@@ -20,6 +20,13 @@ FETCH_RETRY_DELAY = 5  # seconds to wait between retries of a failed page fetch
 DELETE_RETRIES = 3  # attempts per message when a delete is rate limited
 REQUEST_TIMEOUT = (10, 30)  # (connect, read) seconds per HTTP request; no request may hang forever
 UNDELETABLE_MESSAGE_CODES = {50021}  # system messages (calls, pin notifications) can never be deleted via the API
+# Classic system message types: RECIPIENT_ADD/REMOVE (1/2), CALL (3),
+# CHANNEL_NAME_CHANGE (4), CHANNEL_ICON_CHANGE (5), CHANNEL_PINNED_MESSAGE (6),
+# GUILD_MEMBER_JOIN (7). The platform rejects deleting any of them (code
+# 50021), so deletion runs skip them locally — no request is sent, and a
+# stack of them at the top of a chat cannot burn the delete bucket into 429s.
+# Other system-ish types stay covered by UNDELETABLE_MESSAGE_CODES server-side.
+SYSTEM_MESSAGE_TYPES = {1, 2, 3, 4, 5, 6, 7}
 
 BROWSER_USER_AGENT = (  # A complete, real browser UA; the platform rejects writes from clients it cannot fingerprint
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "

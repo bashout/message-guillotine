@@ -15,7 +15,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from message_guillotine.api import RATE_LIMIT_DELAY, HistoryFetchError
+from message_guillotine.api import RATE_LIMIT_DELAY, SYSTEM_MESSAGE_TYPES, HistoryFetchError
 from message_guillotine.config import app_config_dir
 
 SAMPLE_MAX = 3  # messages quoted in a dry-run summary
@@ -157,6 +157,17 @@ def run_deletion(tool, channel_id, label, start_time=None, end_time=None,
             state["before_cursor"] = msg["id"]
 
             if (msg.get("author") or {}).get("id") != me_id:
+                if not dry_run:
+                    save_session(channel_id, state, root)
+                continue
+
+            if msg.get("type", 0) in SYSTEM_MESSAGE_TYPES:
+                # Calls, pin notifications and friends can never be deleted;
+                # skipping them locally costs no request, so a chat that
+                # starts with a stack of them reaches the first real message
+                # at scan speed instead of grinding through 429 backoffs.
+                state["skipped"] += 1
+                progress()
                 if not dry_run:
                     save_session(channel_id, state, root)
                 continue

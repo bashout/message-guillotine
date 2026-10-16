@@ -386,7 +386,8 @@ def handle_deletion(tool, channel_id, label, dry_run=False):
                   f"({summary['scanned']} messages scanned).")
             if summary["skipped"]:
                 print("Skipped messages are system messages (calls, pin notifications) "
-                      "that the platform does not allow deleting.")
+                      "that the platform does not allow deleting; they are filtered "
+                      "out without a delete attempt.")
     else:
         print(f"\nDeleted {summary['deleted']} so far "
               f"(failed {summary['failed']}, skipped {summary['skipped']}, "

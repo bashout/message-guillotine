@@ -11,6 +11,7 @@ Bulk delete and archive your DM and server messages via the platform's unofficia
 | DM deletion | Delete your own DM messages, filtered by user and time range; the channel is scanned newest-first and each of your messages is deleted as it is found, with live progress |
 | Server deletion | Delete your own messages from a server channel, filtered by time range, with the same streaming scan |
 | Rate limiting | 24 messages/minute; the server's rate-limit headers are honored when the bucket is exhausted |
+| System messages | Calls, pins and other system messages are filtered out before any delete is attempted — a stack of them never burns rate-limit budget |
 | Archiving | Save a full chat — both sides, oldest first — as `messages.jsonl` + `attachments/`, streamed page by page |
 | Resume | Interrupted archives and deletion runs pick up where they stopped: archives via per-channel cursors, deletions via a resumable per-channel session (one keypress, no rescanning); partial archive writes are cleaned up automatically |
 | Dry run | `guillotine.py --dry-run` reports what would be deleted (count + message samples) without deleting |

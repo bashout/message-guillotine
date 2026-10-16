@@ -71,10 +71,11 @@ def make_tool(responses):
     return tool
 
 
-def message(i, author_id="7", day=5, content=None):
+def message(i, author_id="7", day=5, content=None, msg_type=0):
     return {"id": str(i), "author": {"id": author_id},
             "timestamp": f"2026-01-{day:02d}T00:00:00+00:00",
-            "content": content or f"msg {i}"}
+            "content": content or f"msg {i}",
+            "type": msg_type}
 
 
 def patch_sleep(monkeypatch):
@@ -272,6 +273,40 @@ def test_run_skipped_system_messages_counted_inline(monkeypatch, tmp_path):
                     delete_results=[("skipped", 0.0), ("deleted", 0.0)])
     summary = run_deletion(tool, "42", "chat", root=tmp_path)
     assert summary["skipped"] == 1 and summary["deleted"] == 1
+
+
+def test_run_skips_system_messages_locally_without_api_calls(monkeypatch, tmp_path):
+    # A stack of call/pin notifications at the top of the chat: none may
+    # cost a delete request (the delete bucket is what 429s), the first
+    # real message is reached at scan speed.
+    tool = StubTool([message(9, msg_type=3), message(8, msg_type=6),
+                     message(7, msg_type=1), message(6, msg_type=4),
+                     message(5)],
+                    delete_results=[("deleted", 0.0)])
+    summary = run_deletion(tool, "42", "chat", root=tmp_path)
+    assert tool.delete_calls == ["5"]  # only the tangible message, no 429 fodder
+    assert summary["skipped"] == 4
+    assert summary["deleted"] == 1
+    assert summary["complete"] is True
+
+
+def test_run_others_system_messages_never_reach_delete(monkeypatch, tmp_path):
+    # System messages authored by the other party are dropped by the
+    # mine-only check before the system-type skip even applies.
+    tool = StubTool([message(9, author_id="999", msg_type=3), message(5)],
+                    delete_results=[("deleted", 0.0)])
+    summary = run_deletion(tool, "42", "chat", root=tmp_path)
+    assert tool.delete_calls == ["5"]
+    assert summary["scanned"] == 2
+    assert summary["skipped"] == 0
+
+
+def test_dry_run_counts_system_messages_as_skipped_not_deletable(monkeypatch, tmp_path):
+    tool = StubTool([message(9, msg_type=3), message(5, content="real message")])
+    summary = run_deletion(tool, "42", "chat", dry_run=True, root=tmp_path)
+    assert summary["deleted"] == 1  # the system message is not "would delete"
+    assert summary["skipped"] == 1
+    assert summary["samples"] == ["7: real message"]
 
 
 # ---------------------------------------------------------------------------
