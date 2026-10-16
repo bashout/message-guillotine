@@ -1,7 +1,5 @@
 """Platform API client logic with a stubbed HTTP session."""
 
-from datetime import datetime, timezone
-
 import pytest
 
 from message_guillotine.api import HistoryFetchError, MessageGuillotine
@@ -80,30 +78,6 @@ def test_get_all_dm_users_dedupes_and_excludes_self_and_bots():
     assert users[0]["channel_id"] == "1"
 
 
-def test_filter_messages_in_range_mine_only():
-    tool = make_tool([])
-    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
-    end = datetime(2026, 1, 3, tzinfo=timezone.utc)
-    messages = [
-        api_message(1, author_id="9"),
-        api_message(2, author_id="7"),
-        api_message(3, author_id="7"),
-    ]
-    filtered = tool.filter_messages_in_range(messages, start, end, my_only=True)
-    assert [m["id"] for m in filtered] == ["2", "3"]
-    everything = tool.filter_messages_in_range(messages, start, end, my_only=False)
-    assert [m["id"] for m in everything] == ["1", "2", "3"]
-
-
-def test_filter_messages_in_range_bounds():
-    tool = make_tool([])
-    start = datetime(2026, 1, 2, tzinfo=timezone.utc)
-    end = datetime(2026, 1, 2, tzinfo=timezone.utc)
-    messages = [api_message(1), api_message(2), api_message(3)]
-    filtered = tool.filter_messages_in_range(messages, start, end, my_only=False)
-    assert [m["id"] for m in filtered] == ["2"]
-
-
 def test_fetch_page_fails_fast_on_auth_error():
     tool = make_tool([FakeResponse(status_code=401, text="nope")])
     with pytest.raises(HistoryFetchError):
@@ -119,8 +93,32 @@ def test_fetch_page_retries_on_rate_limit():
     assert resp.status_code == 200
 
 
-def test_get_channel_history_stops_on_short_page():
-    page = [api_message(1), api_message(2)]
-    tool = make_tool([FakeResponse(json_data=page)])
-    assert [m["id"] for m in tool.get_channel_history("5", limit=100)] == ["1", "2"]
-    assert tool.session.calls[0][1]["limit"] == 100
+def test_iter_history_before_pages_newest_first():
+    page1 = [api_message(5), api_message(4), api_message(3)]
+    page2 = [api_message(2), api_message(1)]
+    tool = make_tool([FakeResponse(json_data=page1), FakeResponse(json_data=page2)])
+    ids = [m["id"] for m in tool.iter_channel_history_before("5", limit=3)]
+    assert ids == ["5", "4", "3", "2", "1"]  # newest first throughout
+    assert tool.session.calls[0][1] == {"limit": 3}  # no cursor on the first page
+    assert tool.session.calls[1][1] == {"limit": 3, "before": "3"}
+
+
+def test_iter_history_before_starts_at_cursor():
+    tool = make_tool([FakeResponse(json_data=[])])
+    list(tool.iter_channel_history_before("5", before_id="99"))
+    assert tool.session.calls[0][1] == {"limit": 100, "before": "99"}
+
+
+def test_iter_history_before_sleeps_only_between_pages(monkeypatch):
+    import time as time_mod
+    sleeps = []
+    monkeypatch.setattr(time_mod, "sleep", lambda s: sleeps.append(s))
+    full_page = [api_message(i) for i in range(3, 0, -1)]
+    short_page = [api_message(1)]
+    tool = make_tool([
+        FakeResponse(json_data=full_page),
+        FakeResponse(json_data=short_page),
+    ])
+    tool.limit = None
+    list(tool.iter_channel_history_before("5", limit=3))
+    assert sleeps == [0.5]  # between pages, none after the short final page

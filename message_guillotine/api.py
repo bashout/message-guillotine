@@ -8,7 +8,6 @@ limiting, and streaming attachment downloads."""
 import base64
 import json
 import time
-from datetime import datetime
 
 import requests
 
@@ -156,33 +155,35 @@ class MessageGuillotine:
                         }
         return list(users.values())
     
-    def get_channel_history(self, channel_id, limit=100):
-        """Fetch all messages from a channel (paginates backwards).
-        Raises HistoryFetchError when a page cannot be fetched after retrying."""
-        all_messages = []
-        last_id = None
-
+    def iter_channel_history_before(self, channel_id, before_id=None, limit=100):
+        """Yield messages newest-first, one fetched page at a time, starting
+        older than before_id (the whole channel when it is None). Used by
+        deletion so huge channels stream with progress instead of buffering,
+        and a run can stop at a time-range boundary instead of fetching the
+        full history. Raises HistoryFetchError when a page cannot be fetched
+        after retrying."""
+        cursor = str(before_id) if before_id else None
         while True:
             params = {"limit": limit}
-            if last_id:
-                params["before"] = last_id
+            if cursor:
+                params["before"] = cursor
 
             resp = self._fetch_page_with_retries(
                 f"{API_BASE}/channels/{channel_id}/messages", params)
 
             messages = resp.json()
             if not messages:
-                break
+                return
 
-            all_messages.extend(messages)
-            last_id = messages[-1]['id']
+            # `before` pages come back newest-first; enforce just in case
+            messages.sort(key=lambda m: int(m['id']), reverse=True)
+            for msg in messages:
+                yield msg
 
+            cursor = messages[-1]['id']
             if len(messages) < limit:
-                break
-
+                return
             time.sleep(0.5)
-
-        return all_messages
 
     def iter_channel_history(self, channel_id, after_id="0", limit=100):
         """Yield messages oldest-first, one fetched page at a time, starting after after_id.
@@ -234,22 +235,6 @@ class MessageGuillotine:
                 time.sleep(FETCH_RETRY_DELAY)
         raise HistoryFetchError(last_error)
     
-    def filter_messages_in_range(self, messages, start_time, end_time, my_only=True):
-        """Filter messages within time range, optionally only yours."""
-        start_ts = start_time.timestamp()
-        end_ts = end_time.timestamp()
-        
-        filtered = []
-        for msg in messages:
-            msg_time = datetime.fromisoformat(msg['timestamp'].replace('Z', '+00:00')).timestamp()
-            if start_ts <= msg_time <= end_ts:
-                if my_only and msg['author']['id'] != self.current_user['id']:
-                    continue
-                filtered.append(msg)
-        
-        filtered.sort(key=lambda x: x['timestamp'])
-        return filtered
-    
     def delete_message(self, channel_id, message_id):
         """Delete a single message. Returns the response so the caller can
         read status_code (and Retry-After when rate limited)."""
@@ -279,104 +264,56 @@ class MessageGuillotine:
                 pass
             return None
     
-    def delete_with_rate_limit(self, messages, channel_id):
-        """Delete messages at 24 per minute with progress.
+    def delete_message_with_retries(self, channel_id, message_id):
+        """Delete one message, retrying when rate limited.
 
+        Returns (status, wait) where status is one of:
+          "deleted"      — the message is gone; wait is the extra seconds the
+                           server asked for before the next delete when the
+                           rate bucket is exhausted (0 otherwise)
+          "skipped"      — a system message (call, pin notification) the API
+                           can never delete; the rest of the run is unaffected
+          "failed"       — an unexpected error on this message; the run continues
+          "auth"         — 401/403: the token was rejected or this account
+                           cannot delete in this channel; every further delete
+                           would fail the same way
+          "rate_limited" — still 429 after DELETE_RETRIES attempts; the server
+                           is still throttling, so every remaining delete
+                           would burn the same backoff
         A 429 backs off for the server's Retry-After and retries the same
-        message (bounded); if the retries are exhausted the run aborts —
-        the server is still rate limiting, so every remaining delete would
-        burn the same backoff and fail. A 403 for a message the API can never delete
-        (a system message such as a call or pin notification, platform
-        code 50021) skips just that message and the run continues. Any
-        other 401/403 aborts the run outright: every remaining delete
-        would fail the same way — a rejected token, or a channel that
-        blocks this account from deleting messages."""
-        total = len(messages)
-        print(f"\nFound {total} messages to delete.")
-        print(f"Will delete at ~24/min (1 every {RATE_LIMIT_DELAY:.1f}s)...")
-
-        confirm = input("Continue? (y/N): ").strip().lower()
-        if confirm != 'y':
-            print("Cancelled.")
-            return
-
-        deleted = 0
-        failed = 0
-        skipped = 0
-        start_time = time.time()
-
-        for i, msg in enumerate(messages, 1):
-            message_id = msg['id']
-
-            for attempt in range(1, DELETE_RETRIES + 1):
-                resp = self.delete_message(channel_id, message_id)
-                if resp.status_code in (200, 204):
-                    deleted += 1
-                    break
-                if resp.status_code == 429:
-                    retry_after = max(float(resp.headers.get("Retry-After") or RATE_LIMIT_DELAY), 1.0)
-                    print(f"\n  Rate limited; retrying in {retry_after:.0f}s "
-                          f"(attempt {attempt}/{DELETE_RETRIES})...")
-                    time.sleep(retry_after)
-                    continue
-                if resp.status_code in (401, 403):
-                    if resp.status_code == 403 and _error_code(resp) in UNDELETABLE_MESSAGE_CODES:
-                        # This one message can never be deleted (a system
-                        # message such as a call or pin notification); the
-                        # rest of the run is unaffected.
-                        skipped += 1
-                        break
-                    reason = ("the token was rejected - re-authenticate"
-                              if resp.status_code == 401 else
-                              "this account is not allowed to delete messages "
-                              "in this channel")
-                    print(f"\n\nStopping: delete returned HTTP {resp.status_code} ({reason}).")
-                    detail = _error_detail(resp)
-                    if detail:
-                        print(f"Platform response: {detail}")
-                    print(f"Deleted {deleted}/{total} before stopping; "
-                          f"{total - deleted - failed - skipped} messages left.")
-                    return
-                failed += 1
-                break
-            else:
-                failed += 1  # rate limited through every attempt
-                print(
-                    f"\n\nStopping: still rate limited after {DELETE_RETRIES} attempts. "
-                    f"Every remaining delete would fail the same way; rerun "
-                    f"later to delete the rest.")
-                print(f"Deleted {deleted}/{total} before stopping; "
-                      f"{total - deleted - failed - skipped} messages left.")
-                return
-
-            # Calculate time remaining
-            remaining = (total - i) * RATE_LIMIT_DELAY
-            elapsed = time.time() - start_time
-            
-            def fmt_secs(s):
-                seconds = int(s)
-                days = seconds // 86400
-                seconds %= 86400
-                hours = seconds // 3600
-                seconds %= 3600
-                minutes = seconds // 60
-                seconds %= 60
-                
-                parts = []
-                if days > 0:
-                    parts.append(f"{days}d")
-                if hours > 0 or days > 0:
-                    parts.append(f"{hours:02d}:{minutes:02d}:{seconds:02d}")
-                else:
-                    parts.append(f"{minutes:02d}:{seconds:02d}")
-                return " ".join(parts)
-            
-            print(f"[{i}/{total}] Deleted: {deleted} | Failed: {failed} | Skipped: {skipped} | Elapsed: {fmt_secs(elapsed)} | Remaining: {fmt_secs(remaining)} | Rate: {RATE_LIMIT_DELAY:.1f}s/msg", end='\r')
-
-            if i < total:
-                time.sleep(RATE_LIMIT_DELAY)
-
-        print(f"\nDone. Deleted {deleted}/{total}, Failed: {failed}, Skipped: {skipped}")
-        if skipped:
-            print("Skipped messages are system messages (calls, pin notifications) "
-                  "that the platform does not allow deleting.")
+        message (bounded)."""
+        for attempt in range(1, DELETE_RETRIES + 1):
+            resp = self.delete_message(channel_id, message_id)
+            if resp.status_code in (200, 204):
+                wait = 0.0
+                if (resp.headers.get("X-RateLimit-Remaining") or "1") == "0":
+                    try:
+                        wait = float(resp.headers.get("X-RateLimit-Reset-After") or 0)
+                    except ValueError:
+                        wait = 0.0
+                return "deleted", wait
+            if resp.status_code == 429:
+                retry_after = max(float(resp.headers.get("Retry-After") or RATE_LIMIT_DELAY), 1.0)
+                print(f"\n  Rate limited; retrying in {retry_after:.0f}s "
+                      f"(attempt {attempt}/{DELETE_RETRIES})...")
+                time.sleep(retry_after)
+                continue
+            if resp.status_code in (401, 403):
+                if resp.status_code == 403 and _error_code(resp) in UNDELETABLE_MESSAGE_CODES:
+                    # This one message can never be deleted (a system
+                    # message such as a call or pin notification); the
+                    # rest of the run is unaffected.
+                    return "skipped", 0.0
+                reason = ("the token was rejected - re-authenticate"
+                          if resp.status_code == 401 else
+                          "this account is not allowed to delete messages "
+                          "in this channel")
+                print(f"\n\nStopping: delete returned HTTP {resp.status_code} ({reason}).")
+                detail = _error_detail(resp)
+                if detail:
+                    print(f"Platform response: {detail}")
+                return "auth", 0.0
+            return "failed", 0.0
+        print(f"\n\nStopping: still rate limited after {DELETE_RETRIES} attempts. "
+              f"Every remaining delete would fail the same way.")
+        return "rate_limited", 0.0
