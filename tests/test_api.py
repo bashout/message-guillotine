@@ -122,3 +122,40 @@ def test_iter_history_before_sleeps_only_between_pages(monkeypatch):
     tool.limit = None
     list(tool.iter_channel_history_before("5", limit=3))
     assert sleeps == [0.5]  # between pages, none after the short final page
+
+
+def test_count_my_messages_returns_total_results():
+    tool = make_tool([FakeResponse(status_code=200,
+                                    json_data={"total_results": 42, "messages": []})])
+    assert tool.count_my_messages("42", "7", min_id="100", max_id="900") == 42
+    url, params = tool.session.calls[0]
+    assert url == "https://discord.com/api/v10/channels/42/messages/search"
+    assert params == {"author_id": "7", "min_id": "100", "max_id": "900"}
+
+
+def test_count_my_messages_omits_unset_bounds():
+    tool = make_tool([FakeResponse(status_code=200, json_data={"total_results": 0})])
+    assert tool.count_my_messages("42", "7") == 0
+    assert tool.session.calls[0][1] == {"author_id": "7"}
+
+
+def test_count_my_messages_none_when_search_unavailable():
+    tool = make_tool([FakeResponse(status_code=404, text="search disabled")])
+    assert tool.count_my_messages("42", "7") is None
+
+
+def test_count_my_messages_none_on_bad_body():
+    tool = make_tool([FakeResponse(status_code=200, json_data={"messages": []})])
+    assert tool.count_my_messages("42", "7") is None
+
+
+def test_count_my_messages_none_on_network_error():
+    import requests
+
+    class ExplodingSession:
+        def get(self, url, params=None, timeout=None):
+            raise requests.RequestException("boom")
+
+    tool = MessageGuillotine.__new__(MessageGuillotine)
+    tool.session = ExplodingSession()
+    assert tool.count_my_messages("42", "7") is None

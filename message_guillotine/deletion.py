@@ -11,14 +11,39 @@ session file is removed once the run completes.
 
 
 import json
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
 
-from message_guillotine.api import RATE_LIMIT_DELAY, SYSTEM_MESSAGE_TYPES, HistoryFetchError
+from message_guillotine.api import (
+    RATE_LIMIT_DELAY,
+    SYSTEM_MESSAGE_TYPES,
+    HistoryFetchError,
+    snowflake_for,
+)
 from message_guillotine.config import app_config_dir
 
 SAMPLE_MAX = 3  # messages quoted in a dry-run summary
+
+
+def _start_total_count(tool, channel_id, me_id, min_id, max_id):
+    """Kick off tool.count_my_messages in the background so the run starts
+    scanning immediately instead of waiting on the count. Returns
+    poll() -> total-or-None; a tool without the method (stubs, older
+    callers) polls None forever and the run just shows no estimate."""
+    if not hasattr(tool, "count_my_messages"):
+        return lambda: None
+    box = {}
+
+    def worker():
+        try:
+            box["total"] = tool.count_my_messages(channel_id, me_id, min_id, max_id)
+        except Exception:
+            box["total"] = None
+
+    threading.Thread(target=worker, daemon=True).start()
+    return lambda: box.get("total")
 
 
 def sessions_root():
@@ -104,6 +129,12 @@ def run_deletion(tool, channel_id, label, start_time=None, end_time=None,
     (True when the scan ran to the range boundary), aborted (a short reason
     string when the run stopped early, else None), samples.
 
+    In parallel with the scan, the platform's search endpoint is asked how
+    many of your messages lie in the remaining range; while that count is
+    known, the progress line carries a remaining count and, for real runs,
+    an ETA at the delete pace. Search being unavailable just drops the
+    estimate — the run is unaffected.
+
     The per-channel session file is updated after every scanned message, so
     any interruption leaves a resumable run behind; a completed run removes
     it.
@@ -129,21 +160,43 @@ def run_deletion(tool, channel_id, label, start_time=None, end_time=None,
         state["before_cursor"] = resume.get("before_cursor")
 
     me_id = (tool.current_user or {}).get("id")
+    # The count query covers exactly the range still ahead of the cursor: a
+    # resume counts only messages older than where it stopped.
+    poll_total = _start_total_count(
+        tool, channel_id, me_id,
+        snowflake_for(start_time) if start_time is not None else None,
+        (state["before_cursor"] if state["before_cursor"] is not None
+         else snowflake_for(end_time) if end_time is not None else None))
     samples = []
     aborted = None
     aborted_message = None
     pending_pace = 0.0  # seconds owed before the next delete, from the last one
     start_clock = time.time()
 
+    def estimate_segment(dry=dry_run):
+        """Progress-line tail with the remaining count (and ETA for real
+        runs), or "" while the search count is unavailable. The count comes
+        from the search index and counts every message you authored in the
+        remaining range, so the ETA (delete pace) is an estimate, not a
+        promise; already-processed messages are subtracted as they tick."""
+        total = poll_total()
+        if total is None:
+            return ""
+        remaining = max(0, total - state["deleted"] - state["failed"])
+        if dry:
+            return f" | ~{remaining} of yours left"
+        return (f" | ~{remaining} left"
+                f" | ETA {_fmt_elapsed(remaining * RATE_LIMIT_DELAY)}")
+
     def progress(dry=dry_run):
         elapsed = _fmt_elapsed(time.time() - start_clock)
         if dry:
             print(f"\r[scanned {state['scanned']} | would delete {state['deleted']}"
-                  f" | {elapsed}]", end="", flush=True)
+                  f"{estimate_segment()} | {elapsed}]", end="", flush=True)
         else:
             print(f"\r[scanned {state['scanned']} | deleted {state['deleted']}"
                   f" | failed {state['failed']} | skipped {state['skipped']}"
-                  f" | {elapsed}]", end="", flush=True)
+                  f"{estimate_segment()} | {elapsed}]", end="", flush=True)
 
     try:
         for msg in tool.iter_channel_history_before(

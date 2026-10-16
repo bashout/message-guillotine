@@ -19,6 +19,7 @@ FETCH_RETRIES = 5  # attempts per page before the archive run is marked incomple
 FETCH_RETRY_DELAY = 5  # seconds to wait between retries of a failed page fetch
 DELETE_RETRIES = 3  # attempts per message when a delete is rate limited
 REQUEST_TIMEOUT = (10, 30)  # (connect, read) seconds per HTTP request; no request may hang forever
+DISCORD_EPOCH_MS = 1420070400000  # message IDs encode (unix_ms - this) << 22
 UNDELETABLE_MESSAGE_CODES = {50021}  # system messages (calls, pin notifications) can never be deleted via the API
 # Classic system message types: RECIPIENT_ADD/REMOVE (1/2), CALL (3),
 # CHANNEL_NAME_CHANGE (4), CHANNEL_ICON_CHANGE (5), CHANNEL_PINNED_MESSAGE (6),
@@ -83,6 +84,12 @@ def _error_code(resp):
         return resp.json().get("code")
     except (ValueError, AttributeError):
         return None
+
+
+def snowflake_for(dt):
+    """The lowest message ID whose timestamp is at or after dt. Message IDs
+    embed their creation time, so a datetime can bound a query by ID."""
+    return str((int(dt.timestamp() * 1000) - DISCORD_EPOCH_MS) << 22)
 
 
 class MessageGuillotine:
@@ -161,6 +168,33 @@ class MessageGuillotine:
                             'last_message_id': last_message_id
                         }
         return list(users.values())
+
+    def count_my_messages(self, channel_id, author_id, min_id=None, max_id=None):
+        """Count of the author's messages with IDs in [min_id, max_id]
+        (either bound may be None = no limit), from the search endpoint's
+        total_results. One request on the search bucket — it never touches
+        the history or delete buckets, so it cannot slow the scan. Returns
+        None when search is unavailable (disabled, not indexed) or the call
+        fails: the count only feeds a time estimate, and callers just hide
+        the estimate."""
+        params = {"author_id": str(author_id)}
+        if min_id is not None:
+            params["min_id"] = str(min_id)
+        if max_id is not None:
+            params["max_id"] = str(max_id)
+        try:
+            resp = self.session.get(
+                f"{API_BASE}/channels/{channel_id}/messages/search",
+                params=params, timeout=REQUEST_TIMEOUT)
+        except requests.RequestException:
+            return None
+        if resp.status_code != 200:
+            return None
+        try:
+            total = resp.json().get("total_results")
+        except (ValueError, AttributeError):
+            return None
+        return total if isinstance(total, int) and total >= 0 else None
     
     def iter_channel_history_before(self, channel_id, before_id=None, limit=100):
         """Yield messages newest-first, one fetched page at a time, starting

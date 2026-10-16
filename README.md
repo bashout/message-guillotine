@@ -8,7 +8,7 @@ Bulk delete and archive your DM and server messages via the platform's unofficia
 
 | Feature | Description |
 |---------|-------------|
-| DM deletion | Delete your own DM messages, filtered by user and time range; the channel is scanned newest-first and each of your messages is deleted as it is found, with live progress |
+| DM deletion | Delete your own DM messages, filtered by user and time range; the channel is scanned newest-first and each of your messages is deleted as it is found, with live progress and a remaining-time estimate |
 | Server deletion | Delete your own messages from a server channel, filtered by time range, with the same streaming scan |
 | Rate limiting | 24 messages/minute; the server's rate-limit headers are honored when the bucket is exhausted |
 | System messages | Calls, pins and other system messages are filtered out before any delete is attempted — a stack of them never burns rate-limit budget |

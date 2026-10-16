@@ -1,9 +1,17 @@
 """Message deletion: single-message retries, streaming runs, resume state."""
 
+import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
-from message_guillotine.api import RATE_LIMIT_DELAY, HistoryFetchError, MessageGuillotine
+from message_guillotine import deletion
+from message_guillotine.api import (
+    DISCORD_EPOCH_MS,
+    RATE_LIMIT_DELAY,
+    HistoryFetchError,
+    MessageGuillotine,
+    snowflake_for,
+)
 from message_guillotine.deletion import (
     clear_session,
     load_session,
@@ -326,3 +334,119 @@ def test_session_headers_mimic_web_client():
     assert props["os"] == "Windows" and props["browser"] == "Chrome"
     assert props["browser_user_agent"] == headers["User-Agent"]
     assert headers["X-Discord-Locale"] == "en-US"
+
+
+# ---------------------------------------------------------------------------
+# remaining count / ETA (search-endpoint count fetched in the background)
+# ---------------------------------------------------------------------------
+
+def test_snowflake_for_encodes_timestamp():
+    dt = datetime(2026, 1, 4, 12, 30, tzinfo=timezone.utc)
+    assert int(snowflake_for(dt)) == (int(dt.timestamp() * 1000) - DISCORD_EPOCH_MS) << 22
+
+
+def test_start_total_count_polls_thread_result():
+    class CountTool:
+        def __init__(self):
+            self.calls = []
+
+        def count_my_messages(self, channel_id, author_id, min_id, max_id):
+            self.calls.append((channel_id, author_id, min_id, max_id))
+            return 42
+
+    tool = CountTool()
+    poll = deletion._start_total_count(tool, "42", "7", "100", "900")
+    deadline = time.time() + 5
+    got = None
+    while got is None and time.time() < deadline:
+        got = poll()
+        if got is None:
+            threading.Event().wait(0.01)
+    assert got == 42
+    assert tool.calls == [("42", "7", "100", "900")]
+
+
+def test_start_total_count_without_method_polls_none():
+    poll = deletion._start_total_count(StubTool([]), "42", "7", None, None)
+    assert poll() is None
+
+
+def test_start_total_count_polls_none_when_count_raises():
+    class BoomTool:
+        def count_my_messages(self, channel_id, author_id, min_id, max_id):
+            raise RuntimeError("boom")
+
+    poll = deletion._start_total_count(BoomTool(), "42", "7", None, None)
+    deadline = time.time() + 5
+    # None means both "not yet" and "failed"; wait out the thread either way
+    while poll() is not None and time.time() < deadline:
+        threading.Event().wait(0.01)
+    assert poll() is None
+
+
+def test_run_shows_remaining_and_eta(monkeypatch, tmp_path, capsys):
+    tool = StubTool([message(5), message(4, day=4), message(3, day=3)],
+                    delete_results=[("deleted", 0.0)] * 3)
+    monkeypatch.setattr(deletion, "_start_total_count",
+                        lambda tool, channel_id, me_id, min_id, max_id:
+                        (lambda: 10))
+    summary = run_deletion(tool, "42", "chat", root=tmp_path)
+    out = capsys.readouterr().out
+    assert "~9 left" in out  # 10 - 1 after the first delete
+    assert "~7 left" in out  # 10 - 3 after the last
+    assert "ETA" in out
+    assert summary["deleted"] == 3
+
+
+def test_run_without_count_shows_no_eta(monkeypatch, tmp_path, capsys):
+    # StubTool has no count_my_messages: the run must proceed with the
+    # plain progress line, no estimate segments.
+    tool = StubTool([message(5)], delete_results=[("deleted", 0.0)])
+    summary = run_deletion(tool, "42", "chat", root=tmp_path)
+    out = capsys.readouterr().out
+    assert "ETA" not in out and "~" not in out
+    assert summary["deleted"] == 1
+
+
+def test_run_bounds_count_by_range_and_cursor(monkeypatch, tmp_path):
+    seen = {}
+
+    def fake_start(tool, channel_id, me_id, min_id, max_id):
+        seen.update(min_id=min_id, max_id=max_id)
+        return lambda: None
+
+    monkeypatch.setattr(deletion, "_start_total_count", fake_start)
+    start_time = datetime(2026, 1, 4)
+    end_time = datetime(2026, 1, 6)
+    tool = StubTool([message(5)], delete_results=[("deleted", 0.0)])
+    run_deletion(tool, "42", "chat", start_time=start_time,
+                 end_time=end_time, root=tmp_path)
+    assert seen["min_id"] == snowflake_for(start_time)
+    assert seen["max_id"] == snowflake_for(end_time)
+
+
+def test_run_resume_counts_only_messages_after_cursor(monkeypatch, tmp_path):
+    seen = {}
+
+    def fake_start(tool, channel_id, me_id, min_id, max_id):
+        seen.update(me_id=me_id, min_id=min_id, max_id=max_id)
+        return lambda: None
+
+    monkeypatch.setattr(deletion, "_start_total_count", fake_start)
+    tool = StubTool([message(3, day=3)], delete_results=[("deleted", 0.0)])
+    resume = {"channel_id": "42", "before_cursor": "4",
+              "scanned": 10, "deleted": 4, "failed": 0, "skipped": 1,
+              "start_time": None, "end_time": None}
+    run_deletion(tool, "42", "chat", resume=resume, root=tmp_path)
+    assert seen == {"me_id": "7", "min_id": None, "max_id": "4"}
+
+
+def test_dry_run_shows_remaining_without_eta(monkeypatch, tmp_path, capsys):
+    tool = StubTool([message(5), message(3, day=3)])
+    monkeypatch.setattr(deletion, "_start_total_count",
+                        lambda *args: (lambda: 5))
+    summary = run_deletion(tool, "42", "chat", dry_run=True, root=tmp_path)
+    out = capsys.readouterr().out
+    assert "~3 of yours left" in out  # 5 - 2 would-deletes
+    assert "ETA" not in out
+    assert summary["deleted"] == 2
