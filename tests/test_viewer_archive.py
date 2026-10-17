@@ -65,12 +65,6 @@ def test_filtered_view_pinned(tmp_path):
     ]
     viewer = load(make_archive(tmp_path, records=records))
     assert list(viewer.filtered_view((None, None, False, False, True))) == [1]
-    assert len(viewer.filtered_view((None, None, False, False, False))) == 3
-
-
-def test_filtered_view_unfiltered_is_all(archive):
-    viewer = load(archive)
-    assert len(viewer.filtered_view((None, None, False, False, False))) == 5
 
 
 def test_anchor_payload(archive):

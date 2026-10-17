@@ -103,9 +103,15 @@ class ArchiveLibrary:
 
 
 class ViewerHandler(BaseHTTPRequestHandler):
-    library = None  # ArchiveLibrary, set on the class before serving
     server_version = "ArchiveViewer/1.0"
     protocol_version = "HTTP/1.1"
+
+    @property
+    def library(self):
+        """The ArchiveLibrary of the server this handler belongs to (set as an
+        attribute on the server by create_server, so any number of servers can
+        coexist in one process)."""
+        return self.server.library
 
     def log_message(self, fmt, *args):  # quiet: one line per request is noise
         pass
@@ -371,7 +377,6 @@ def create_server(root, select_archive=None, host="127.0.0.1", port=8765):
     """
     root = Path(root)
     library = ArchiveLibrary(root)
-    ViewerHandler.library = library
     archives = find_archives(root)
     if select_archive in {a["name"] for a in archives}:
         library.select(select_archive)
@@ -383,6 +388,7 @@ def create_server(root, select_archive=None, host="127.0.0.1", port=8765):
         if port == 0:
             raise
         server = ViewerServer((host, 0), ViewerHandler)
+    server.library = library
     bound_host, bound_port = server.server_address[:2]
     return server, f"http://{bound_host}:{bound_port}/"
 
@@ -415,7 +421,7 @@ def main(argv=None):
     except OSError as exc:
         sys.exit(f"could not start the viewer: {exc}")
 
-    library = ViewerHandler.library
+    library = server.library
     print(f"Archival folder: {library.root}", file=sys.stderr)
     archives = find_archives(root)
     print(f"  {len(archives)} archive(s) found", file=sys.stderr)

@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=42"]
+requires = ["setuptools>=42", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "message-guillotine"
-version = "0.3.0"
+dynamic = ["version"]
 description = "Bulk delete and archive your own chat messages"
 requires-python = ">=3.8"
 dependencies = [
@@ -30,3 +30,10 @@ packages = ["message_guillotine", "message_guillotine.viewer"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+
+[tool.setuptools_scm]
+# The version comes from the latest vX.Y[.Z] git tag (setuptools-scm);
+# commits past a tag build as X.Y.devN. Building without git metadata
+# (e.g. from a zip download) falls back instead of failing;
+# SETUPTOOLS_SCM_PRETEND_VERSION=... overrides in a pinch.
+fallback_version = "0.0.0"

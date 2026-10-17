@@ -129,6 +129,29 @@ def test_archive_chat_marks_incomplete_on_fetch_failure(tmp_path):
     assert [r["id"] for r in records_of(folder)] == ["1", "2", "3"]
 
 
+def test_archive_chat_marks_incomplete_on_interrupt_and_resumes(tmp_path):
+    from message_guillotine import archive_format
+
+    class InterruptedTool(FakeTool):
+        def iter_channel_history(self, channel_id, after_id="0"):
+            for msg in self.messages:
+                if int(msg["id"]) > int(after_id):
+                    yield msg
+            raise KeyboardInterrupt  # Ctrl-C mid-run
+
+    archive_dir = tmp_path / "archives"
+    tool = InterruptedTool([api_message(1), api_message(2)])
+    assert archiver.archive_chat(tool, "42", "chat", archive_dir) is None
+    folder = archive_format.find_existing_archive("42", archive_dir)
+    assert archive_format.read_archive_status(folder) is False
+    assert [r["id"] for r in records_of(folder)] == ["1", "2"]  # writes kept
+
+    # a rerun with a healthy tool resumes and completes the archive
+    folder = archiver.archive_chat(FakeTool(tool.messages), "42", "chat", archive_dir)
+    assert archive_format.read_archive_status(folder) is True
+    assert [r["id"] for r in records_of(folder)] == ["1", "2"]
+
+
 def test_archive_chat_separate_folder_per_channel(tmp_path):
     archive_dir = tmp_path / "archives"
     first = archiver.archive_chat(FakeTool([api_message(1)]), "42", "chat-a", archive_dir)

@@ -42,6 +42,10 @@ archive-viewer
 The tool prompts for your user token on start. Archives are written to your
 archive folder (one folder per chat); the viewer serves that folder.
 
+The package version is derived from git tags via setuptools-scm: tag
+`vX.Y[.Z]` and the release builds that version — no `pyproject.toml` edit
+needed. Commits past a tag build as `X.Y.devN` development versions.
+
 Run the tests (config resolution, archive format, archiver resume/retry,
 API paging, deletion streaming/resume, viewer queries, and the HTTP server
 end to end):
