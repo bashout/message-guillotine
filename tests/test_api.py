@@ -124,6 +124,38 @@ def test_iter_history_before_sleeps_only_between_pages(monkeypatch):
     assert sleeps == [0.5]  # between pages, none after the short final page
 
 
+def test_iter_history_after_pages_oldest_first_and_stops_on_short_page(monkeypatch):
+    import time as time_mod
+    sleeps = []
+    monkeypatch.setattr(time_mod, "sleep", lambda s: sleeps.append(s))
+    full_page = [api_message(i) for i in range(1, 4)]
+    short_page = [api_message(4)]
+    tool = make_tool([
+        FakeResponse(json_data=full_page),
+        FakeResponse(json_data=short_page),
+        FakeResponse(json_data=[]),  # must never be requested
+    ])
+    ids = [m["id"] for m in tool.iter_channel_history("5", limit=3)]
+    assert ids == ["1", "2", "3", "4"]  # oldest first throughout
+    assert len(tool.session.calls) == 2  # no fetch past the short final page
+    assert sleeps == [0.5]  # between pages, none after the short final page
+
+
+def test_retry_after_falls_back_on_missing_or_malformed_header():
+    from message_guillotine.api import _retry_after
+    assert _retry_after(FakeResponse(), 5.0) == 5.0  # absent
+    assert _retry_after(FakeResponse(headers={"Retry-After": "abc"}), 5.0) == 5.0  # malformed
+    assert _retry_after(FakeResponse(headers={"Retry-After": "7"}), 5.0) == 7.0
+    assert _retry_after(FakeResponse(headers={"Retry-After": "0.1"}), 5.0) == 1.0  # floored
+
+
+def test_download_session_keeps_auth_token_out_of_cdn_requests():
+    tool = MessageGuillotine("fake-token")
+    assert tool.download_session.headers["User-Agent"]
+    assert "Authorization" not in tool.download_session.headers
+    assert tool.session.headers["Authorization"] == "fake-token"
+
+
 def test_count_my_messages_returns_total_results():
     tool = make_tool([FakeResponse(status_code=200,
                                     json_data={"total_results": 42, "messages": []})])
