@@ -164,7 +164,7 @@ def test_non_local_host_refused(server_url):
 def test_create_server_falls_back_to_newest_archive(tmp_path, archive):
     server, url = create_server(tmp_path)  # no explicit selection
     assert server and url.startswith("http://127.0.0.1:")
-    selected = server.RequestHandlerClass.library.selected_name
+    selected = server.library.selected_name
     server.server_close()
     assert selected == archive.name  # only archive: newest by default
 
