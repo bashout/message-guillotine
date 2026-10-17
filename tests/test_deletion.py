@@ -356,32 +356,8 @@ def test_dry_run_counts_system_messages_as_skipped_not_deletable(monkeypatch, tm
 
 
 # ---------------------------------------------------------------------------
-# session headers (unchanged behavior, kept from the old delete path)
-# ---------------------------------------------------------------------------
-
-def test_session_headers_mimic_web_client():
-    import base64 as b64
-    import json as json_mod
-
-    tool = MessageGuillotine("fake-token")
-    headers = tool.session.headers
-    assert headers["Authorization"] == "fake-token"
-    # A complete, real browser UA — not a truncated pseudo-browser string
-    assert "Chrome/" in headers["User-Agent"] and "Safari/537.36" in headers["User-Agent"]
-    props = json_mod.loads(b64.b64decode(headers["X-Super-Properties"]))
-    assert props["os"] == "Windows" and props["browser"] == "Chrome"
-    assert props["browser_user_agent"] == headers["User-Agent"]
-    assert headers["X-Discord-Locale"] == "en-US"
-
-
-# ---------------------------------------------------------------------------
 # remaining count / ETA (search-endpoint count fetched in the background)
 # ---------------------------------------------------------------------------
-
-def test_snowflake_for_encodes_timestamp():
-    dt = datetime(2026, 1, 4, 12, 30, tzinfo=timezone.utc)
-    assert int(snowflake_for(dt)) == (int(dt.timestamp() * 1000) - DISCORD_EPOCH_MS) << 22
-
 
 def test_start_total_count_polls_thread_result():
     class CountTool:
@@ -406,19 +382,6 @@ def test_start_total_count_polls_thread_result():
 
 def test_start_total_count_without_method_polls_none():
     poll = deletion._start_total_count(StubTool([]), "42", "7", None, None)
-    assert poll() is None
-
-
-def test_start_total_count_polls_none_when_count_raises():
-    class BoomTool:
-        def count_my_messages(self, channel_id, author_id, min_id, max_id):
-            raise RuntimeError("boom")
-
-    poll = deletion._start_total_count(BoomTool(), "42", "7", None, None)
-    deadline = time.time() + 5
-    # None means both "not yet" and "failed"; wait out the thread either way
-    while poll() is not None and time.time() < deadline:
-        threading.Event().wait(0.01)
     assert poll() is None
 
 

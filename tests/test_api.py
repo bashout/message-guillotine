@@ -1,8 +1,17 @@
 """Platform API client logic with a stubbed HTTP session."""
 
-import pytest
+from datetime import datetime, timezone
 
-from message_guillotine.api import HistoryFetchError, MessageGuillotine
+import pytest
+import requests
+
+from message_guillotine.api import (
+    DISCORD_EPOCH_MS,
+    FETCH_RETRY_DELAY,
+    HistoryFetchError,
+    MessageGuillotine,
+    snowflake_for,
+)
 
 
 class FakeResponse:
@@ -191,3 +200,105 @@ def test_count_my_messages_none_on_network_error():
     tool = MessageGuillotine.__new__(MessageGuillotine)
     tool.session = ExplodingSession()
     assert tool.count_my_messages("42", "7") is None
+
+
+def test_fetch_page_retries_transient_http_error(monkeypatch):
+    import time as time_mod
+    sleeps = []
+    monkeypatch.setattr(time_mod, "sleep", lambda s: sleeps.append(s))
+    tool = make_tool([FakeResponse(status_code=500),
+                      FakeResponse(status_code=200, json_data=[])])
+    resp = tool._fetch_page_with_retries("https://api.example", {})
+    assert resp.status_code == 200
+    assert sleeps == [FETCH_RETRY_DELAY]  # backed off once, then recovered
+
+
+def test_fetch_page_retries_network_error(monkeypatch):
+    import time as time_mod
+    sleeps = []
+    monkeypatch.setattr(time_mod, "sleep", lambda s: sleeps.append(s))
+
+    class RecoveringSession:
+        def __init__(self):
+            self.calls = 0
+
+        def get(self, url, params=None, timeout=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise requests.RequestException("boom")
+            return FakeResponse(status_code=200, json_data=[])
+
+    tool = MessageGuillotine.__new__(MessageGuillotine)
+    tool.session = RecoveringSession()
+    resp = tool._fetch_page_with_retries("https://api.example", {})
+    assert resp.status_code == 200
+    assert sleeps == [FETCH_RETRY_DELAY]
+
+
+class FakeStreamingResponse:
+    def __init__(self, chunks, status_code=200):
+        self.status_code = status_code
+        self._chunks = iter(chunks)
+
+    def iter_content(self, chunk_size=None):
+        return self._chunks
+
+
+class FakeDownloadSession:
+    def __init__(self, response):
+        self.response = response
+
+    def get(self, url, stream=False, timeout=None):
+        return self.response
+
+
+def test_download_attachment_streams_to_part_then_renames(tmp_path):
+    tool = MessageGuillotine.__new__(MessageGuillotine)
+    tool.download_session = FakeDownloadSession(
+        FakeStreamingResponse([b"ab", b"cd"]))
+    dest = tmp_path / "0001_1_pic.png"
+    assert tool.download_attachment("https://cdn.example/x", dest) == 4
+    assert dest.read_bytes() == b"abcd"
+    assert not dest.with_name(dest.name + ".part").exists()  # renamed, not left behind
+
+
+def test_download_attachment_non_200_returns_none_without_file(tmp_path):
+    tool = MessageGuillotine.__new__(MessageGuillotine)
+    tool.download_session = FakeDownloadSession(
+        FakeStreamingResponse([], status_code=404))
+    dest = tmp_path / "0001_1_pic.png"
+    assert tool.download_attachment("https://cdn.example/x", dest) is None
+    assert not dest.exists()
+
+
+def test_download_attachment_failure_mid_stream_leaves_no_part_file(tmp_path):
+    def chunks():
+        yield b"partial"
+        raise requests.RequestException("connection reset")
+
+    tool = MessageGuillotine.__new__(MessageGuillotine)
+    tool.download_session = FakeDownloadSession(FakeStreamingResponse(chunks()))
+    dest = tmp_path / "0001_1_pic.png"
+    assert tool.download_attachment("https://cdn.example/x", dest) is None
+    assert not dest.exists()
+    assert not dest.with_name(dest.name + ".part").exists()  # cleaned up
+
+
+def test_snowflake_for_encodes_timestamp():
+    dt = datetime(2026, 1, 4, 12, 30, tzinfo=timezone.utc)
+    assert int(snowflake_for(dt)) == (int(dt.timestamp() * 1000) - DISCORD_EPOCH_MS) << 22
+
+
+def test_session_headers_mimic_web_client():
+    import base64 as b64
+    import json as json_mod
+
+    tool = MessageGuillotine("fake-token")
+    headers = tool.session.headers
+    assert headers["Authorization"] == "fake-token"
+    # A complete, real browser UA — not a truncated pseudo-browser string
+    assert "Chrome/" in headers["User-Agent"] and "Safari/537.36" in headers["User-Agent"]
+    props = json_mod.loads(b64.b64decode(headers["X-Super-Properties"]))
+    assert props["os"] == "Windows" and props["browser"] == "Chrome"
+    assert props["browser_user_agent"] == headers["User-Agent"]
+    assert headers["X-Discord-Locale"] == "en-US"

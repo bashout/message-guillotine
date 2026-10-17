@@ -152,6 +152,33 @@ def test_media_traversal_refused(server_url):
     assert fetch(server_url, "/media/missing.png")[0] == 404
 
 
+def fetch_range(url, path, range_header):
+    """Like fetch, but sends a Range header and returns (status, Content-Range, body)."""
+    request = urllib.request.Request(
+        url + path, headers={"Host": "localhost", "Range": range_header})
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return response.status, response.headers.get("Content-Range"), response.read()
+    except urllib.error.HTTPError as error:
+        return error.code, error.headers.get("Content-Range"), error.read()
+
+
+def test_media_range_requests(server_url):
+    # The media file is b"\x89PNGdata" (8 bytes); range support is what lets
+    # <video>/<audio> seek in the viewer.
+    status, content_range, body = fetch_range(server_url, "/media/0001_4_pic.png", "bytes=2-5")
+    assert status == 206
+    assert body == b"NGda"
+    assert content_range == "bytes 2-5/8"
+    status, content_range, body = fetch_range(server_url, "/media/0001_4_pic.png", "bytes=-3")
+    assert status == 206
+    assert body == b"ata"  # suffix range: the last 3 bytes
+    assert content_range == "bytes 5-7/8"
+    status, content_range, body = fetch_range(server_url, "/media/0001_4_pic.png", "bytes=100-200")
+    assert status == 416
+    assert content_range == "bytes */8"
+
+
 def test_unknown_path_is_404(server_url):
     assert fetch(server_url, "/nope")[0] == 404
 
