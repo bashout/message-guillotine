@@ -115,6 +115,11 @@ class MessageGuillotine:
             "X-Super-Properties": base64.b64encode(
                 json.dumps(SUPER_PROPERTIES, separators=(",", ":")).encode()).decode(),
         })
+        # Separate session for CDN attachment downloads: keeps TLS connections
+        # alive across the many files of one archive run, and keeps the auth
+        # token out of requests to the CDN.
+        self.download_session = requests.Session()
+        self.download_session.headers.update({"User-Agent": BROWSER_USER_AGENT})
         self.current_user = None
         self.dm_channels = []
         self.guilds = []
@@ -299,7 +304,7 @@ class MessageGuillotine:
         Returns bytes written, or None on failure."""
         tmp_path = dest_path.with_name(dest_path.name + ".part")
         try:
-            resp = requests.get(url, stream=True, timeout=30)
+            resp = self.download_session.get(url, stream=True, timeout=30)
             if resp.status_code != 200:
                 return None
             size = 0
