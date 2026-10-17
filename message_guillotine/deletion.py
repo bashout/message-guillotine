@@ -13,7 +13,7 @@ session file is removed once the run completes.
 import json
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from message_guillotine.api import (
@@ -119,6 +119,8 @@ def run_deletion(tool, channel_id, label, start_time=None, end_time=None,
                  resume=None, dry_run=False, root=None):
     """Stream-scan the channel newest-to-oldest and delete every message you
     sent inside [start_time, end_time] (either bound may be None = no limit).
+    With an end_time the scan starts at the bound's snowflake — message IDs
+    encode creation time, so nothing newer than the range is ever fetched.
 
     With resume (a session dict from load_session), the scan continues after
     its before-cursor and the counters carry over. With dry_run, messages
@@ -158,6 +160,14 @@ def run_deletion(tool, channel_id, label, start_time=None, end_time=None,
         for key in ("scanned", "deleted", "failed", "skipped"):
             state[key] = int(resume.get(key) or 0)
         state["before_cursor"] = resume.get("before_cursor")
+    elif end_time is not None:
+        # Jump straight to the range boundary instead of scanning from the
+        # channel top and skipping every newer message: `before` the end
+        # bound's snowflake starts the first page inside the range. +1ms
+        # keeps the bound inclusive (`before` is strict); the timestamp
+        # check in the scan stays as the safety net.
+        state["before_cursor"] = snowflake_for(
+            end_time + timedelta(milliseconds=1))
 
     me_id = (tool.current_user or {}).get("id")
     # The count query covers exactly the range still ahead of the cursor: a

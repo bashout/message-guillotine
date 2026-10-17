@@ -2,7 +2,7 @@
 
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from message_guillotine import deletion
 from message_guillotine.api import (
@@ -221,6 +221,44 @@ def test_run_skips_messages_newer_than_end_time(monkeypatch, tmp_path):
     assert summary["scanned"] == 2
 
 
+def test_run_with_end_time_jumps_scan_to_range_boundary(monkeypatch, tmp_path):
+    # A fresh run with an end bound seeds the cursor with the bound's
+    # snowflake, so the first fetch is already inside the range: months of
+    # newer history are never fetched, and a message created at exactly the
+    # bound still counts as inside (`before` is strict, hence the +1ms).
+    def snowflake_at(dt):
+        return str((int(dt.timestamp() * 1000) - DISCORD_EPOCH_MS) << 22)
+
+    end = datetime(2026, 1, 5, tzinfo=timezone.utc)
+    msgs = [
+        {"id": snowflake_at(datetime(2026, 1, 6, tzinfo=timezone.utc)),
+         "author": {"id": "7"}, "timestamp": "2026-01-06T00:00:00+00:00",
+         "content": "newer", "type": 0},
+        {"id": snowflake_at(end),
+         "author": {"id": "7"}, "timestamp": "2026-01-05T00:00:00+00:00",
+         "content": "at the bound", "type": 0},
+        {"id": snowflake_at(datetime(2026, 1, 3, tzinfo=timezone.utc)),
+         "author": {"id": "7"}, "timestamp": "2026-01-03T00:00:00+00:00",
+         "content": "older", "type": 0},
+    ]
+
+    class BoundaryTool(StubTool):
+        def iter_channel_history_before(self, channel_id, before_id=None, limit=100):
+            self.fetch_calls.append(before_id)
+            for msg in self.messages:
+                if before_id is not None and int(msg["id"]) >= int(before_id):
+                    continue
+                yield msg
+
+    tool = BoundaryTool(msgs, delete_results=[("deleted", 0.0)])
+    summary = run_deletion(tool, "42", "chat",
+                           start_time=datetime(2026, 1, 4, tzinfo=timezone.utc),
+                           end_time=end, root=tmp_path)
+    assert tool.fetch_calls == [snowflake_for(end + timedelta(milliseconds=1))]
+    assert tool.delete_calls == [snowflake_at(end)]
+    assert summary["deleted"] == 1 and summary["complete"] is True
+
+
 def test_run_resumes_from_saved_cursor_and_counts(monkeypatch, tmp_path):
     tool = StubTool([message(3, day=3), message(2, day=2)],
                     delete_results=[("deleted", 0.0), ("deleted", 0.0)])
@@ -422,7 +460,10 @@ def test_run_bounds_count_by_range_and_cursor(monkeypatch, tmp_path):
     run_deletion(tool, "42", "chat", start_time=start_time,
                  end_time=end_time, root=tmp_path)
     assert seen["min_id"] == snowflake_for(start_time)
-    assert seen["max_id"] == snowflake_for(end_time)
+    # The count is bounded by the scan cursor, which a fresh run seeds at
+    # the end bound (+1ms: `before` is strict), so the estimate covers
+    # exactly the range ahead of the scan.
+    assert seen["max_id"] == snowflake_for(end_time + timedelta(milliseconds=1))
 
 
 def test_run_resume_counts_only_messages_after_cursor(monkeypatch, tmp_path):
