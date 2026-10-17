@@ -86,6 +86,17 @@ def _error_code(resp):
         return None
 
 
+def _retry_after(resp, fallback):
+    """Seconds to wait from a Retry-After header, or fallback when absent or
+    malformed (the header is optional and may legally hold an HTTP date,
+    which this client does not support). Never below 1s."""
+    try:
+        value = float(resp.headers.get("Retry-After"))
+    except (TypeError, ValueError):
+        value = fallback
+    return max(value, 1.0)
+
+
 def snowflake_for(dt):
     """The lowest message ID whose timestamp is at or after dt. Message IDs
     embed their creation time, so a datetime can bound a query by ID."""
@@ -262,7 +273,7 @@ class MessageGuillotine:
                 if resp.status_code == 200:
                     return resp
                 if resp.status_code == 429:
-                    retry_after = max(float(resp.headers.get("Retry-After") or FETCH_RETRY_DELAY), 1.0)
+                    retry_after = _retry_after(resp, FETCH_RETRY_DELAY)
                     last_error = "rate limited (429)"
                     print(f"\n  Rate limited; retrying in {retry_after:.0f}s...")
                     time.sleep(retry_after)
@@ -334,7 +345,7 @@ class MessageGuillotine:
                         wait = 0.0
                 return "deleted", wait
             if resp.status_code == 429:
-                retry_after = max(float(resp.headers.get("Retry-After") or RATE_LIMIT_DELAY), 1.0)
+                retry_after = _retry_after(resp, RATE_LIMIT_DELAY)
                 print(f"\n  Rate limited; retrying in {retry_after:.0f}s "
                       f"(attempt {attempt}/{DELETE_RETRIES})...")
                 time.sleep(retry_after)
