@@ -1,18 +1,21 @@
 """Interactive CLI for deleting and archiving your own messages.
 
-Delete YOUR messages from DMs or servers at 24/min rate.
-Uses the platform's unofficial user API (self-bot).
+Delete YOUR messages from DMs or servers: the channel is scanned
+newest-to-oldest one page at a time and each of your messages in the chosen
+range is deleted as it is found, with live progress and a resumable
+per-channel session. Uses the platform's unofficial user API (self-bot).
 WARNING: Self-bots violate the platform ToS. Use at your own risk.
 
 Entry point: guillotine.py"""
 
 
 import argparse
+import re
 import threading
 import webbrowser
 from datetime import datetime, timedelta
 
-from message_guillotine.api import HistoryFetchError, MessageGuillotine
+from message_guillotine.api import RATE_LIMIT_DELAY, MessageGuillotine
 from message_guillotine.archive_format import (
     find_existing_archive,
     list_archives,
@@ -20,16 +23,41 @@ from message_guillotine.archive_format import (
 )
 from message_guillotine.archiver import archive_chat
 from message_guillotine.config import configure_archive_dir, resolve_archive_dir
+from message_guillotine.deletion import load_session, run_deletion
 from message_guillotine.viewer.server import create_server
+
+FILTER_THRESHOLD = 12  # lists longer than this offer a name filter
+
+
+def _relative_datetime(text):
+    """A relative date as a datetime at local midnight, or None.
+
+    Accepted: 'today', 'yesterday', '7d', '2w', '3d ago'."""
+    text = text.strip().lower()
+    if text == "today":
+        return datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    if text == "yesterday":
+        return (datetime.now() - timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0)
+    match = re.fullmatch(r"(\d+)\s*([dw])\s*(?:ago)?", text)
+    if match:
+        days = int(match.group(1)) * (7 if match.group(2) == "w" else 1)
+        return (datetime.now() - timedelta(days=days)).replace(
+            hour=0, minute=0, second=0, microsecond=0)
+    return None
 
 
 def parse_datetime(prompt):
-    """Parse user input into datetime."""
+    """Parse user input into datetime. Blank means no limit."""
     while True:
         date_str = input(prompt).strip()
         if not date_str:
             return None
-        
+
+        relative = _relative_datetime(date_str)
+        if relative is not None:
+            return relative
+
         try:
             for fmt in ["%Y-%m-%d", "%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%m/%d/%Y", "%m/%d/%Y %H:%M"]:
                 try:
@@ -38,7 +66,46 @@ def parse_datetime(prompt):
                     continue
             return datetime.fromisoformat(date_str.replace('Z', '+00:00'))
         except ValueError:
-            print(f"Invalid format. Use: YYYY-MM-DD or YYYY-MM-DD HH:MM:SS")
+            print(f"Invalid format. Use: YYYY-MM-DD, YYYY-MM-DD HH:MM:SS, or 7d/today")
+
+
+def _choose_numbered(items, describe, prompt, title):
+    """Print a numbered list and prompt until a valid selection. Lists longer
+    than FILTER_THRESHOLD first offer a name filter. Returns the chosen item,
+    or None on cancel or empty filter result."""
+    print("\n" + "="*80)
+    print(title)
+    print("="*80)
+
+    chosen = items
+    if len(items) > FILTER_THRESHOLD:
+        while True:
+            query = input("Filter by name (blank to list all): ").strip().lower()
+            if not query:
+                chosen = items
+                break
+            chosen = [item for item in items if query in describe(item).lower()]
+            if chosen:
+                break
+            print("Nothing matches that filter; try again or leave blank.")
+
+    for i, item in enumerate(chosen, 1):
+        print(f"[{i}] {describe(item)}")
+
+    print("\n[0] Cancel")
+
+    while True:
+        raw = input(prompt).strip()
+        try:
+            choice = int(raw)
+        except ValueError:
+            print("Invalid selection.")
+            continue
+        if choice == 0:
+            return None
+        if 1 <= choice <= len(chosen):
+            return chosen[choice - 1]
+        print("Invalid selection.")
 
 
 def select_dm_user(tool):
@@ -61,24 +128,11 @@ def select_dm_user(tool):
     else:
         users.sort(key=lambda u: int(u.get('last_message_id') or 0), reverse=True)
 
-    print("\n" + "="*80)
-    print("SELECT A USER")
-    print("="*80)
-
-    for i, user in enumerate(users, 1):
+    def describe(user):
         display_name = user['global_name'] or user['username']
-        print(f"[{i}] {display_name}#{user['discriminator']} (ID: {user['id']})")
+        return f"{display_name}#{user['discriminator']} (ID: {user['id']})"
 
-    print("\n[0] Cancel")
-
-    try:
-        choice = int(input("Select user (number): ").strip())
-        if choice == 0:
-            return None
-        return users[choice - 1]
-    except (ValueError, IndexError):
-        print("Invalid selection.")
-        return None
+    return _choose_numbered(users, describe, "Select user (number): ", "SELECT A USER")
 
 
 def select_guild_channel(tool):
@@ -87,22 +141,12 @@ def select_guild_channel(tool):
         print("No servers found.")
         return None
 
-    print("\n" + "="*80)
-    print("SELECT A SERVER")
-    print("="*80)
-
-    for i, guild in enumerate(tool.guilds, 1):
-        print(f"[{i}] {guild['name']} (ID: {guild['id']})")
-
-    print("\n[0] Cancel")
-
-    try:
-        choice = int(input("Select server (number): ").strip())
-        if choice == 0:
-            return None
-        selected_guild = tool.guilds[choice - 1]
-    except (ValueError, IndexError):
-        print("Invalid selection.")
+    selected_guild = _choose_numbered(
+        tool.guilds,
+        lambda g: f"{g['name']} (ID: {g['id']})",
+        "Select server (number): ",
+        "SELECT A SERVER")
+    if selected_guild is None:
         return None
 
     channels = tool.get_guild_channels(selected_guild['id'])
@@ -110,23 +154,14 @@ def select_guild_channel(tool):
         print("No text channels found.")
         return None
 
-    print("\n" + "="*80)
-    print(f"SELECT A CHANNEL IN {selected_guild['name']}")
-    print("="*80)
-
-    for i, channel in enumerate(channels, 1):
-        print(f"[{i}] #{channel['name']} (ID: {channel['id']})")
-
-    print("\n[0] Cancel")
-
-    try:
-        choice = int(input("Select channel (number): ").strip())
-        if choice == 0:
-            return None
-        return selected_guild, channels[choice - 1]
-    except (ValueError, IndexError):
-        print("Invalid selection.")
+    selected_channel = _choose_numbered(
+        channels,
+        lambda c: f"#{c['name']} (ID: {c['id']})",
+        "Select channel (number): ",
+        f"SELECT A CHANNEL IN {selected_guild['name']}")
+    if selected_channel is None:
         return None
+    return selected_guild, selected_channel
 
 
 def browse_archives(focus_channel_id=None, archive_dir=None):
@@ -256,87 +291,128 @@ def handle_archive(tool, archive_dir=None):
         browse_archives(focus_channel_id=channel_id, archive_dir=archive_dir)
 
 
-def handle_dm_deletion(tool):
+def _parse_iso(value):
+    """An ISO string from a saved session back into a datetime, or None."""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def describe_range(start_time, end_time):
+    """Human-readable range for plans and resume prompts."""
+    start = start_time.strftime("%Y-%m-%d %H:%M") if start_time else "the beginning"
+    end = end_time.strftime("%Y-%m-%d %H:%M") if end_time else "now"
+    return f"{start} to {end}"
+
+
+def prompt_time_range():
+    """Prompt for an optional start and end time."""
+    print("\n" + "="*80)
+    print("SELECT TIME RANGE")
+    print("Leave blank for no limit; also accepted: 7d, 2w, today, yesterday")
+    print("="*80)
+    start_time = parse_datetime("Start date (YYYY-MM-DD HH:MM:SS): ")
+    end_time = parse_datetime("End date (YYYY-MM-DD HH:MM:SS): ")
+    return start_time, end_time
+
+
+def handle_deletion(tool, channel_id, label, dry_run=False):
+    """Shared DM/server deletion: offer to resume an unfinished run for this
+    channel (one keypress, no rescanning), otherwise plan a new run, confirm
+    it up front, then stream-scan and delete with live progress."""
+    channel_id = str(channel_id)
+    resume = None
+    session = load_session(channel_id)
+
+    if session:
+        start_time = _parse_iso(session.get("start_time"))
+        end_time = _parse_iso(session.get("end_time"))
+        print("\n" + "="*80)
+        print("UNFINISHED DELETION RUN FOR THIS CHAT")
+        print("="*80)
+        print(f"Deleted {session.get('deleted', 0)} of your messages so far "
+              f"(scanned {session.get('scanned', 0)}, "
+              f"skipped {session.get('skipped', 0)}, "
+              f"failed {session.get('failed', 0)}).")
+        print(f"Range: {describe_range(start_time, end_time)}")
+        print("[1] Resume where it stopped (default)")
+        print("[2] Start a new deletion run instead")
+        print("[0] Cancel")
+
+        while True:
+            choice = (input("Select (0-2): ").strip() or "1")
+            if choice == "0":
+                return
+            if choice == "1":
+                resume = session
+                break
+            if choice == "2":
+                start_time, end_time = prompt_time_range()
+                break
+            print("Invalid selection.")
+    else:
+        start_time, end_time = prompt_time_range()
+
+    print("\n" + "="*80)
+    print("DELETION PLAN")
+    print(f"Channel: {label} (ID: {channel_id})")
+    print("Scope: every message YOU sent in this channel")
+    print(f"Range: {describe_range(start_time, end_time)}")
+    print(f"Pace: ~24/min ({RATE_LIMIT_DELAY:.1f}s per delete); the scan runs live with progress")
+    if dry_run:
+        print("DRY RUN: nothing will be deleted")
+    print("="*80)
+
+    if input("Continue? (y/N): ").strip().lower() != 'y':
+        print("Cancelled.")
+        return
+
+    summary = run_deletion(tool, channel_id, label,
+                          start_time=start_time, end_time=end_time,
+                          resume=resume, dry_run=dry_run)
+
+    if summary["complete"]:
+        if dry_run:
+            print(f"\nDry run: {summary['deleted']} of your messages in range "
+                  f"would be deleted ({summary['scanned']} messages scanned).")
+            for sample in summary["samples"]:
+                print(f"  {sample}")
+        else:
+            print(f"\nDone. Deleted {summary['deleted']}, failed {summary['failed']}, "
+                  f"skipped {summary['skipped']} "
+                  f"({summary['scanned']} messages scanned).")
+            if summary["skipped"]:
+                print("Skipped messages are system messages (calls, pin notifications) "
+                      "that the platform does not allow deleting; they are filtered "
+                      "out without a delete attempt.")
+    else:
+        print(f"\nDeleted {summary['deleted']} so far "
+              f"(failed {summary['failed']}, skipped {summary['skipped']}, "
+              f"{summary['scanned']} scanned).")
+        print("Rerun the deletion for this chat to resume where it stopped.")
+
+
+def handle_dm_deletion(tool, dry_run=False):
     """Handle DM message deletion."""
     selected_user = select_dm_user(tool)
     if not selected_user:
         return
-    
-    print("\n" + "="*80)
-    print("SELECT TIME RANGE")
-    print("Leave blank for no limit")
-    print("="*80)
-    
-    start_time = parse_datetime("Start date (YYYY-MM-DD HH:MM:SS): ")
-    end_time = parse_datetime("End date (YYYY-MM-DD HH:MM:SS): ")
-    
-    if start_time is None:
-        start_time = datetime(2015, 1, 1)
-    if end_time is None:
-        end_time = datetime.now() + timedelta(days=1)
-    
-    print(f"\nTime range: {start_time} to {end_time}")
-    
-    channel_id = selected_user['channel_id']
-    print(f"\nFetching messages from DM with {selected_user['username']}...")
-
-    try:
-        all_messages = tool.get_channel_history(channel_id, limit=100)
-    except HistoryFetchError as exc:
-        print(f"Could not fetch channel history ({exc}).")
-        return
-    print(f"Fetched {len(all_messages)} total messages from this DM.")
-    
-    my_messages = tool.filter_messages_in_range(all_messages, start_time, end_time, my_only=True)
-    
-    if not my_messages:
-        print("No messages from you found in that time range.")
-        return
-    
-    tool.delete_with_rate_limit(my_messages, channel_id)
+    label = selected_user['global_name'] or selected_user['username']
+    handle_deletion(tool, selected_user['channel_id'], f"DM with {label}",
+                    dry_run=dry_run)
 
 
-def handle_server_deletion(tool):
+def handle_server_deletion(tool, dry_run=False):
     """Handle server message deletion."""
     selected = select_guild_channel(tool)
     if not selected:
         return
     selected_guild, selected_channel = selected
-
-    # Time range
-    print("\n" + "="*80)
-    print("SELECT TIME RANGE")
-    print("Leave blank for no limit")
-    print("="*80)
-
-    start_time = parse_datetime("Start date (YYYY-MM-DD HH:MM:SS): ")
-    end_time = parse_datetime("End date (YYYY-MM-DD HH:MM:SS): ")
-
-    if start_time is None:
-        start_time = datetime(2015, 1, 1)
-    if end_time is None:
-        end_time = datetime.now() + timedelta(days=1)
-
-    print(f"\nTime range: {start_time} to {end_time}")
-    print("Deleting: ONLY your messages")
-
-    channel_id = selected_channel['id']
-    print(f"\nFetching messages from #{selected_channel['name']}...")
-
-    try:
-        all_messages = tool.get_channel_history(channel_id, limit=100)
-    except HistoryFetchError as exc:
-        print(f"Could not fetch channel history ({exc}).")
-        return
-    print(f"Fetched {len(all_messages)} total messages from this channel.")
-
-    filtered_messages = tool.filter_messages_in_range(all_messages, start_time, end_time, my_only=True)
-    
-    if not filtered_messages:
-        print("No messages found matching criteria.")
-        return
-    
-    tool.delete_with_rate_limit(filtered_messages, channel_id)
+    label = f"{selected_guild['name']} #{selected_channel['name']}"
+    handle_deletion(tool, selected_channel['id'], label, dry_run=dry_run)
 
 
 def main(argv=None):
@@ -348,6 +424,8 @@ def main(argv=None):
                         help="archival folder for archives and the viewer "
                              "(overrides DM_ARCHIVE_DIR and the config file; "
                              "menu option [4] can still change it in-session)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="scan and report what would be deleted, without deleting")
     args = parser.parse_args(argv)
 
     print("="*80)
@@ -375,38 +453,41 @@ def main(argv=None):
         print("\n" + "="*80)
         print("SELECT MODE")
         print(f"Archival folder: {archive_dir}")
+        if args.dry_run:
+            print("DRY RUN mode: nothing will be deleted")
         print("="*80)
         print("[1] Delete DM messages")
         print("[2] Delete server messages")
         print("[3] Archive a chat (JSONL + attachments, no deletion)")
         print("[4] Set archive folder")
         print("[5] Browse archives in the viewer")
-        print("[0] Cancel")
+        print("[0] Exit")
 
         try:
-            mode = int(input("Mode (0-5): ").strip())
-        except ValueError:
+            raw = input("Mode (0-5): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if not raw.isdigit() or not 0 <= int(raw) <= 5:
             print("Invalid selection.")
-            return
+            continue
+        mode = int(raw)
 
-        if mode == 1:
-            handle_dm_deletion(tool)
+        if mode == 0:
             return
+        elif mode == 1:
+            handle_dm_deletion(tool, dry_run=args.dry_run)
         elif mode == 2:
-            handle_server_deletion(tool)
-            return
+            handle_server_deletion(tool, dry_run=args.dry_run)
         elif mode == 3:
             handle_archive(tool, archive_dir=cli_archive_dir)
-            return
         elif mode == 4:
             new_dir = configure_archive_dir(archive_dir)
             if new_dir != archive_dir:
                 cli_archive_dir = None  # the in-session choice replaces the CLI arg
         elif mode == 5:
             browse_archives(archive_dir=cli_archive_dir)
-        else:
-            print("Cancelled.")
-            return
+        # otherwise: loop back to the mode menu
 
 
 if __name__ == "__main__":
