@@ -434,7 +434,11 @@ def main(argv=None):
     print("WARNING: Self-bots violate the platform ToS. Use at your own risk.")
     print("="*80)
 
-    token = input("Enter your user token: ").strip()
+    try:
+        token = input("Enter your user token: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()  # Ctrl-D / Ctrl-C: leave cleanly instead of a traceback
+        return
     if not token:
         print("No token provided. Exiting.")
         return
