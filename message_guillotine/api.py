@@ -262,6 +262,8 @@ class MessageGuillotine:
                 yield msg
 
             cursor = messages[-1]['id']
+            if len(messages) < limit:
+                return
             time.sleep(0.5)
 
     def _fetch_page_with_retries(self, url, params):
