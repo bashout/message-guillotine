@@ -252,7 +252,9 @@ def run_deletion(tool, channel_id, label, start_time=None, end_time=None,
                 state["skipped"] += 1
             elif status == "failed":
                 state["failed"] += 1
-            else:  # "auth" or "rate_limited": every further delete fails too
+            else:  # "auth", "rate_limited" or "network": every further
+                # delete fails the same way; the session file lets a
+                # network/rate-limit abort resume where it stopped
                 aborted = status
                 break
             progress()
