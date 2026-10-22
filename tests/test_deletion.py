@@ -494,6 +494,24 @@ def test_run_resume_counts_only_messages_after_cursor(monkeypatch, tmp_path):
     assert seen == {"me_id": "7", "min_id": None, "max_id": "4"}
 
 
+def test_run_resume_estimate_ignores_prior_counters(monkeypatch, tmp_path, capsys):
+    # The resume count covers only messages ahead of the cursor; the prior
+    # session's deleted/failed are behind it, so subtracting them again
+    # would undercount what is left (and with it the ETA).
+    tool = StubTool([message(3, day=3), message(2, day=2)],
+                    delete_results=[("deleted", 0.0), ("deleted", 0.0)])
+    patch_sleep(monkeypatch)
+    monkeypatch.setattr(deletion, "_start_total_count",
+                        lambda *args: (lambda: 2))
+    resume = {"channel_id": "42", "before_cursor": "4",
+              "scanned": 10, "deleted": 4, "failed": 1, "skipped": 1,
+              "start_time": None, "end_time": None}
+    run_deletion(tool, "42", "chat", resume=resume, root=tmp_path)
+    out = capsys.readouterr().out
+    assert "~1 left" in out  # 2 ahead - 1 deleted this run
+    assert "~0 left" in out  # 2 ahead - 2 deleted this run
+
+
 def test_dry_run_shows_remaining_without_eta(monkeypatch, tmp_path, capsys):
     tool = StubTool([message(5), message(3, day=3)])
     monkeypatch.setattr(deletion, "_start_total_count",
