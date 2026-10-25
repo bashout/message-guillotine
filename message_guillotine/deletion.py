@@ -169,6 +169,12 @@ def run_deletion(tool, channel_id, label, start_time=None, end_time=None,
         state["before_cursor"] = snowflake_for(
             end_time + timedelta(milliseconds=1))
 
+    # Counters at the moment the scan starts. The total below covers only
+    # the range ahead of the cursor, so on a resume the prior session's
+    # deletes — all behind the cursor — must not be subtracted again.
+    prior_deleted = state["deleted"]
+    prior_failed = state["failed"]
+
     me_id = (tool.current_user or {}).get("id")
     # The count query covers exactly the range still ahead of the cursor: a
     # resume counts only messages older than where it stopped.
@@ -186,13 +192,16 @@ def run_deletion(tool, channel_id, label, start_time=None, end_time=None,
     def estimate_segment(dry=dry_run):
         """Progress-line tail with the remaining count (and ETA for real
         runs), or "" while the search count is unavailable. The count comes
-        from the search index and counts every message you authored in the
-        remaining range, so the ETA (delete pace) is an estimate, not a
-        promise; already-processed messages are subtracted as they tick."""
+        from the search index and covers exactly the range ahead of the
+        cursor, so only what this run has deleted or failed to delete is
+        subtracted as it ticks; a resume's prior counters are all behind
+        the cursor and stay out of the arithmetic. The ETA (delete pace)
+        is an estimate, not a promise."""
         total = poll_total()
         if total is None:
             return ""
-        remaining = max(0, total - state["deleted"] - state["failed"])
+        remaining = max(0, total - (state["deleted"] - prior_deleted)
+                         - (state["failed"] - prior_failed))
         if dry:
             return f" | ~{remaining} of yours left"
         return (f" | ~{remaining} left"
@@ -252,7 +261,9 @@ def run_deletion(tool, channel_id, label, start_time=None, end_time=None,
                 state["skipped"] += 1
             elif status == "failed":
                 state["failed"] += 1
-            else:  # "auth" or "rate_limited": every further delete fails too
+            else:  # "auth", "rate_limited" or "network": every further
+                # delete fails the same way; the session file lets a
+                # network/rate-limit abort resume where it stopped
                 aborted = status
                 break
             progress()

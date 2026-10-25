@@ -4,9 +4,12 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 
+import requests
+
 from message_guillotine import deletion
 from message_guillotine.api import (
     DISCORD_EPOCH_MS,
+    FETCH_RETRY_DELAY,
     RATE_LIMIT_DELAY,
     HistoryFetchError,
     MessageGuillotine,
@@ -44,6 +47,8 @@ class FakeSession:
     def delete(self, url, timeout=None):
         self.calls.append(url)
         item = self.responses.pop(0)
+        if isinstance(item, Exception):
+            raise item
         return item if isinstance(item, FakeResponse) else FakeResponse(item)
 
 
@@ -164,6 +169,41 @@ def test_delete_exhausted_429_aborts(monkeypatch, capsys):
     assert "still rate limited" in capsys.readouterr().out
 
 
+def test_delete_network_error_retries_and_deletes(monkeypatch):
+    # The server closes the pooled keep-alive connection while the run
+    # paces between deletes; the retry lands on a fresh connection.
+    tool = make_tool([requests.ConnectionError("Remote end closed connection"
+                                               " without response"), 204])
+    sleeps = patch_sleep(monkeypatch)
+    status, wait = tool.delete_message_with_retries("42", "1")
+    assert (status, wait) == ("deleted", 0.0)
+    assert len(tool.session.calls) == 2  # the same message retried
+    assert sleeps == [FETCH_RETRY_DELAY]
+
+
+def test_delete_404_after_network_error_counts_as_deleted(monkeypatch):
+    # The first attempt's delete reached the platform; only its reply was
+    # lost. The retry's 404 means the message is already gone.
+    tool = make_tool([requests.ConnectionError("Remote end closed"), 404])
+    status, _ = tool.delete_message_with_retries("42", "1")
+    assert status == "deleted"
+
+
+def test_delete_404_without_network_error_stays_failed():
+    tool = make_tool([404])
+    assert tool.delete_message_with_retries("42", "1") == ("failed", 0.0)
+
+
+def test_delete_persistent_network_errors_abort_as_network(monkeypatch, capsys):
+    tool = make_tool([requests.ConnectionError("down")] * 3)
+    sleeps = patch_sleep(monkeypatch)
+    status, _ = tool.delete_message_with_retries("42", "1")
+    assert status == "network"
+    assert len(tool.session.calls) == 3
+    assert sleeps == [FETCH_RETRY_DELAY] * 3
+    assert "network errors persisted" in capsys.readouterr().out
+
+
 # ---------------------------------------------------------------------------
 # session state
 # ---------------------------------------------------------------------------
@@ -276,6 +316,15 @@ def test_run_auth_abort_saves_resumable_session(monkeypatch, tmp_path):
     summary = run_deletion(tool, "42", "chat", root=tmp_path)
     assert summary["complete"] is False
     assert summary["aborted"] == "auth"
+    session = load_session("42", root=tmp_path)
+    assert session["before_cursor"] == "5" and session["scanned"] == 1
+
+
+def test_run_network_abort_saves_resumable_session(monkeypatch, tmp_path):
+    tool = StubTool([message(5)], delete_results=[("network", 0.0)])
+    summary = run_deletion(tool, "42", "chat", root=tmp_path)
+    assert summary["complete"] is False
+    assert summary["aborted"] == "network"
     session = load_session("42", root=tmp_path)
     assert session["before_cursor"] == "5" and session["scanned"] == 1
 
@@ -443,6 +492,24 @@ def test_run_resume_counts_only_messages_after_cursor(monkeypatch, tmp_path):
               "start_time": None, "end_time": None}
     run_deletion(tool, "42", "chat", resume=resume, root=tmp_path)
     assert seen == {"me_id": "7", "min_id": None, "max_id": "4"}
+
+
+def test_run_resume_estimate_ignores_prior_counters(monkeypatch, tmp_path, capsys):
+    # The resume count covers only messages ahead of the cursor; the prior
+    # session's deleted/failed are behind it, so subtracting them again
+    # would undercount what is left (and with it the ETA).
+    tool = StubTool([message(3, day=3), message(2, day=2)],
+                    delete_results=[("deleted", 0.0), ("deleted", 0.0)])
+    patch_sleep(monkeypatch)
+    monkeypatch.setattr(deletion, "_start_total_count",
+                        lambda *args: (lambda: 2))
+    resume = {"channel_id": "42", "before_cursor": "4",
+              "scanned": 10, "deleted": 4, "failed": 1, "skipped": 1,
+              "start_time": None, "end_time": None}
+    run_deletion(tool, "42", "chat", resume=resume, root=tmp_path)
+    out = capsys.readouterr().out
+    assert "~1 left" in out  # 2 ahead - 1 deleted this run
+    assert "~0 left" in out  # 2 ahead - 2 deleted this run
 
 
 def test_dry_run_shows_remaining_without_eta(monkeypatch, tmp_path, capsys):

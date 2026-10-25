@@ -339,10 +339,33 @@ class MessageGuillotine:
           "rate_limited" — still 429 after DELETE_RETRIES attempts; the server
                            is still throttling, so every remaining delete
                            would burn the same backoff
+          "network"      — the platform was unreachable for DELETE_RETRIES
+                           attempts; every further request would fail the
+                           same way until the connection is back
+
         A 429 backs off for the server's Retry-After and retries the same
-        message (bounded)."""
+        message (bounded). A network error — typically the server closing a
+        pooled keep-alive connection while the run paced between deletes —
+        also retries the same message: re-issuing a DELETE is safe, because
+        a repeat on an already-deleted message returns 404, which after a
+        network error counts as deleted (the first attempt went through,
+        its reply just never arrived)."""
+        last_failure = "rate_limited"
+        unconfirmed = False  # a delete may have been applied without a reply
         for attempt in range(1, DELETE_RETRIES + 1):
-            resp = self.delete_message(channel_id, message_id)
+            try:
+                resp = self.delete_message(channel_id, message_id)
+            except requests.RequestException as exc:
+                last_failure = "network"
+                unconfirmed = True
+                print(f"\n  Network error: {exc}; retrying in "
+                      f"{FETCH_RETRY_DELAY}s "
+                      f"(attempt {attempt}/{DELETE_RETRIES})...")
+                time.sleep(FETCH_RETRY_DELAY)
+                continue
+            if resp.status_code == 404 and unconfirmed:
+                return "deleted", 0.0
+            unconfirmed = False
             if resp.status_code in (200, 204):
                 wait = 0.0
                 if (resp.headers.get("X-RateLimit-Remaining") or "1") == "0":
@@ -352,6 +375,7 @@ class MessageGuillotine:
                         wait = 0.0
                 return "deleted", wait
             if resp.status_code == 429:
+                last_failure = "rate_limited"
                 retry_after = _retry_after(resp, RATE_LIMIT_DELAY)
                 print(f"\n  Rate limited; retrying in {retry_after:.0f}s "
                       f"(attempt {attempt}/{DELETE_RETRIES})...")
@@ -373,6 +397,12 @@ class MessageGuillotine:
                     print(f"Platform response: {detail}")
                 return "auth", 0.0
             return "failed", 0.0
+        if last_failure == "network":
+            print(f"\n\nStopping: network errors persisted through "
+                  f"{DELETE_RETRIES} attempts. Every further request would "
+                  f"fail the same way; the run can resume once the "
+                  f"connection is back.")
+            return "network", 0.0
         print(f"\n\nStopping: still rate limited after {DELETE_RETRIES} attempts. "
               f"Every remaining delete would fail the same way.")
         return "rate_limited", 0.0
