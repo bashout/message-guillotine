@@ -1132,7 +1132,7 @@ fn apply_style(ctx: &egui::Context) {
     visuals.widgets.hovered.rounding = egui::Rounding::same(6.0);
     visuals.widgets.active.rounding = egui::Rounding::same(6.0);
     visuals.selection.bg_fill = egui::Color32::from_rgb(0x3d, 0x6b, 0x99);
-    visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(0x6a, 0x9c, 0xc9));
+    visuals.selection.stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0x6a, 0x9c, 0xc9));
     visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(0x2e, 0x2e, 0x36);
     visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(0x27, 0x27, 0x2e);
     ctx.set_style(style);
