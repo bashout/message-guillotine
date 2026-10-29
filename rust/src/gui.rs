@@ -3,6 +3,7 @@
 //! daemon over loopback IPC so run-now stays inside the single-deletion
 //! lock; falls back to running directly when no daemon is up.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
@@ -43,7 +44,13 @@ pub async fn run(config_arg: Option<&PathBuf>) -> anyhow::Result<()> {
         .clone()
         .or_else(|| std::env::var_os("GUILLOTINE_VIEWER").map(PathBuf::from));
 
-    let menu = build_menu(&chats, &archive_dir, viewer.as_deref())?;
+    // Resolve raw chat keys to friendly names for the Run-now menu.
+    let labels = match cfg.token() {
+        Ok(token) => fetch_chat_labels(token, &chats).await,
+        Err(_) => HashMap::new(),
+    };
+
+    let menu = build_menu(&chats, &archive_dir, viewer.as_deref(), &labels)?;
     let _tray = tray_icon::TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_tooltip("guillotine")
@@ -212,7 +219,65 @@ fn open_in_file_manager(folder: &Path) {
     let _ = std::process::Command::new("explorer").arg(folder).spawn();
 }
 
-fn build_menu(chats: &[String], archive_dir: &Path, _viewer: Option<&Path>) -> anyhow::Result<Menu> {
+/// Map chat keys ("dm:<id>", "guild:<g>/channel:<c>") to friendly labels
+/// ("Display (@username)", "GuildName #channel") via the API. Keys that
+/// can't be resolved are simply absent from the map (callers fall back to
+/// the raw key).
+async fn fetch_chat_labels(token: &str, chats: &[String]) -> HashMap<String, String> {
+    use crate::config::ChatKey;
+    let mut map = HashMap::new();
+    let Ok(mut client) = crate::api::Client::new(token) else {
+        return map;
+    };
+    if client.get_current_user().await.ok().flatten().is_none() {
+        return map;
+    }
+    if let Ok(channels) = client.get_dm_channels().await {
+        for (user, _channel) in client.dm_users(&channels) {
+            let name = user
+                .global_name
+                .clone()
+                .unwrap_or_else(|| user.username.clone());
+            map.insert(
+                format!("dm:{}", user.id),
+                format!("{name} (@{})", user.username),
+            );
+        }
+    }
+    let mut guild_names: HashMap<String, String> = HashMap::new();
+    if let Ok(guilds) = client.get_guilds().await {
+        for g in guilds {
+            guild_names.insert(g.id, g.name);
+        }
+    }
+    let mut channels_by_guild: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    for chat in chats {
+        let Ok(ChatKey::GuildChannel { guild, channel }) = ChatKey::parse(chat) else {
+            continue;
+        };
+        let channels = channels_by_guild
+            .entry(guild.clone())
+            .or_default();
+        if channels.is_empty() {
+            *channels = fetch_guild_channels(token, &guild).await;
+        }
+        let channel_name = channels
+            .iter()
+            .find(|(id, _)| id == &channel)
+            .map(|(_, name)| name.clone())
+            .unwrap_or_else(|| format!("#{channel}"));
+        let guild_name = guild_names.get(&guild).cloned().unwrap_or_else(|| guild.clone());
+        map.insert(chat.clone(), format!("{guild_name} {channel_name}"));
+    }
+    map
+}
+
+fn build_menu(
+    chats: &[String],
+    archive_dir: &Path,
+    _viewer: Option<&Path>,
+    labels: &HashMap<String, String>,
+) -> anyhow::Result<Menu> {
     let menu = Menu::new();
     menu.append(&MenuItem::with_id(
         "settings",
@@ -245,9 +310,11 @@ fn build_menu(chats: &[String], archive_dir: &Path, _viewer: Option<&Path>) -> a
     if !chats.is_empty() {
         let run_sub = Submenu::with_id("run-now", "Run now", true);
         for chat in chats {
+            // Raw key stays the action id; the menu shows the friendly name.
+            let label = labels.get(chat).cloned().unwrap_or_else(|| chat.clone());
             run_sub.append(&MenuItem::with_id(
                 format!("run:{chat}"),
-                chat,
+                label,
                 true,
                 None::<Accelerator>,
             ))?;
@@ -317,6 +384,38 @@ struct SettingsApp {
 }
 
 const SCHEDULE_OPTIONS: [&str; 3] = ["daily", "weekly", "monthly"];
+
+/// Muted/secondary text for hints and metadata.
+fn muted(ui: &egui::Ui, text: impl Into<String>) -> egui::RichText {
+    egui::RichText::new(text.into()).color(ui.visuals().weak_text_color())
+}
+
+/// Monospace, muted style for ids and raw chat keys.
+fn mono(ui: &egui::Ui, text: impl Into<String>) -> egui::RichText {
+    egui::RichText::new(text.into())
+        .monospace()
+        .color(ui.visuals().weak_text_color())
+}
+
+/// Status color for a job phase: green done, red failed, amber running.
+fn phase_color(phase: &str) -> egui::Color32 {
+    if phase == "done" {
+        egui::Color32::from_rgb(0x66, 0xbb, 0x6a)
+    } else if phase.contains("fail") {
+        egui::Color32::from_rgb(0xef, 0x53, 0x50)
+    } else {
+        egui::Color32::from_rgb(0xff, 0xb3, 0x00)
+    }
+}
+
+/// Short timestamp for grid cells: "2024-03-10 04:00:00" -> "03-10 04:00".
+fn short_time(iso: &str) -> String {
+    if iso.len() > 19 {
+        format!("{} {}", &iso[5..10], &iso[11..19])
+    } else {
+        iso.to_string()
+    }
+}
 
 impl SettingsApp {
     fn load(path: &PathBuf, rt: &tokio::runtime::Handle) -> Self {
@@ -695,9 +794,9 @@ impl SettingsApp {
         self.poll_channel_fetch();
         self.ensure_channels_fetched();
         {
-            ui.heading("guillotine settings");
-            ui.label(format!("config file: {}", self.path.display()));
-            ui.add_space(6.0);
+            ui.heading("Settings");
+            ui.add(egui::Label::new(mono(ui, format!("config: {}", self.path.display()))));
+            ui.add_space(8.0);
 
             egui::CollapsingHeader::new("Connection")
                 .default_open(true)
@@ -742,14 +841,18 @@ impl SettingsApp {
                             }
                         });
                 } else {
-                    ui.label("no existing archives found in this folder yet");
+                    ui.add(egui::Label::new(muted(ui, "no existing archives found in this folder yet")));
                 }
             });
+            ui.add_space(8.0);
 
             egui::CollapsingHeader::new("DM scope")
                 .default_open(true)
                 .show(ui, |ui| {
-                    ui.label("No 'all DMs' mode: nominate users, or exclude specific users.");
+                    ui.add(egui::Label::new(muted(
+                        ui,
+                        "No 'all DMs' mode: nominate users, or exclude specific users.",
+                    )));
                     ui.horizontal(|ui| {
                         ui.label("policy:");
                         egui::ComboBox::from_id_salt("dm_policy")
@@ -774,21 +877,23 @@ impl SettingsApp {
                         ui.checkbox(&mut self.default_archive, "archive before delete");
                     });
                 });
+            ui.add_space(8.0);
 
             egui::CollapsingHeader::new(format!("DM chats ({} available)", self.dm_rows.len()))
                 .default_open(true)
                 .show(ui, |ui| {
                     if self.dm_pending {
-                        ui.label("fetching your DMs…");
+                        ui.add(egui::Label::new(muted(ui, "fetching your DMs…")));
                     }
                     if self.dm_rows.is_empty() && !self.dm_pending {
-                        ui.label("no DMs found — check the token above");
+                        ui.add(egui::Label::new(muted(ui, "no DMs found — check the token above")));
                     }
                     egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
                         for row in &mut self.dm_rows {
                             ui.horizontal(|ui| {
                                 ui.checkbox(&mut row.enabled, "");
-                                ui.label(format!("{}  [{}]", row.name, row.user_id));
+                                ui.label(egui::RichText::new(&row.name).strong());
+                                ui.label(mono(ui, &row.user_id));
                             });
                             if row.enabled {
                                 ui.horizontal(|ui| {
@@ -807,15 +912,16 @@ impl SettingsApp {
                         }
                     });
                 });
+            ui.add_space(8.0);
 
             egui::CollapsingHeader::new(format!("Guild channels ({})", self.manual_chats.len()))
                 .default_open(true)
                 .show(ui, |ui| {
                     if self.guild_pending {
-                        ui.label("fetching your guilds…");
+                        ui.add(egui::Label::new(muted(ui, "fetching your guilds…")));
                     }
                     if self.guilds.is_empty() && !self.guild_pending {
-                        ui.label("no guilds found — check the token above");
+                        ui.add(egui::Label::new(muted(ui, "no guilds found — check the token above")));
                     }
                     ui.horizontal(|ui| {
                         ui.label("guild:");
@@ -869,7 +975,10 @@ impl SettingsApp {
                         }
                     });
                     ui.add_space(4.0);
-                    ui.label("manual entry (fallback) — key format: guild:<guild_id>/channel:<channel_id>");
+                    ui.add(egui::Label::new(muted(
+                        ui,
+                        "manual entry (fallback) — key format: guild:<guild_id>/channel:<channel_id>",
+                    )));
                     let mut remove: Option<usize> = None;
                     for (i, row) in self.manual_chats.iter_mut().enumerate() {
                         ui.horizontal(|ui| {
@@ -905,7 +1014,15 @@ impl SettingsApp {
                 if ui.button("Save").clicked() {
                     self.save();
                 }
-                ui.label(&self.status);
+                if !self.status.is_empty() {
+                    let ok = self.status.starts_with("Saved");
+                    let color = if ok {
+                        egui::Color32::from_rgb(0x66, 0xbb, 0x6a)
+                    } else {
+                        egui::Color32::from_rgb(0xef, 0x53, 0x50)
+                    };
+                    ui.label(egui::RichText::new(&self.status).color(color));
+                }
             });
         }
     }
@@ -981,13 +1098,16 @@ impl eframe::App for PanelApp {
             let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
             g.ctx = Some(ctx.clone());
         }
-        egui::SidePanel::left("panel-tabs").show(ctx, |ui| {
+        egui::TopBottomPanel::top("panel-titlebar").show(ctx, |ui| {
             ui.add_space(6.0);
-            ui.heading("guillotine");
+            ui.horizontal(|ui| {
+                ui.heading("guillotine");
+                ui.separator();
+                let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                ui.selectable_value(&mut g.tab, Tab::Jobs, "Jobs");
+                ui.selectable_value(&mut g.tab, Tab::Settings, "Settings");
+            });
             ui.add_space(6.0);
-            let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            ui.selectable_value(&mut g.tab, Tab::Jobs, "Jobs");
-            ui.selectable_value(&mut g.tab, Tab::Settings, "Settings");
         });
         let tab = self.state.lock().unwrap_or_else(|e| e.into_inner()).tab;
         egui::CentralPanel::default().show(ctx, |ui| match tab {
@@ -1004,7 +1124,7 @@ fn panel_window(state: std::sync::Arc<std::sync::Mutex<PanelState>>) -> anyhow::
     };
     let app = PanelApp {
         settings: SettingsApp::load(&config_path, &rt),
-        jobs: JobsApp::new(&rt),
+        jobs: JobsApp::new(&rt, &config_path),
         state,
     };
     let mut options = eframe::NativeOptions {
@@ -1033,10 +1153,12 @@ struct JobsApp {
     running: Vec<serde_json::Value>,
     last: serde_json::Value,
     note: String,
+    /// Chat key -> friendly label, fetched in the background from the API.
+    labels: std::sync::Arc<std::sync::Mutex<HashMap<String, String>>>,
 }
 
 impl JobsApp {
-    fn new(rt: &tokio::runtime::Handle) -> Self {
+    fn new(rt: &tokio::runtime::Handle, config_path: &Path) -> Self {
         let (tx, rx) = mpsc::channel::<serde_json::Value>();
         let rt = rt.clone();
         rt.spawn(async move {
@@ -1054,12 +1176,42 @@ impl JobsApp {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
         });
+        // Resolve friendly chat labels in the background for the grids.
+        let labels = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+        {
+            let labels = labels.clone();
+            let config_path = config_path.to_path_buf();
+            rt.spawn(async move {
+                if let Ok((cfg, _)) = crate::load_config(Some(&config_path)) {
+                    let chats: Vec<String> = cfg.chats().map(|(k, _)| k.to_string()).collect();
+                    if let Ok(token) = cfg.token() {
+                        let map = fetch_chat_labels(token, &chats).await;
+                        *labels.lock().unwrap_or_else(|e| e.into_inner()) = map;
+                    }
+                }
+            });
+        }
         JobsApp {
             rx,
             running: Vec::new(),
             last: serde_json::json!({}),
             note: String::new(),
+            labels,
         }
+    }
+
+    /// Friendly label for a chat key: the daemon-provided job label first,
+    /// then the locally fetched map, else the raw key.
+    fn label_for(&self, key: &str, job_label: Option<&str>) -> String {
+        if let Some(l) = job_label.filter(|l| !l.is_empty()) {
+            return l.to_string();
+        }
+        self.labels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .cloned()
+            .unwrap_or_else(|| key.to_string())
     }
 
     fn show(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
@@ -1075,61 +1227,112 @@ impl JobsApp {
         ctx.request_repaint_after(std::time::Duration::from_secs(1));
 
         {
-            ui.heading("guillotine jobs");
+            ui.heading("Jobs");
+            ui.label(muted(ui, "live view of the daemon's job registry, refreshed every second"));
             if !self.note.is_empty() {
-                ui.label(&self.note);
+                ui.add(egui::Label::new(
+                    egui::RichText::new(&self.note).color(egui::Color32::from_rgb(0xef, 0x53, 0x50)),
+                ));
             }
-            ui.add_space(6.0);
-            ui.label("Running now:");
-            if self.running.is_empty() {
-                ui.label("  none");
-            }
-            egui::Grid::new("jobs-grid").striped(true).show(ui, |ui| {
-                ui.label(egui::RichText::new("chat").strong());
-                ui.label(egui::RichText::new("phase").strong());
-                ui.label(egui::RichText::new("scanned").strong());
-                ui.label(egui::RichText::new("deleted").strong());
-                ui.label(egui::RichText::new("failed").strong());
-                ui.label(egui::RichText::new("skipped").strong());
-                ui.label(egui::RichText::new("since").strong());
-                ui.end_row();
-                for job in &self.running {
-                    ui.label(job["chat"].as_str().unwrap_or(""));
-                    ui.label(format!("{} — {}", job["phase"].as_str().unwrap_or(""), job["note"].as_str().unwrap_or("")));
-                    ui.label(job["scanned"].to_string());
-                    ui.label(job["deleted"].to_string());
-                    ui.label(job["failed"].to_string());
-                    ui.label(job["skipped"].to_string());
-                    let started = job["started"].as_str().unwrap_or("");
-                    ui.label(if started.len() > 19 { &started[..19] } else { started });
-                    ui.end_row();
-                }
-            });
-            ui.add_space(10.0);
-            ui.label("Last run per chat:");
-            let empty = self.last.as_object().is_none_or(|o| o.is_empty());
-            if empty {
-                ui.label("  none yet");
-            }
-            if let Some(obj) = self.last.as_object() {
-                egui::Grid::new("last-grid").striped(true).show(ui, |ui| {
-                    ui.label(egui::RichText::new("chat").strong());
-                    ui.label(egui::RichText::new("last run").strong());
-                    ui.label(egui::RichText::new("deleted").strong());
-                    ui.label(egui::RichText::new("failed").strong());
-                    ui.label(egui::RichText::new("complete").strong());
-                    ui.end_row();
-                    for (chat, r) in obj {
-                        ui.label(chat);
-                        let when = r["last_run"].as_str().unwrap_or("");
-                        ui.label(if when.len() > 19 { &when[..19] } else { when });
-                        ui.label(r["deleted"].to_string());
-                        ui.label(r["failed"].to_string());
-                        ui.label(r["complete"].to_string());
+            ui.add_space(8.0);
+
+            egui::CollapsingHeader::new(format!("Running now ({})", self.running.len()))
+                .default_open(true)
+                .show(ui, |ui| {
+                    if self.running.is_empty() {
+                        ui.add(egui::Label::new(muted(ui, "no jobs running")));
+                        return;
+                    }
+                    egui::Grid::new("jobs-grid").striped(true).show(ui, |ui| {
+                        ui.label(egui::RichText::new("chat").strong());
+                        ui.label(egui::RichText::new("phase").strong());
+                        ui.label(egui::RichText::new("progress").strong());
+                        ui.label(egui::RichText::new("counts (del/fail/skip)").strong());
+                        ui.label(egui::RichText::new("started").strong());
                         ui.end_row();
+                        for job in &self.running {
+                            let key = job["chat"].as_str().unwrap_or("");
+                            let label = self.label_for(key, job["label"].as_str());
+                            ui.vertical(|ui| {
+                                ui.label(egui::RichText::new(&label).strong());
+                                ui.label(mono(ui, key));
+                            });
+                            let phase = job["phase"].as_str().unwrap_or("");
+                            let note = job["note"].as_str().unwrap_or("");
+                            ui.vertical(|ui| {
+                                ui.label(egui::RichText::new(phase).strong().color(phase_color(phase)));
+                                if !note.is_empty() {
+                                    ui.label(muted(ui, note));
+                                }
+                            });
+                            let scanned = job["scanned"].as_u64().unwrap_or(0);
+                            let done = job["deleted"].as_u64().unwrap_or(0)
+                                + job["failed"].as_u64().unwrap_or(0)
+                                + job["skipped"].as_u64().unwrap_or(0);
+                            let frac = if scanned > 0 {
+                                (done as f32 / scanned as f32).clamp(0.0, 1.0)
+                            } else {
+                                0.0
+                            };
+                            ui.add(
+                                egui::ProgressBar::new(frac)
+                                    .desired_width(160.0)
+                                    .text(format!("{done}/{scanned} scanned")),
+                            );
+                            ui.label(format!(
+                                "{} / {} / {}",
+                                job["deleted"], job["failed"], job["skipped"]
+                            ));
+                            ui.label(mono(ui, short_time(job["started"].as_str().unwrap_or(""))));
+                            ui.end_row();
+                        }
+                    });
+                });
+
+            ui.add_space(8.0);
+            let empty = self.last.as_object().is_none_or(|o| o.is_empty());
+            egui::CollapsingHeader::new("Last run per chat")
+                .default_open(true)
+                .show(ui, |ui| {
+                    if empty {
+                        ui.add(egui::Label::new(muted(ui, "no runs recorded yet")));
+                        return;
+                    }
+                    if let Some(obj) = self.last.as_object() {
+                        egui::Grid::new("last-grid").striped(true).show(ui, |ui| {
+                            ui.label(egui::RichText::new("chat").strong());
+                            ui.label(egui::RichText::new("last run").strong());
+                            ui.label(egui::RichText::new("deleted").strong());
+                            ui.label(egui::RichText::new("failed").strong());
+                            ui.label(egui::RichText::new("complete").strong());
+                            ui.end_row();
+                            for (chat, r) in obj {
+                                let label = self.label_for(chat, None);
+                                ui.vertical(|ui| {
+                                    ui.label(egui::RichText::new(&label).strong());
+                                    ui.label(mono(ui, chat));
+                                });
+                                ui.label(mono(ui, short_time(r["last_run"].as_str().unwrap_or(""))));
+                                ui.label(r["deleted"].to_string());
+                                let failed = r["failed"].as_u64().unwrap_or(0);
+                                let failed_txt = egui::RichText::new(r["failed"].to_string());
+                                ui.label(if failed > 0 {
+                                    failed_txt.color(egui::Color32::from_rgb(0xef, 0x53, 0x50))
+                                } else {
+                                    failed_txt
+                                });
+                                let complete = r["complete"].as_bool().unwrap_or(false);
+                                let color = if complete {
+                                    egui::Color32::from_rgb(0x66, 0xbb, 0x6a)
+                                } else {
+                                    egui::Color32::from_rgb(0xff, 0xb3, 0x00)
+                                };
+                                ui.label(egui::RichText::new(r["complete"].to_string()).color(color));
+                                ui.end_row();
+                            }
+                        });
                     }
                 });
-            }
         }
     }
 }

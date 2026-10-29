@@ -4,7 +4,9 @@
 //! the deletion — and every deletion goes through the process-wide
 //! single-run lock, so only one deletion ever runs at a time.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 
 use chrono::{DateTime, Datelike, Duration, Local, NaiveTime};
 
@@ -73,6 +75,59 @@ pub async fn resolve_channel_id(client: &Client, key: &ChatKey) -> anyhow::Resul
     }
 }
 
+/// Process-wide cache of chat key -> friendly label, so repeated job runs
+/// don't re-hit the API for the same DM user or guild channel names.
+fn label_cache() -> &'static Mutex<HashMap<String, String>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Resolve a chat key to a friendly label: "Display (@username)" for a DM,
+/// "GuildName #channel" for a guild channel. Falls back to the raw key when
+/// the API lookup fails (offline, unknown id), and caches the result.
+async fn chat_label(client: &Client, key: &ChatKey) -> String {
+    let cache_key = key.to_string();
+    if let Some(label) = label_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&cache_key)
+    {
+        return label.clone();
+    }
+    let label = match key {
+        ChatKey::Dm(user) => {
+            let mut label = cache_key.clone();
+            if let Ok(channels) = client.get_dm_channels().await {
+                if let Some((u, _)) = client.dm_users(&channels).into_iter().find(|(u, _)| &u.id == user) {
+                    let name = u.global_name.clone().unwrap_or_else(|| u.username.clone());
+                    label = format!("{name} (@{})", u.username);
+                }
+            }
+            label
+        }
+        ChatKey::GuildChannel { guild, channel } => {
+            let mut guild_name = guild.clone();
+            if let Ok(guilds) = client.get_guilds().await {
+                if let Some(g) = guilds.iter().find(|g| &g.id == guild) {
+                    guild_name = g.name.clone();
+                }
+            }
+            let mut channel_name = format!("#{channel}");
+            if let Ok(channels) = client.get_guild_channels(guild).await {
+                if let Some(c) = channels.iter().find(|c| &c.id == channel) {
+                    channel_name = format!("#{}", c.name);
+                }
+            }
+            format!("{guild_name} {channel_name}")
+        }
+    };
+    label_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(cache_key, label.clone());
+    label
+}
+
 /// Execute one chat's job: archive first when configured (appending to the
 /// existing archive for this chat), then delete your messages older than the
 /// retention window. The deletion phase holds the global single-run lock.
@@ -87,7 +142,8 @@ pub async fn run_chat_job(
     let archive_dir = cfg.resolve_archive_dir(None);
 
     let chat_key = job.key.to_string();
-    registry.start(&chat_key, "starting");
+    let friendly = chat_label(client, &job.key).await;
+    registry.start(&chat_key, &friendly, "starting");
     // One job at a time, archive phase included: two concurrent archives of
     // the same chat would both append the same messages (duplicate records).
     let _guard = deletion::deletion_lock().lock().await;

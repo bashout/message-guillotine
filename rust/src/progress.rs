@@ -7,6 +7,9 @@ use std::sync::{Arc, Mutex};
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct JobProgress {
     pub chat: String,
+    /// Friendly display name ("Display (@user)" / "Guild #channel"); falls
+    /// back to `chat` when the lookup failed.
+    pub label: String,
     pub phase: String,
     pub scanned: u64,
     pub deleted: u64,
@@ -23,12 +26,13 @@ pub struct JobRegistry {
 }
 
 impl JobRegistry {
-    pub fn start(&self, chat: &str, phase: &str) {
+    pub fn start(&self, chat: &str, label: &str, phase: &str) {
         let now = chrono::Utc::now().to_rfc3339();
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).insert(
             chat.to_string(),
             JobProgress {
                 chat: chat.to_string(),
+                label: label.to_string(),
                 phase: phase.to_string(),
                 scanned: 0,
                 deleted: 0,
