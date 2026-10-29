@@ -35,7 +35,7 @@ Everything lives in the crate at the repo root:
 
 ```bash
 git clone https://github.com/bashout/message-guillotine.git
-cd message-guillotine/rust
+cd message-guillotine
 cargo build --release            # add --no-default-features on headless Linux
 
 # the binary is target/release/guillotine

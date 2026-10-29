@@ -46,12 +46,15 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            bin: guillotine
             artifact: guillotine-linux-x86_64
           - os: macos-latest
             target: aarch64-apple-darwin
+            bin: guillotine
             artifact: guillotine-macos-aarch64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            bin: guillotine.exe
             artifact: guillotine-windows-x86_64.exe
     steps:
       - name: Checkout
@@ -75,8 +78,17 @@ jobs:
         working-directory: .
         run: cargo build --release --target ${{ matrix.target }}
 
+      # cargo names the binary after [[bin]] ("guillotine"), not after the
+      # published artifact name, so stage it under the release name first.
+      - name: Stage artifact
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${{ matrix.artifact }}"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
-          path: target/${{ matrix.target }}/release/${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}
+          if-no-files-found: error

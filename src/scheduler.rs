@@ -12,7 +12,7 @@ use chrono::{DateTime, Datelike, Duration, Local, NaiveTime};
 
 use crate::api::Client;
 use crate::archiver;
-use crate::config::{ChatConfig, ChatKey, Config, ScheduleKind};
+use crate::config::{ChatConfig, ChatKey, Config, Schedule, ScheduleKind};
 use crate::deletion;
 
 /// A chat job resolved from the config: who/what to process and how.
@@ -251,6 +251,54 @@ pub fn next_fire(
     }
 }
 
+/// Per-chat scheduling state, kept across loop iterations. Holding the next
+/// fire time (instead of recomputing it from `now` every pass) is what makes a
+/// fire time that passes while the loop is busy — a long deletion, a suspend —
+/// fire late rather than be silently skipped for a whole period. `anchor` pins
+/// a weekly schedule to the weekday it was first scheduled on, so it cannot
+/// drift to whatever day the loop happens to recompute on.
+#[derive(Debug, Clone)]
+pub struct JobSchedule {
+    pub next: DateTime<Local>,
+    pub schedule: Schedule,
+    pub anchor: Option<chrono::Weekday>,
+}
+
+/// Reconcile the schedule state with the current job list: add chats that are
+/// new, recompute chats whose schedule changed, and drop chats that are gone.
+/// Entries that are still valid are left untouched, so a due time is never
+/// pushed forward.
+pub fn reconcile_schedules(
+    state: &mut HashMap<String, JobSchedule>,
+    jobs: &[ChatJob],
+    now: DateTime<Local>,
+) {
+    let keys: std::collections::HashSet<String> =
+        jobs.iter().map(|j| j.key.to_string()).collect();
+    state.retain(|k, _| keys.contains(k));
+    for job in jobs {
+        let key = job.key.to_string();
+        if state
+            .get(&key)
+            .is_some_and(|existing| existing.schedule == job.settings.schedule)
+        {
+            continue;
+        }
+        let anchor = match job.settings.schedule.kind {
+            ScheduleKind::Weekly => Some(now.weekday()),
+            _ => None,
+        };
+        state.insert(
+            key,
+            JobSchedule {
+                next: next_fire(&job.settings.schedule, now, anchor.as_ref()),
+                schedule: job.settings.schedule,
+                anchor,
+            },
+        );
+    }
+}
+
 /// `guillotine run-now <chat>`: run one configured chat immediately. Still
 /// serialized with any scheduled run via the deletion lock.
 pub async fn run_now(config_arg: Option<&PathBuf>, chat: &str) -> anyhow::Result<()> {
@@ -260,11 +308,19 @@ pub async fn run_now(config_arg: Option<&PathBuf>, chat: &str) -> anyhow::Result
     if let Ok(resp) = crate::ipc::send(serde_json::json!({ "cmd": "run_now", "chat": chat })).await
     {
         if resp.get("ok").and_then(|v| v.as_bool()) == Some(true) {
-            let s = &resp["summary"];
-            println!(
-                "run-now {chat}: deleted {}, failed {}, skipped {} ({} scanned, complete={})",
-                s["deleted"], s["failed"], s["skipped"], s["scanned"], s["complete"]
-            );
+            // The daemon acks run-now immediately and runs it in the
+            // background, so there is usually no summary to print.
+            if resp.get("accepted").and_then(|v| v.as_bool()) == Some(true) {
+                println!(
+                    "run-now {chat}: accepted by the daemon; running in the background \
+                     (see the Jobs tab or the service log for the result)"
+                );
+            } else if let Some(s) = resp.get("summary") {
+                println!(
+                    "run-now {chat}: deleted {}, failed {}, skipped {} ({} scanned, complete={})",
+                    s["deleted"], s["failed"], s["skipped"], s["scanned"], s["complete"]
+                );
+            }
             return Ok(());
         } else {
             anyhow::bail!(
@@ -344,13 +400,9 @@ pub async fn run_loop(cfg: &Config, config_path: &std::path::Path) -> anyhow::Re
         }
     }
     tracing::info!(count = jobs.len(), "scheduler started");
-    let mut next: Vec<(DateTime<Local>, usize)> = jobs
-        .iter()
-        .enumerate()
-        .map(|(i, j)| (next_fire(&j.settings.schedule, Local::now(), None), i))
-        .collect();
+    let mut schedules: HashMap<String, JobSchedule> = HashMap::new();
+    reconcile_schedules(&mut schedules, &jobs, Local::now());
 
-    let anchors: std::collections::HashMap<String, chrono::Weekday> = std::collections::HashMap::new();
     loop {
         // Pick up config edits (GUI save, manual edits) without a restart —
         // and re-resolve the job list so removed chats stop firing immediately.
@@ -369,18 +421,19 @@ pub async fn run_loop(cfg: &Config, config_path: &std::path::Path) -> anyhow::Re
                     tracing::info!(chat = %gone.key, "chat removed from config; no longer scheduled");
                 }
                 jobs = fresh_jobs;
-                next = jobs
-                    .iter()
-                    .enumerate()
-                    .map(|(i, j)| (next_fire(&j.settings.schedule, Local::now(), anchors.get(&j.key.to_string())), i))
-                    .collect();
+                reconcile_schedules(&mut schedules, &jobs, Local::now());
             }
             Err(e) => tracing::warn!(error = %e, "job re-resolution failed; keeping previous jobs"),
         }
         let cfg = &cfg;
         let now = Local::now();
-        next.sort_by_key(|(t, _)| *t);
-        let Some((due, idx)) = next.first().copied() else {
+        // Earliest due chat. A due time that already passed stays due and
+        // fires late instead of being pushed to the next period.
+        let Some((key, due)) = schedules
+            .iter()
+            .min_by_key(|(_, s)| s.next)
+            .map(|(k, s)| (k.clone(), s.next))
+        else {
             tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
             continue;
         };
@@ -388,21 +441,14 @@ pub async fn run_loop(cfg: &Config, config_path: &std::path::Path) -> anyhow::Re
             let wait = (due - now)
                 .to_std()
                 .unwrap_or(std::time::Duration::from_secs(1));
+            // Wake at least hourly so config and DM-scope edits are picked up.
             tokio::time::sleep(wait.min(std::time::Duration::from_secs(3600))).await;
-            // Re-resolve scope hourly while waiting so DM changes are picked up.
-            if wait > std::time::Duration::from_secs(3600) {
-                if let Ok(fresh) = resolve_jobs(&client, cfg).await {
-                    jobs = fresh;
-                    next = jobs
-                        .iter()
-                        .enumerate()
-                        .map(|(i, j)| (next_fire(&j.settings.schedule, Local::now(), None), i))
-                        .collect();
-                }
-            }
             continue;
         }
-        let job = jobs[idx].clone();
+        let Some(job) = jobs.iter().find(|j| j.key.to_string() == key).cloned() else {
+            schedules.remove(&key);
+            continue;
+        };
         tracing::info!(chat = %job.key, "scheduled run firing");
         match run_chat_job(&client, cfg, &job, &registry).await {
             Ok(summary) => {
@@ -411,7 +457,10 @@ pub async fn run_loop(cfg: &Config, config_path: &std::path::Path) -> anyhow::Re
             }
             Err(e) => tracing::error!(chat = %job.key, error = %e, "job failed"),
         }
-        next[idx] = (next_fire(&job.settings.schedule, Local::now(), anchors.get(&job.key.to_string())), idx);
+        // Advance only this chat, measured from when the run finished.
+        if let Some(s) = schedules.get_mut(&key) {
+            s.next = next_fire(&s.schedule, Local::now(), s.anchor.as_ref());
+        }
     }
 }
 
@@ -648,6 +697,86 @@ default_retention_days = 14
         let jobs = dm_default_jobs(&cfg, &dm_users);
         assert_eq!(job_keys(&jobs), vec!["dm:1"]);
         assert_eq!(jobs[0].settings.retention_days, 14);
+    }
+
+    fn job(key: &str, schedule: Schedule) -> ChatJob {
+        ChatJob {
+            key: ChatKey::parse(key).unwrap(),
+            settings: ChatConfig {
+                schedule,
+                retention_days: 7,
+                archive_before_delete: false,
+            },
+        }
+    }
+
+    fn weekly() -> Schedule {
+        Schedule { kind: ScheduleKind::Weekly, at: at(4, 0) }
+    }
+
+    fn daily() -> Schedule {
+        Schedule { kind: ScheduleKind::Daily, at: at(4, 0) }
+    }
+
+    #[test]
+    fn weekly_anchor_is_pinned_so_it_cannot_drift_to_today() {
+        // First seen Monday 10:00 -> next Monday 04:00.
+        let mut state = HashMap::new();
+        let j = job("dm:1", weekly());
+        reconcile_schedules(&mut state, std::slice::from_ref(&j), local(2024, 3, 11, 10, 0));
+        assert_eq!(state["dm:1"].next, local(2024, 3, 18, 4, 0));
+        assert_eq!(state["dm:1"].anchor, Some(chrono::Weekday::Mon));
+        // Reconciled again on Tuesday: the pinned anchor keeps it on Monday
+        // instead of sliding to "tomorrow", which is what made weekly fire daily.
+        reconcile_schedules(&mut state, &[j], local(2024, 3, 12, 0, 0));
+        assert_eq!(state["dm:1"].next, local(2024, 3, 18, 4, 0));
+        // ...and on every other day of the week.
+        for day in 13..=17 {
+            reconcile_schedules(&mut state, &[job("dm:1", weekly())], local(2024, 3, day, 0, 0));
+            assert_eq!(
+                state["dm:1"].next,
+                local(2024, 3, 18, 4, 0),
+                "weekly must stay on its anchor day (reconciled on 03-{day})"
+            );
+        }
+    }
+
+    #[test]
+    fn reconcile_never_pushes_a_due_time_forward() {
+        // A fire time that passes while the loop is busy (a long deletion, a
+        // suspend) must stay due and fire late, not be skipped for a period.
+        let mut state = HashMap::new();
+        let j = job("dm:1", daily());
+        reconcile_schedules(&mut state, std::slice::from_ref(&j), local(2024, 3, 11, 3, 0));
+        let due = state["dm:1"].next;
+        assert_eq!(due, local(2024, 3, 11, 4, 0));
+        reconcile_schedules(&mut state, &[j], local(2024, 3, 11, 9, 0));
+        assert_eq!(state["dm:1"].next, due, "a missed fire must stay due");
+    }
+
+    #[test]
+    fn reconcile_adds_removes_and_repins_on_schedule_change() {
+        let mut state = HashMap::new();
+        reconcile_schedules(
+            &mut state,
+            &[job("dm:1", weekly()), job("dm:2", daily())],
+            local(2024, 3, 11, 10, 0),
+        );
+        assert_eq!(state.len(), 2);
+        // dm:2 disappears from the config
+        reconcile_schedules(&mut state, &[job("dm:1", weekly())], local(2024, 3, 12, 0, 0));
+        assert!(!state.contains_key("dm:2"), "removed chats are dropped");
+        // dm:1 switches to daily: recomputed, anchor cleared
+        reconcile_schedules(&mut state, &[job("dm:1", daily())], local(2024, 3, 12, 0, 0));
+        assert_eq!(state["dm:1"].next, local(2024, 3, 12, 4, 0));
+        assert_eq!(state["dm:1"].anchor, None);
+        // a new chat is picked up
+        reconcile_schedules(
+            &mut state,
+            &[job("dm:1", daily()), job("guild:1/channel:2", daily())],
+            local(2024, 3, 12, 0, 0),
+        );
+        assert!(state.contains_key("guild:1/channel:2"));
     }
 
     #[test]

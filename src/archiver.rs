@@ -314,12 +314,18 @@ use std::time::Duration;
 
 /// One-shot CLI archive of a channel.
 pub async fn archive(config_arg: Option<&std::path::PathBuf>, channel: &str) -> anyhow::Result<()> {
+    if !crate::config::valid_id(channel) {
+        anyhow::bail!("channel id must be numeric");
+    }
     let (cfg, _path) = crate::load_config(config_arg)?;
     let mut client = Client::new(cfg.token()?)?;
     if client.get_current_user().await?.is_none() {
         anyhow::bail!("invalid token or authentication failed");
     }
     let archive_dir = cfg.resolve_archive_dir(None);
+    // Same single-run lock as deletions: two concurrent archives of one chat
+    // would both append the same messages (duplicate records).
+    let _guard = crate::deletion::deletion_lock().lock().await;
     let folder = archive_chat(&client, channel, channel, &archive_dir).await?;
     if let Some(folder) = folder {
         println!("Archived to {}", folder.display());

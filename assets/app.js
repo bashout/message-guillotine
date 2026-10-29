@@ -320,4 +320,7 @@ $('view-gallery').addEventListener('click', () => showPane('gallery'));
 $('view-stats').addEventListener('click', () => showPane('stats'));
 els.galleryMore.addEventListener('click', loadMoreGallery);
 
-
+// -- boot -------------------------------------------------------------------
+loadArchives().catch((e) => {
+  els.list.textContent = 'Could not load archives: ' + e.message;
+});

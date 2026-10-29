@@ -197,7 +197,7 @@ pub fn install(config_arg: Option<&Path>) -> anyhow::Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-pub fn uninstall(_config_arg: Option<&PathBuf>) -> anyhow::Result<()> {
+pub fn uninstall(_config_arg: Option<&Path>) -> anyhow::Result<()> {
     let plist = PathBuf::from(std::env::var("HOME")?)
         .join("Library/LaunchAgents/com.guillotine.service.plist");
     let _ = Command::new("launchctl")
@@ -251,7 +251,7 @@ pub fn install(config_arg: Option<&Path>) -> anyhow::Result<()> {
 }
 
 #[cfg(target_os = "windows")]
-pub fn uninstall(_config_arg: Option<&PathBuf>) -> anyhow::Result<()> {
+pub fn uninstall(_config_arg: Option<&Path>) -> anyhow::Result<()> {
     use std::os::windows::process::CommandExt;
     let status = Command::new("reg")
         .args([

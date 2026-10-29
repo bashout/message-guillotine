@@ -361,18 +361,21 @@ impl Config {
     /// Effective settings for a DM chat: its own [chat] entry when present,
     /// otherwise the dm defaults for any in-scope user (nominated or not
     /// excluded). None when the user is out of scope.
+    ///
+    /// Scope is checked first: an explicit [chat] entry never widens the dm
+    /// policy, so an excluded user stays excluded even if they have one.
     pub fn dm_chat_settings(&self, user_id: &str) -> Option<ChatConfig> {
+        if !self.dm_user_in_scope(user_id) {
+            return None;
+        }
         if let Some(own) = self.chat.get(&format!("dm:{user_id}")) {
             return Some(own.clone());
         }
-        if self.dm_user_in_scope(user_id) {
-            return Some(ChatConfig {
-                schedule: self.dm.default_schedule,
-                retention_days: self.dm.default_retention_days,
-                archive_before_delete: self.dm.default_archive_before_delete,
-            });
-        }
-        None
+        Some(ChatConfig {
+            schedule: self.dm.default_schedule,
+            retention_days: self.dm.default_retention_days,
+            archive_before_delete: self.dm.default_archive_before_delete,
+        })
     }
 
     /// Whether a DM user is in scope at all under the dm policy.
@@ -598,6 +601,55 @@ default_schedule = "weekly"
         assert_eq!(s.retention_days, 30);
         assert_eq!(s.schedule.kind, ScheduleKind::Weekly);
         assert!(cfg.dm_chat_settings("9").is_none());
+    }
+
+    #[test]
+    fn excluded_user_with_own_entry_stays_out_of_scope() {
+        // An explicit [chat] entry must never widen the dm policy: this is the
+        // path `run-now` and the IPC run_now command take.
+        let cfg: Config = toml::from_str(
+            r#"token = "t"
+[dm]
+policy = "exclude"
+users = ["9"]
+[chat."dm:9"]
+schedule = "daily"
+retention_days = 7
+"#,
+        )
+        .unwrap();
+        assert!(!cfg.dm_user_in_scope("9"));
+        assert!(
+            cfg.dm_chat_settings("9").is_none(),
+            "an excluded user must not get settings from their own [chat] entry"
+        );
+
+        // Same under nominate: an unlisted user with an entry is out of scope.
+        let cfg: Config = toml::from_str(
+            r#"token = "t"
+[dm]
+policy = "nominate"
+users = ["1"]
+[chat."dm:2"]
+schedule = "daily"
+retention_days = 7
+"#,
+        )
+        .unwrap();
+        assert!(cfg.dm_chat_settings("2").is_none());
+        // ...while a nominated user with an entry still gets it.
+        let cfg: Config = toml::from_str(
+            r#"token = "t"
+[dm]
+policy = "nominate"
+users = ["1"]
+[chat."dm:1"]
+schedule = "monthly"
+retention_days = 7
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.dm_chat_settings("1").unwrap().retention_days, 7);
     }
 
     fn temp_config(tag: &str, body: &str) -> PathBuf {

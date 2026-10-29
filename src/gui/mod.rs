@@ -1,8 +1,8 @@
 //! Tray icon app: per-chat status, "run now", and a transient panel window
 //! (Iced) with Settings / Jobs / Logs views that edits the TOML config.
 //! Talks to the running service daemon over loopback IPC so run-now stays
-//! inside the single-deletion lock; falls back to running directly when no
-//! daemon is up.
+//! inside the single-deletion lock. With no daemon up, run-now is refused
+//! rather than run unlocked — the lock only holds within one process.
 //!
 //! Process layout: the persistent muda tray icon stays alive for the whole
 //! process; the Iced panel window is transient. Iced runs as a `daemon` on

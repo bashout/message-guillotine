@@ -210,7 +210,7 @@ impl PanelApp {
                                 tracing::info!(chat = %chat, "run-now done: {}", &resp["summary"]);
                             }
                             Ok(resp) => tracing::warn!(chat = %chat, "run-now failed: {}", &resp["error"]),
-                            Err(e) => tracing::warn!(chat = %chat, "daemon unreachable, running directly: {e}"),
+                            Err(e) => tracing::warn!(chat = %chat, "daemon unreachable ({e}); start it with `guillotine service install`"),
                         }
                     });
                 }
@@ -468,7 +468,7 @@ impl PanelApp {
                         tracing::info!(chat = %chat, "delete-all done: {}", &resp["summary"])
                     }
                     Ok(resp) => tracing::warn!(chat = %chat, "delete-all failed: {}", &resp["error"]),
-                    Err(e) => tracing::warn!(chat = %chat, "daemon unreachable: {e}"),
+                    Err(e) => tracing::warn!(chat = %chat, "daemon unreachable ({e}); delete-all needs the running service"),
                 }
                 Task::none()
             }
