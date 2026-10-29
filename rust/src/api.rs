@@ -515,16 +515,22 @@ impl Client {
     }
 }
 
-/// Seconds to wait from a Retry-After header, or fallback when absent or
-/// malformed. Never below 1s.
-fn retry_after(resp: &reqwest::Response, fallback: Duration) -> Duration {
-    let secs = resp
-        .headers()
-        .get("Retry-After")
-        .and_then(|v| v.to_str().ok())
+/// Seconds to wait from a Retry-After header value, or the fallback when the
+/// header is absent or malformed. Never below 1s.
+fn retry_after_secs(header: Option<&str>, fallback: Duration) -> Duration {
+    let secs = header
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(fallback.as_secs_f64());
     Duration::from_secs_f64(secs.max(1.0))
+}
+
+/// Seconds to wait from a Retry-After header, or fallback when absent or
+/// malformed. Never below 1s.
+fn retry_after(resp: &reqwest::Response, fallback: Duration) -> Duration {
+    retry_after_secs(
+        resp.headers().get("Retry-After").and_then(|v| v.to_str().ok()),
+        fallback,
+    )
 }
 
 async fn error_code(resp: reqwest::Response) -> Option<i64> {
@@ -544,6 +550,85 @@ mod tests {
         let parsed: u64 = id.parse().unwrap();
         let ts_ms = (parsed >> 22) + DISCORD_EPOCH_MS as u64;
         assert_eq!(ts_ms, 1_704_067_200_000);
+    }
+
+    #[test]
+    fn snowflake_roundtrip_and_pre_epoch_saturation() {
+        for ms in [1_420_070_400_001i64, 1_704_067_200_000, 1_900_000_000_000] {
+            let dt = DateTime::from_timestamp_millis(ms).unwrap();
+            let id: u64 = snowflake_for(dt).parse().unwrap();
+            assert_eq!((id >> 22) as i64 + DISCORD_EPOCH_MS, ms, "round-trip {ms}");
+        }
+        // pre-epoch and exactly at the epoch saturate at id 0
+        assert_eq!(snowflake_for(DateTime::from_timestamp_millis(DISCORD_EPOCH_MS).unwrap()), "0");
+        assert_eq!(snowflake_for(DateTime::from_timestamp_millis(DISCORD_EPOCH_MS - 1).unwrap()), "0");
+        assert_eq!(snowflake_for(DateTime::from_timestamp_millis(0).unwrap()), "0");
+        // one ms after the epoch -> smallest nonzero id
+        let id: u64 = snowflake_for(DateTime::from_timestamp_millis(DISCORD_EPOCH_MS + 1).unwrap())
+            .parse()
+            .unwrap();
+        assert_eq!(id, 1 << 22);
+        // ids are monotonic in time
+        let a = snowflake_for(DateTime::from_timestamp_millis(1_700_000_000_000).unwrap()).parse::<u64>().unwrap();
+        let b = snowflake_for(DateTime::from_timestamp_millis(1_700_000_000_001).unwrap()).parse::<u64>().unwrap();
+        assert!(a < b);
+    }
+
+    #[test]
+    fn message_epoch_parsing() {
+        let mk = |ts: &str| Message {
+            id: "1".into(),
+            timestamp: ts.into(),
+            author: User { id: "u".into(), username: "u".into(), discriminator: String::new(), global_name: None, bot: false },
+            content: String::new(),
+            r#type: 0,
+            attachments: vec![],
+            pinned: false,
+            edited_timestamp: None,
+            message_reference: None,
+        };
+        // 2024-01-01T00:00:00Z = 1704067200.0; millis preserved
+        assert_eq!(mk("2024-01-01T00:00:00.000+00:00").epoch().unwrap(), 1_704_067_200.0);
+        assert_eq!(mk("2024-01-01T00:00:00.500+00:00").epoch().unwrap(), 1_704_067_200.5);
+        // offset is normalized to the same instant
+        assert_eq!(mk("2024-01-01T02:00:00.000+02:00").epoch().unwrap(), 1_704_067_200.0);
+        // garbage -> Err (the deletion fail-safe relies on this)
+        assert!(mk("not a timestamp").epoch().is_err());
+        assert!(mk("").epoch().is_err());
+    }
+
+    #[test]
+    fn is_system_covers_all_system_types() {
+        let base = serde_json::json!({
+            "id": "1", "timestamp": "2024-01-01T00:00:00.000+00:00",
+            "author": {"id": "2", "username": "u"}
+        });
+        for t in SYSTEM_MESSAGE_TYPES {
+            let mut v = base.clone();
+            v["type"] = serde_json::json!(t);
+            let msg: Message = serde_json::from_value(v).unwrap();
+            assert!(msg.is_system(), "type {t} must be system");
+        }
+        for t in [0u64, 19, 20] {
+            let mut v = base.clone();
+            v["type"] = serde_json::json!(t);
+            let msg: Message = serde_json::from_value(v).unwrap();
+            assert!(!msg.is_system(), "type {t} must not be system");
+        }
+    }
+
+    #[test]
+    fn retry_after_header_parsing_and_fallback() {
+        let fb = Duration::from_secs(5);
+        assert_eq!(retry_after_secs(Some("2.5"), fb), Duration::from_secs_f64(2.5));
+        assert_eq!(retry_after_secs(Some("3"), fb), Duration::from_secs(3));
+        // malformed / absent -> fallback
+        assert_eq!(retry_after_secs(Some("soon"), fb), fb);
+        assert_eq!(retry_after_secs(Some(""), fb), fb);
+        assert_eq!(retry_after_secs(None, fb), fb);
+        // never below 1s, even if the server says 0 or negative
+        assert_eq!(retry_after_secs(Some("0"), fb), Duration::from_secs(1));
+        assert_eq!(retry_after_secs(Some("-4"), fb), Duration::from_secs(1));
     }
 
     #[test]

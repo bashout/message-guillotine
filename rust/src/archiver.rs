@@ -341,4 +341,85 @@ mod tests {
         assert_eq!(sanitize_filename("🔥🔥🔥", "att-1"), "att-1");
         assert_eq!(sanitize_filename("..hidden..", "file"), "hidden");
     }
+
+    #[test]
+    fn sanitize_filename_traversal_and_empty() {
+        // pure traversal collapses to the fallback, never a path component
+        assert_eq!(sanitize_filename("..", "fb"), "fb");
+        assert_eq!(sanitize_filename("...", "fb"), "fb");
+        assert_eq!(sanitize_filename("../..", "fb"), "fb");
+        assert_eq!(sanitize_filename("..\\..", "fb"), "fb");
+        // empty / whitespace-only -> fallback
+        assert_eq!(sanitize_filename("", "fb"), "fb");
+        assert_eq!(sanitize_filename("   ", "fb"), "fb");
+        assert_eq!(sanitize_filename("___", "fb"), "fb");
+        // unicode-only -> fallback; mixed keeps ascii parts
+        assert_eq!(sanitize_filename("héllo wörld", "fb"), "h_llo_w_rld");
+        // slashes become underscores so no path separators survive
+        assert_eq!(sanitize_filename("a/b\\c", "fb"), "a_b_c");
+    }
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "guillotine-archiver-test-{}-{tag}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn compact_manifest_latest_wins_and_atomic() {
+        let root = temp_root("manifest");
+        let path = root.join("manifest.jsonl");
+        let older = serde_json::json!({"seq": 1, "attachment_id": "a1", "status": "failed"});
+        let middle = serde_json::json!({"seq": 2, "attachment_id": "a2", "status": "ok", "local_path": "attachments/x.png"});
+        let newer = serde_json::json!({"seq": 3, "attachment_id": "a1", "status": "ok", "local_path": "attachments/y.png"});
+        let mut body = String::new();
+        for e in [&older, &middle, &newer] {
+            body.push_str(&serde_json::to_string(e).unwrap());
+            body.push('\n');
+        }
+        std::fs::write(&path, body).unwrap();
+        let entries = compact_manifest(&root);
+        assert_eq!(entries.len(), 2, "duplicate attachment_id collapses to latest");
+        let by_id: std::collections::BTreeMap<&str, &serde_json::Value> = entries
+            .iter()
+            .map(|e| (e["attachment_id"].as_str().unwrap(), e))
+            .collect();
+        assert_eq!(by_id["a1"]["seq"], 3, "latest entry wins");
+        assert_eq!(by_id["a1"]["local_path"], "attachments/y.png");
+        assert_eq!(by_id["a2"]["seq"], 2);
+        // rewritten atomically: no .part left, file parses line-by-line
+        assert!(!root.join("manifest.jsonl.part").exists());
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(on_disk.lines().count(), 2);
+        assert!(serde_json::from_str::<serde_json::Value>(on_disk.lines().next().unwrap()).is_ok());
+        // compacting again is stable
+        assert_eq!(compact_manifest(&root).len(), 2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sort_message_records_orders_and_noops_when_sorted() {
+        let root = temp_root("sort");
+        let path = root.join("messages.jsonl");
+        let mk = |id: &str| serde_json::json!({"id": id}).to_string();
+        // unsorted input gets rewritten in id (snowflake) order
+        std::fs::write(&path, format!("{}\n{}\n{}\n", mk("300"), mk("100"), mk("200"))).unwrap();
+        sort_message_records(&root);
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after, format!("{}\n{}\n{}\n", mk("100"), mk("200"), mk("300")));
+        assert!(!root.join("messages.jsonl.part").exists());
+        // already sorted: file content untouched (no rewrite)
+        sort_message_records(&root);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), after);
+        // empty/missing file: no panic, no file created
+        let root2 = temp_root("sort-empty");
+        sort_message_records(&root2);
+        assert!(!root2.join("messages.jsonl").exists());
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&root2);
+    }
 }

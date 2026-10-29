@@ -173,6 +173,31 @@ pub async fn serve(
     }
 }
 
+/// Request lines are capped at 64 KiB: a local peer can neither exhaust
+/// memory nor hold a task/fd forever with an endless line.
+const MAX_REQUEST_LINE: u64 = 64 * 1024;
+
+/// Read one request line, capped at [`MAX_REQUEST_LINE`] bytes.
+async fn read_request_line<R>(reader: R) -> anyhow::Result<String>
+where
+    R: tokio::io::AsyncBufReadExt + Unpin,
+{
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+    let mut line = String::new();
+    reader.take(MAX_REQUEST_LINE).read_line(&mut line).await?;
+    Ok(line)
+}
+
+/// Response payload for `cmd: "status"`.
+fn status_response() -> Value {
+    json!({ "ok": true, "runs": read_last_runs() })
+}
+
+/// Response payload for `cmd: "jobs"`: the live registry plus last runs.
+fn jobs_response(registry: &crate::progress::SharedRegistry) -> Value {
+    json!({ "ok": true, "running": registry.snapshot(), "last": read_last_runs() })
+}
+
 async fn handle(
     stream: TcpStream,
     cfg: Arc<Config>,
@@ -180,12 +205,9 @@ async fn handle(
     secret: String,
 ) -> anyhow::Result<()> {
     let (reader, mut writer) = stream.into_split();
-    let mut line = String::new();
-    let reader = BufReader::new(reader);
     // Cap the line length and bound the whole exchange so a local peer can
     // neither exhaust memory nor hold a task/fd forever.
-    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
-    reader.take(64 * 1024).read_line(&mut line).await?;
+    let line = read_request_line(BufReader::new(reader)).await?;
     let req: Value = serde_json::from_str(line.trim())?;
     if !secret_eq(req.get("secret").and_then(|s| s.as_str()).unwrap_or(""), &secret) {
         let resp = json!({ "ok": false, "error": "unauthorized" });
@@ -193,8 +215,8 @@ async fn handle(
         return Ok(());
     }
     let resp = match req.get("cmd").and_then(|c| c.as_str()) {
-        Some("status") => json!({ "ok": true, "runs": read_last_runs() }),
-        Some("jobs") => json!({ "ok": true, "running": registry.snapshot(), "last": read_last_runs() }),
+        Some("status") => status_response(),
+        Some("jobs") => jobs_response(&registry),
         Some("archive") => {
             let channel = req.get("channel").and_then(|c| c.as_str()).unwrap_or("").to_string();
             if !crate::config::valid_id(&channel) {
@@ -327,3 +349,99 @@ pub async fn send(mut cmd: Value) -> anyhow::Result<Value> {
 }
 
 use anyhow::Context;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg_with(toml_body: &str) -> Config {
+        toml::from_str(toml_body).unwrap()
+    }
+
+    #[test]
+    fn secret_eq_constant_time_semantics() {
+        assert!(secret_eq("abc123", "abc123"));
+        assert!(!secret_eq("abc123", "abc124"));
+        assert!(!secret_eq("abc123", "abc12"));
+        assert!(!secret_eq("", "x"));
+        assert!(secret_eq("", ""));
+        assert!(!secret_eq("ABC", "abc"));
+    }
+
+    #[tokio::test]
+    async fn request_line_is_capped_at_64kib() {
+        // a well-formed short line reads fully
+        let short = b"{\"cmd\":\"status\"}\n".to_vec();
+        let line = read_request_line(&mut &short[..]).await.unwrap();
+        assert_eq!(line, "{\"cmd\":\"status\"}\n");
+        // an over-cap line is truncated at the cap and therefore unparseable
+        let mut big = b"{\"pad\":\"".to_vec();
+        big.extend(std::iter::repeat_n(b'a', 200 * 1024));
+        big.extend_from_slice(b"\"}\n");
+        let line = read_request_line(&mut &big[..]).await.unwrap();
+        assert_eq!(line.len() as u64, MAX_REQUEST_LINE);
+        assert!(serde_json::from_str::<Value>(line.trim()).is_err());
+        // at the cap without a newline, the line is cut at exactly the cap
+        let exact = vec![b' '; MAX_REQUEST_LINE as usize];
+        let line = read_request_line(&mut &exact[..]).await.unwrap();
+        assert_eq!(line.len() as u64, MAX_REQUEST_LINE);
+    }
+
+    #[test]
+    fn prepare_run_now_validates_chat_key() {
+        let cfg = cfg_with("token = \"t\"\n[dm]\npolicy = \"nominate\"\nusers = [\"1\"]\n");
+        assert!(prepare_run_now(&cfg, "not-a-key", false).is_err());
+        assert!(prepare_run_now(&cfg, "dm:../etc", false).is_err());
+        assert!(prepare_run_now(&cfg, "guild:1/channel:2/3", false).is_err());
+    }
+
+    #[test]
+    fn prepare_run_now_dm_scope_and_all_flag() {
+        let cfg = cfg_with(
+            "token = \"t\"\n[dm]\npolicy = \"nominate\"\nusers = [\"1\"]\ndefault_retention_days = 30\n\
+             [chat.\"dm:1\"]\nschedule = \"weekly\"\nretention_days = 7\n",
+        );
+        // nominated user with own entry
+        let job = prepare_run_now(&cfg, "dm:1", false).unwrap();
+        assert_eq!(job.settings.retention_days, 7);
+        assert_eq!(job.settings.schedule.kind, crate::config::ScheduleKind::Weekly);
+        // all=true forces retention 0 (delete everything)
+        let job = prepare_run_now(&cfg, "dm:1", true).unwrap();
+        assert_eq!(job.settings.retention_days, 0);
+        // user not in scope under nominate policy
+        assert!(prepare_run_now(&cfg, "dm:2", false).is_err());
+        // guild channel without a [chat] entry
+        assert!(prepare_run_now(&cfg, "guild:1/channel:2", false).is_err());
+
+        let cfg = cfg_with(
+            "token = \"t\"\n[dm]\npolicy = \"exclude\"\nusers = [\"9\"]\ndefault_retention_days = 30\n",
+        );
+        // exclude policy: any other user is in scope with dm defaults
+        let job = prepare_run_now(&cfg, "dm:2", false).unwrap();
+        assert_eq!(job.settings.retention_days, 30);
+        // excluded user is out of scope
+        assert!(prepare_run_now(&cfg, "dm:9", false).is_err());
+    }
+
+    #[test]
+    fn jobs_and_status_response_shape() {
+        let registry = crate::progress::new_registry();
+        registry.start("dm:1", "Alice (@alice)", "deleting");
+        registry.update("dm:1", |p| p.deleted = 5);
+        let resp = jobs_response(&registry);
+        assert_eq!(resp["ok"], true);
+        let running = resp["running"].as_array().unwrap();
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0]["chat"], "dm:1");
+        assert_eq!(running[0]["label"], "Alice (@alice)");
+        assert_eq!(running[0]["phase"], "deleting");
+        assert_eq!(running[0]["deleted"], 5);
+        assert!(running[0]["started"].as_str().is_some());
+        assert!(resp["last"].is_object());
+        // status has no "running" key
+        let resp = status_response();
+        assert_eq!(resp["ok"], true);
+        assert!(resp.get("running").is_none());
+        assert!(resp["runs"].is_object());
+    }
+}

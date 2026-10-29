@@ -520,4 +520,159 @@ archive_before_delete = true
         let cfg: Config = toml::from_str(toml).unwrap();
         assert!(cfg.token.is_none());
     }
+
+    #[test]
+    fn schedule_parsing_at_times_and_invalid() {
+        let s = Schedule::from_str("weekly at 09:15").unwrap();
+        assert_eq!(s.kind, ScheduleKind::Weekly);
+        assert_eq!(s.at, NaiveTime::from_hms_opt(9, 15, 0).unwrap());
+        // default 04:00 when no "at" clause
+        assert_eq!(Schedule::from_str("weekly").unwrap().at, NaiveTime::from_hms_opt(4, 0, 0).unwrap());
+        // case-insensitive kind
+        assert_eq!(Schedule::from_str("MONTHLY").unwrap().kind, ScheduleKind::Monthly);
+        // invalid forms
+        assert!(Schedule::from_str("daily at 25:00").is_err());
+        assert!(Schedule::from_str("daily at 12:60").is_err());
+        assert!(Schedule::from_str("daily at noon").is_err());
+        assert!(Schedule::from_str("daily at").is_err());
+        assert!(Schedule::from_str("").is_err());
+        assert!(Schedule::from_str("every day").is_err());
+        // Display round-trips through FromStr
+        let s = Schedule::from_str("monthly at 23:45").unwrap();
+        assert_eq!(Schedule::from_str(&s.to_string()).unwrap(), s);
+    }
+
+    #[test]
+    fn chat_key_rejects_non_numeric_ids() {
+        // traversal attempts must never reach the filesystem
+        assert!(ChatKey::parse("dm:../x").is_err());
+        assert!(ChatKey::parse("dm:..").is_err());
+        assert!(ChatKey::parse("guild:1/channel:2/3").is_err());
+        assert!(ChatKey::parse("guild:../channel:2").is_err());
+        assert!(ChatKey::parse("guild:1/channel:2x").is_err());
+        assert!(ChatKey::parse("dm:12 34").is_err());
+        assert!(ChatKey::parse("dm:").is_err());
+        assert!(ChatKey::parse("guild:1/channel:").is_err());
+        assert!(ChatKey::parse("guild:1").is_err());
+        assert!(ChatKey::parse("").is_err());
+        // valid keys round-trip
+        for raw in ["dm:123", "guild:1/channel:2"] {
+            assert_eq!(ChatKey::parse(raw).unwrap().to_string(), raw);
+        }
+    }
+
+    #[test]
+    fn dm_scope_matrix() {
+        // nominate: only listed users; own entry wins over defaults
+        let cfg: Config = toml::from_str(
+            r#"token = "t"
+[dm]
+policy = "nominate"
+users = ["1"]
+default_retention_days = 30
+[chat."dm:1"]
+schedule = "daily"
+retention_days = 7
+"#,
+        )
+        .unwrap();
+        assert!(cfg.dm_user_in_scope("1"));
+        assert!(!cfg.dm_user_in_scope("2"));
+        assert_eq!(cfg.dm_chat_settings("1").unwrap().retention_days, 7);
+        assert!(cfg.dm_chat_settings("2").is_none(), "nominate: unlisted user not in scope at all");
+
+        // exclude: everyone except listed; unlisted users get dm defaults
+        let cfg: Config = toml::from_str(
+            r#"token = "t"
+[dm]
+policy = "exclude"
+users = ["9"]
+default_retention_days = 30
+default_schedule = "weekly"
+"#,
+        )
+        .unwrap();
+        assert!(cfg.dm_user_in_scope("2"));
+        assert!(!cfg.dm_user_in_scope("9"));
+        let s = cfg.dm_chat_settings("2").unwrap();
+        assert_eq!(s.retention_days, 30);
+        assert_eq!(s.schedule.kind, ScheduleKind::Weekly);
+        assert!(cfg.dm_chat_settings("9").is_none());
+    }
+
+    fn temp_config(tag: &str, body: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "guillotine-config-test-{}-{tag}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn retention_clamp_validation() {
+        // over the clamp: rejected for a chat entry
+        let path = temp_config("clamp1", "token = \"t\"\n[chat.\"dm:1\"]\nschedule = \"daily\"\nretention_days = 36501\n");
+        assert!(Config::load(&path).is_err());
+        // over the clamp: rejected for the dm default
+        let path = temp_config("clamp2", "token = \"t\"\n[dm]\npolicy = \"exclude\"\ndefault_retention_days = 40000\n");
+        assert!(Config::load(&path).is_err());
+        // exactly at the clamp: accepted
+        let path = temp_config("clamp3", "token = \"t\"\n[dm]\npolicy = \"exclude\"\ndefault_retention_days = 36500\n[chat.\"dm:1\"]\nschedule = \"daily\"\nretention_days = 36500\n");
+        assert!(Config::load(&path).is_ok());
+        // invalid chat key in [chat] table is a load error
+        let path = temp_config("clamp4", "token = \"t\"\n[chat.\"dm:../evil\"]\nschedule = \"daily\"\nretention_days = 1\n");
+        assert!(Config::load(&path).is_err());
+        // missing token entirely is a load error
+        let path = temp_config("clamp5", "[dm]\npolicy = \"exclude\"\n");
+        assert!(Config::load(&path).is_err());
+        for tag in ["clamp1", "clamp2", "clamp3", "clamp4", "clamp5"] {
+            let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!("guillotine-config-test-{}-{tag}", std::process::id())));
+        }
+    }
+
+    #[test]
+    fn archive_dir_resolution_priority_and_token_env() {
+        // serialize env mutation within this test binary
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let path = temp_config("prio", "token = \"file-token\"\narchive_dir = \"/config/dir\"\n");
+        let cfg = Config::load(&path).unwrap();
+        // config file value
+        std::env::remove_var(ENV_ARCHIVE_DIR);
+        assert_eq!(cfg.resolve_archive_dir(None), PathBuf::from("/config/dir"));
+        // env beats config
+        std::env::set_var(ENV_ARCHIVE_DIR, "/env/dir");
+        assert_eq!(cfg.resolve_archive_dir(None), PathBuf::from("/env/dir"));
+        // explicit beats env
+        assert_eq!(
+            cfg.resolve_archive_dir(Some(Path::new("/explicit/dir"))),
+            PathBuf::from("/explicit/dir")
+        );
+        std::env::remove_var(ENV_ARCHIVE_DIR);
+        // neither env nor config -> per-OS default
+        let path2 = temp_config("prio2", "token = \"t\"\n");
+        let cfg2 = Config::load(&path2).unwrap();
+        assert_eq!(cfg2.resolve_archive_dir(None), default_archive_dir());
+
+        // token env override wins over the file token
+        std::env::set_var(ENV_TOKEN, "env-token");
+        let cfg3 = Config::load(&path2).unwrap();
+        assert_eq!(cfg3.token().unwrap(), "env-token");
+        std::env::remove_var(ENV_TOKEN);
+        let cfg4 = Config::load(&path2).unwrap();
+        assert_eq!(cfg4.token().unwrap(), "t");
+
+        // Debug redacts the token
+        let dbg = format!("{:?}", cfg4);
+        assert!(dbg.contains("<redacted>"));
+        assert!(!dbg.contains("file-token"));
+
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!("guillotine-config-test-{}-prio", std::process::id())));
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!("guillotine-config-test-{}-prio2", std::process::id())));
+    }
 }

@@ -645,4 +645,120 @@ mod tests {
         assert_eq!(q.get("ids").unwrap(), "1,2");
         assert!(query_map(None).is_empty());
     }
+    #[test]
+    fn range_parsing_multi_and_edge_cases() {
+        // multi-range requests are not supported: the parser treats
+        // "0-1,5-6" as "0-" (open-ended), never as two ranges
+        assert!(matches!(
+            parse_range("bytes=0-1,5-6", 100),
+            ByteRange::Partial(0, 99)
+        ));
+        // end beyond size is clamped to the last byte
+        assert!(matches!(parse_range("bytes=10-9999", 100), ByteRange::Partial(10, 99)));
+        // reversed range is unsatisfiable
+        assert!(matches!(parse_range("bytes=50-10", 100), ByteRange::Unsatisfiable));
+        // suffix larger than the file -> whole file
+        assert!(matches!(parse_range("bytes=-9999", 100), ByteRange::Partial(0, 99)));
+        // suffix of zero -> unsatisfiable
+        assert!(matches!(parse_range("bytes=-0", 100), ByteRange::Unsatisfiable));
+        // non-numeric -> full body
+        assert!(matches!(parse_range("bytes=abc-def", 100), ByteRange::Full));
+        // empty size -> always unsatisfiable
+        assert!(matches!(parse_range("bytes=0-", 0), ByteRange::Unsatisfiable));
+        assert!(matches!(parse_range("bytes=-5", 0), ByteRange::Unsatisfiable));
+    }
+
+    #[test]
+    fn host_guard_edge_cases() {
+        assert!(host_allowed("localhost"));
+        assert!(host_allowed("LOCALHOST:8765"));
+        assert!(host_allowed("[::1]"));
+        assert!(host_allowed("192.168.1.10:8765"));
+        assert!(!host_allowed("127.0.0.1:abc"), "non-numeric port is not stripped");
+        assert!(!host_allowed("localhost.evil.com"));
+        assert!(!host_allowed("[::1"), "unterminated bracket");
+        assert!(!host_allowed("0.0.0.0.evil.com:80"));
+    }
+
+    #[test]
+    fn parse_filters_flag_combinations() {
+        // has_attachment / pinned only activate on the literal "true"
+        assert!(parse_filters(&params(&[("has_attachment", "1")])).is_none());
+        assert!(parse_filters(&params(&[("pinned", "false")])).is_none());
+        let f = parse_filters(&params(&[("has_attachment", "true"), ("pinned", "true")])).unwrap();
+        assert!(f.has_attachment && f.pinned && !f.has_link);
+        // full ISO 'from' is normalized to UTC before comparison
+        let f = parse_filters(&params(&[("from", "2024-01-15T14:30:00+02:00")])).unwrap();
+        assert_eq!(f.date_from.as_deref(), Some("2024-01-15T12:30:00+00:00"));
+        // bare 'from' date passes through unchanged (start of day semantics)
+        let f = parse_filters(&params(&[("from", "2024-01-15")])).unwrap();
+        assert_eq!(f.date_from.as_deref(), Some("2024-01-15"));
+    }
+
+    #[test]
+    fn library_lru_evicts_oldest() {
+        let fx = fixture();
+        // second archive
+        let other = fx.root.join("chat-two");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("meta.json"), r#"{"chat": "Two", "channel_id": "222"}"#).unwrap();
+        std::fs::write(other.join("messages.jsonl"), "").unwrap();
+        let library = Library::new(fx.root.clone());
+        let a = library.load("chat-one").unwrap();
+        let b = library.load("chat-two").unwrap();
+        // cache holds LIBRARY_CACHE_MAX (2): loading a third evicts chat-one
+        let third = fx.root.join("chat-three");
+        std::fs::create_dir_all(&third).unwrap();
+        std::fs::write(third.join("meta.json"), r#"{"chat": "Three", "channel_id": "333"}"#).unwrap();
+        std::fs::write(third.join("messages.jsonl"), "").unwrap();
+        let _c = library.load("chat-three").unwrap();
+        // chat-one was evicted: its Arc is only held by our local variable
+        assert_eq!(Arc::strong_count(&a), 1);
+        assert_eq!(Arc::strong_count(&b), 2, "chat-two still cached");
+        // loading chat-one again reloads from disk (works, not an error)
+        assert!(library.load("chat-one").is_some());
+        // selection is independent of the cache
+        library.select("chat-two");
+        assert_eq!(library.selected_name().as_deref(), Some("chat-two"));
+    }
+
+    #[test]
+    fn attachments_payload_paging_clamps() {
+        let fx = fixture();
+        let archive = Archive::load(&fx.archive_dir);
+        // start beyond total -> empty page, clamped start
+        let p = archive.attachments_payload(99, 60, None);
+        assert_eq!(p["total"], json!(1));
+        assert_eq!(p["start"], json!(1));
+        assert_eq!(p["attachments"].as_array().unwrap().len(), 0);
+        // count larger than remaining -> only what's left
+        let p = archive.attachments_payload(0, 60, None);
+        assert_eq!(p["attachments"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn anchor_payload_reverse_direction() {
+        let fx = fixture();
+        let archive = Archive::load(&fx.archive_dir);
+        // desc view: positions count from the newest; anchor 101 is position 2 of 4
+        let p = archive.anchor_payload("101", 2, None, true).unwrap();
+        assert_eq!(p["anchor_index"], json!(2));
+        let ids: Vec<&str> = p["messages"].as_array().unwrap().iter().map(|m| m["id"].as_str().unwrap()).collect();
+        // window centered on position 2: start = 2 - 1 = 1 -> [102, 101] in desc order
+        assert_eq!(ids, vec!["102", "101"]);
+    }
+
+    #[test]
+    fn meta_payload_reports_bounds() {
+        let fx = fixture();
+        let archive = Archive::load(&fx.archive_dir);
+        let m = archive.meta_payload();
+        assert_eq!(m["chat"], json!("Chat One"));
+        assert_eq!(m["channel_id"], json!("111"));
+        assert_eq!(m["total_messages"], json!(4));
+        assert_eq!(m["total_attachments"], json!(1));
+        assert_eq!(m["first_timestamp"], json!("2023-05-01T10:00:00.000000+00:00"));
+        assert_eq!(m["last_timestamp"], json!("2024-06-20T08:00:00.000000+00:00"));
+    }
+
 }

@@ -113,6 +113,76 @@ fn sample(msg: &api::Message) -> String {
 /// scan continues after the session's before-cursor and counters carry over.
 /// With `dry_run`, messages are only counted and quoted — nothing is deleted
 /// and no session is written.
+/// The session state a run starts from: resume counters/cursor carry over
+/// when resuming; otherwise a fresh state whose scan jumps straight to the
+/// cutoff boundary (`before` the cutoff's snowflake, +1ms to keep the bound
+/// inclusive — the API's `before` is exclusive, so a message exactly at the
+/// cutoff must have an id strictly below the bound).
+fn initial_session(
+    channel_id: &str,
+    label: &str,
+    cutoff: Option<DateTime<Utc>>,
+    resume: Option<Session>,
+) -> Session {
+    let mut state = Session {
+        channel_id: channel_id.to_string(),
+        label: label.to_string(),
+        start_time: None,
+        end_time: cutoff.map(|c| c.to_rfc3339()),
+        before_cursor: None,
+        scanned: 0,
+        deleted: 0,
+        failed: 0,
+        skipped: 0,
+        complete: false,
+    };
+    if let Some(resume) = resume {
+        state.scanned = resume.scanned;
+        state.deleted = resume.deleted;
+        state.failed = resume.failed;
+        state.skipped = resume.skipped;
+        state.before_cursor = resume.before_cursor;
+    } else if let Some(cutoff) = cutoff {
+        let bound = cutoff + chrono::Duration::milliseconds(1);
+        state.before_cursor = Some(api::snowflake_for(bound));
+    }
+    state
+}
+
+/// How one message's timestamp compares to the cutoff. Fail safe: an
+/// undatable timestamp is never treated as old enough to delete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CutoffCheck {
+    /// Newer than the cutoff: out of range, skip silently.
+    Newer,
+    /// In range: eligible for deletion.
+    InRange,
+    /// Undatable timestamp: skip and count as failed, never delete.
+    Undatable,
+}
+
+fn cutoff_check(epoch: &anyhow::Result<f64>, cutoff: Option<f64>) -> CutoffCheck {
+    let Some(cut) = cutoff else {
+        return CutoffCheck::InRange;
+    };
+    match epoch {
+        Ok(ts) if *ts > cut => CutoffCheck::Newer,
+        Ok(_) => CutoffCheck::InRange,
+        Err(_) => CutoffCheck::Undatable,
+    }
+}
+
+/// Persist or drop the session file at the end of a run. A dry run never
+/// writes and never clears; an aborted run saves (resume); a complete run
+/// clears.
+fn persist_session(channel_id: &str, state: &Session, aborted: bool, dry_run: bool, root: Option<&Path>) {
+    if aborted && !dry_run {
+        save_session(channel_id, state, root);
+    } else if !aborted && !dry_run {
+        clear_session(channel_id, root);
+    }
+}
+
 /// Everything a deletion run needs beyond the client and channel.
 pub struct DeletionOptions<'a> {
     pub label: &'a str,
@@ -132,31 +202,7 @@ pub async fn run_deletion(
     let channel_id = channel_id.to_string();
     let cutoff_ts = cutoff.map(|c| c.timestamp() as f64);
 
-    let mut state = Session {
-        channel_id: channel_id.clone(),
-        label: label.to_string(),
-        start_time: None,
-        end_time: cutoff.map(|c| c.to_rfc3339()),
-        before_cursor: None,
-        scanned: 0,
-        deleted: 0,
-        failed: 0,
-        skipped: 0,
-        complete: false,
-    };
-    if let Some(resume) = resume {
-        state.scanned = resume.scanned;
-        state.deleted = resume.deleted;
-        state.failed = resume.failed;
-        state.skipped = resume.skipped;
-        state.before_cursor = resume.before_cursor;
-    } else if let Some(cutoff) = cutoff {
-        // Jump straight to the range boundary instead of scanning from the
-        // channel top: `before` the cutoff's snowflake (+1ms to keep the
-        // bound inclusive) starts the first page inside the range.
-        let bound = cutoff + chrono::Duration::milliseconds(1);
-        state.before_cursor = Some(api::snowflake_for(bound));
-    }
+    let mut state = initial_session(&channel_id, label, cutoff, resume);
 
     let me_id = client.current_user.as_ref().map(|u| u.id.clone());
     let mut samples = Vec::new();
@@ -179,13 +225,16 @@ pub async fn run_deletion(
             }
             for msg in &page {
                 if let Some(cut) = cutoff_ts {
-                    match msg.epoch() {
-                        Ok(ts) if ts > cut => continue, // newer than the cutoff
-                        Ok(_) => {}
-                        Err(e) => {
+                    let epoch = msg.epoch();
+                    match cutoff_check(&epoch, Some(cut)) {
+                        CutoffCheck::Newer => continue, // newer than the cutoff
+                        CutoffCheck::InRange => {}
+                        CutoffCheck::Undatable => {
                             // Fail safe: never treat an undatable message as
                             // old enough to delete.
-                            tracing::warn!(id = %msg.id, error = %e, "undatable message timestamp; skipping");
+                            if let Err(e) = &epoch {
+                                tracing::warn!(id = %msg.id, error = %e, "undatable message timestamp; skipping");
+                            }
                             state.failed += 1;
                             continue;
                         }
@@ -282,11 +331,7 @@ pub async fn run_deletion(
         aborted = Some(e);
     }
 
-    if aborted.is_none() && !dry_run {
-        clear_session(&channel_id, root);
-    } else if !dry_run {
-        save_session(&channel_id, &state, root);
-    }
+    persist_session(&channel_id, &state, aborted.is_some(), dry_run, root);
 
     let elapsed = start_clock.elapsed();
     tracing::info!(
@@ -348,4 +393,145 @@ pub async fn scan(
         println!("  {s}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "guillotine-deletion-test-{}-{tag}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn session(channel: &str, scanned: u64, deleted: u64, failed: u64, skipped: u64, cursor: Option<&str>, complete: bool) -> Session {
+        Session {
+            channel_id: channel.to_string(),
+            label: "label".to_string(),
+            start_time: None,
+            end_time: None,
+            before_cursor: cursor.map(str::to_string),
+            scanned,
+            deleted,
+            failed,
+            skipped,
+            complete,
+        }
+    }
+
+    #[test]
+    fn session_save_load_clear_roundtrip() {
+        let root = temp_root("roundtrip");
+        let s = session("123", 10, 4, 1, 2, Some("999"), false);
+        save_session("123", &s, Some(&root));
+        let loaded = load_session("123", Some(&root)).expect("session loads");
+        assert_eq!(loaded.channel_id, "123");
+        assert_eq!(loaded.scanned, 10);
+        assert_eq!(loaded.deleted, 4);
+        assert_eq!(loaded.failed, 1);
+        assert_eq!(loaded.skipped, 2);
+        assert_eq!(loaded.before_cursor.as_deref(), Some("999"));
+        assert!(!loaded.complete);
+        // no .part file left behind (atomic rename)
+        assert!(!session_path("123", Some(&root)).with_extension("json.part").exists());
+        clear_session("123", Some(&root));
+        assert!(load_session("123", Some(&root)).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn corrupt_session_file_is_absent() {
+        let root = temp_root("corrupt");
+        std::fs::write(session_path("42", Some(&root)), "{ not json").unwrap();
+        assert!(load_session("42", Some(&root)).is_none());
+        // valid JSON but not a Session (missing required fields)
+        std::fs::write(session_path("43", Some(&root)), "{\"channel_id\": \"43\"}").unwrap();
+        assert!(load_session("43", Some(&root)).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn complete_session_is_absent() {
+        let root = temp_root("complete");
+        let s = session("7", 5, 5, 0, 0, None, true);
+        save_session("7", &s, Some(&root));
+        assert!(load_session("7", Some(&root)).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cutoff_bound_is_inclusive_via_plus_one_ms() {
+        let cutoff = Utc.with_ymd_and_hms(2024, 6, 15, 12, 0, 0).unwrap();
+        let state = initial_session("1", "lbl", Some(cutoff), None);
+        assert_eq!(state.end_time.as_deref(), Some("2024-06-15T12:00:00+00:00"));
+        let bound: u128 = state.before_cursor.unwrap().parse().unwrap();
+        let bound_ms = (bound >> 22) as i64 + api::DISCORD_EPOCH_MS;
+        // bound = cutoff + 1ms exactly
+        assert_eq!(bound_ms, cutoff.timestamp_millis() + 1);
+        // a message exactly at the cutoff has id < bound => included by `before`
+        let at_cutoff = api::snowflake_for(cutoff).parse::<u128>().unwrap();
+        assert!(at_cutoff < bound);
+        // a message 1ms after the cutoff is at the bound => excluded by `before`
+        let after = api::snowflake_for(cutoff + chrono::Duration::milliseconds(1))
+            .parse::<u128>()
+            .unwrap();
+        assert!(after >= bound);
+    }
+
+    #[test]
+    fn resume_carries_counters_and_cursor() {
+        let cutoff = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let resume = session("9", 100, 40, 3, 7, Some("555"), false);
+        let state = initial_session("9", "lbl", Some(cutoff), Some(resume));
+        assert_eq!(state.scanned, 100);
+        assert_eq!(state.deleted, 40);
+        assert_eq!(state.failed, 3);
+        assert_eq!(state.skipped, 7);
+        assert_eq!(state.before_cursor.as_deref(), Some("555"));
+        assert!(!state.complete);
+        // no cutoff: everything is in range, no bound cursor
+        let state = initial_session("9", "lbl", None, None);
+        assert!(state.before_cursor.is_none());
+        assert!(state.end_time.is_none());
+    }
+
+    #[test]
+    fn cutoff_check_fail_safe_on_undatable() {
+        let cut = 1_700_000_000.0;
+        assert_eq!(cutoff_check(&Ok(cut + 0.5), Some(cut)), CutoffCheck::Newer);
+        assert_eq!(cutoff_check(&Ok(cut), Some(cut)), CutoffCheck::InRange);
+        assert_eq!(cutoff_check(&Ok(cut - 1.0), Some(cut)), CutoffCheck::InRange);
+        let undatable: anyhow::Result<f64> = Err(anyhow::anyhow!("bad timestamp"));
+        assert_eq!(cutoff_check(&undatable, Some(cut)), CutoffCheck::Undatable);
+        // no cutoff: everything in range, even undatable
+        assert_eq!(cutoff_check(&undatable, None), CutoffCheck::InRange);
+    }
+
+    #[test]
+    fn dry_run_never_writes_or_clears_session() {
+        let root = temp_root("dryrun");
+        let s = session("5", 3, 2, 0, 1, Some("111"), false);
+        // dry run, aborted: no save, no clear
+        persist_session("5", &s, true, true, Some(&root));
+        assert!(!session_path("5", Some(&root)).exists());
+        // dry run, complete: still no clear of a pre-existing file
+        save_session("5", &s, Some(&root));
+        persist_session("5", &s, false, true, Some(&root));
+        assert!(session_path("5", Some(&root)).exists(), "dry run must not clear");
+        // real run, complete: clears
+        persist_session("5", &s, false, false, Some(&root));
+        assert!(!session_path("5", Some(&root)).exists());
+        // real run, aborted: saves with counters intact
+        let s2 = session("6", 8, 5, 1, 2, Some("222"), false);
+        persist_session("6", &s2, true, false, Some(&root));
+        let loaded = load_session("6", Some(&root)).unwrap();
+        assert_eq!((loaded.scanned, loaded.deleted, loaded.failed, loaded.skipped), (8, 5, 1, 2));
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

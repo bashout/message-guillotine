@@ -153,3 +153,134 @@ pub fn mark_archive_status(folder: &Path, complete: bool) {
         let _ = std::fs::rename(&tmp, &path);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::Message;
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "guillotine-af-test-{}-{tag}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn mk_archive(root: &Path, name: &str, meta: serde_json::Value) -> PathBuf {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("meta.json"), serde_json::to_string(&meta).unwrap()).unwrap();
+        dir
+    }
+
+    #[test]
+    fn load_message_records_truncates_partial_tail() {
+        let root = temp_root("tail");
+        let path = root.join("messages.jsonl");
+        let mut body = String::new();
+        body.push_str("{\"id\": \"100\", \"content\": \"a\"}\n");
+        body.push_str("{\"id\": \"101\", \"content\": \"b\"}\n");
+        body.push_str("{\"id\": \"10"); // hard-kill partial tail, no newline
+        std::fs::write(&path, &body).unwrap();
+        let records = load_message_records(&path);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["id"], "100");
+        assert_eq!(records[1]["id"], "101");
+        // the file itself is truncated back to the last valid line
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after, "{\"id\": \"100\", \"content\": \"a\"}\n{\"id\": \"101\", \"content\": \"b\"}\n");
+        // loading again is a no-op and still yields both records
+        assert_eq!(load_message_records(&path).len(), 2);
+        // a fully valid file is left untouched
+        std::fs::write(&path, "{\"id\": \"1\"}\n").unwrap();
+        assert_eq!(load_message_records(&path).len(), 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"id\": \"1\"}\n");
+        // missing file -> empty
+        assert!(load_message_records(&root.join("nope.jsonl")).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn find_existing_archive_recency_and_merged_matching() {
+        let root = temp_root("find");
+        let older = mk_archive(&root, "a-old", serde_json::json!({"channel_id": "111", "chat": "old"}));
+        std::fs::write(older.join("messages.jsonl"), "{\"id\": \"1\"}\n").unwrap();
+        // merged archive listing the channel among channel_ids
+        let merged = mk_archive(
+            &root,
+            "b-merged",
+            serde_json::json!({"channel_id": "222", "channel_ids": ["222", "111"], "chat": "merged"}),
+        );
+        std::fs::write(merged.join("messages.jsonl"), "{\"id\": \"2\"}\n").unwrap();
+        // unrelated archive
+        let other = mk_archive(&root, "c-other", serde_json::json!({"channel_id": "333"}));
+        std::fs::write(other.join("messages.jsonl"), "{\"id\": \"3\"}\n").unwrap();
+
+        // make "a-old" older than "b-merged" by mtime
+        let old_time = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1000);
+        let new_time = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2000);
+        std::fs::File::options()
+            .write(true)
+            .open(older.join("messages.jsonl"))
+            .unwrap()
+            .set_modified(old_time)
+            .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(merged.join("messages.jsonl"))
+            .unwrap()
+            .set_modified(new_time)
+            .unwrap();
+
+        // merged archive matches channel 111 via channel_ids and is most recent
+        let found = find_existing_archive("111", &root).unwrap();
+        assert_eq!(found, merged);
+        // channel 333 only in the unrelated archive
+        assert_eq!(find_existing_archive("333", &root).unwrap(), other);
+        // unknown channel -> None
+        assert!(find_existing_archive("999", &root).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn minimal_message_projection_keys() {
+        let msg: Message = serde_json::from_value(serde_json::json!({
+            "id": "123",
+            "timestamp": "2024-01-01T00:00:00.000+00:00",
+            "author": {"id": "u1", "username": "alice", "global_name": "Alice A."},
+            "content": "hi",
+            "type": 0,
+            "attachments": [{"id": "a1", "filename": "f.png", "url": "https://x/f.png"}],
+            "pinned": true,
+            "edited_timestamp": "2024-01-02T00:00:00.000+00:00",
+            "message_reference": {"message_id": "100"}
+        }))
+        .unwrap();
+        let m = minimal_message(&msg);
+        let obj = m.as_object().unwrap();
+        let mut keys: Vec<&String> = obj.keys().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            ["attachment_ids", "author", "author_id", "content", "edited_timestamp", "id", "pinned", "reply_to", "timestamp", "type"]
+        );
+        assert_eq!(m["author"], "Alice A.");
+        assert_eq!(m["reply_to"], "100");
+        assert_eq!(m["attachment_ids"], serde_json::json!(["a1"]));
+        // global_name absent -> username; no reference -> null
+        let msg: Message = serde_json::from_value(serde_json::json!({
+            "id": "1", "timestamp": "2024-01-01T00:00:00.000+00:00",
+            "author": {"id": "u2", "username": "bob"}
+        }))
+        .unwrap();
+        let m = minimal_message(&msg);
+        assert_eq!(m["author"], "bob");
+        assert!(m["reply_to"].is_null());
+        assert_eq!(m["attachment_ids"].as_array().unwrap().len(), 0);
+        assert_eq!(m["type"], 0);
+        assert_eq!(m["pinned"], false);
+    }
+}

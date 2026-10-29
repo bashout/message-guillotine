@@ -22,12 +22,10 @@ pub struct ChatJob {
     pub settings: ChatConfig,
 }
 
-/// Resolve the run scope: every configured guild channel, plus every DM user
-/// in scope under the dm policy (nominated users, or all except the excluded
-/// ones), each with its own [chat] entry or the dm defaults.
-pub async fn resolve_jobs(client: &Client, cfg: &Config) -> anyhow::Result<Vec<ChatJob>> {
+/// Configured chats resolved to jobs: every guild channel, plus every
+/// configured DM that is in scope under the dm policy.
+fn jobs_from_config(cfg: &Config) -> Vec<ChatJob> {
     let mut jobs = Vec::new();
-
     for (key, settings) in cfg.chats() {
         match &key {
             ChatKey::GuildChannel { .. } => jobs.push(ChatJob {
@@ -44,23 +42,41 @@ pub async fn resolve_jobs(client: &Client, cfg: &Config) -> anyhow::Result<Vec<C
             }
         }
     }
+    jobs
+}
 
-    // DM users in scope without their own [chat] entry use the dm defaults
-    // (only reachable under the exclude policy).
-    let dm_channels = client.get_dm_channels().await?;
-    for (user, _channel_id) in client.dm_users(&dm_channels) {
-        if cfg.dm_user_in_scope(&user.id) {
-            if let Some(settings) = cfg.dm_chat_settings(&user.id) {
-                if !cfg.chat.contains_key(&format!("dm:{}", user.id)) {
+/// In-scope DM users (from the API's DM list, as (user id, channel id)) that
+/// have no own [chat] entry get the dm defaults — only reachable under the
+/// exclude policy.
+fn dm_default_jobs(cfg: &Config, dm_users: &[(String, String)]) -> Vec<ChatJob> {
+    let mut jobs = Vec::new();
+    for (user_id, _channel_id) in dm_users {
+        if cfg.dm_user_in_scope(user_id) {
+            if let Some(settings) = cfg.dm_chat_settings(user_id) {
+                if !cfg.chat.contains_key(&format!("dm:{user_id}")) {
                     jobs.push(ChatJob {
-                        key: ChatKey::Dm(user.id),
+                        key: ChatKey::Dm(user_id.clone()),
                         settings,
                     });
                 }
             }
         }
     }
+    jobs
+}
 
+/// Resolve the run scope: every configured guild channel, plus every DM user
+/// in scope under the dm policy (nominated users, or all except the excluded
+/// ones), each with its own [chat] entry or the dm defaults.
+pub async fn resolve_jobs(client: &Client, cfg: &Config) -> anyhow::Result<Vec<ChatJob>> {
+    let mut jobs = jobs_from_config(cfg);
+    let dm_channels = client.get_dm_channels().await?;
+    let dm_users: Vec<(String, String)> = client
+        .dm_users(&dm_channels)
+        .into_iter()
+        .map(|(u, c)| (u.id, c))
+        .collect();
+    jobs.extend(dm_default_jobs(cfg, &dm_users));
     Ok(jobs)
 }
 
@@ -463,6 +479,175 @@ mod tests {
             .unwrap();
         let next = next_fire(&s, from, None);
         assert_eq!((next.year(), next.month(), next.day()), (2025, 1, 1));
+    }
+
+    fn local(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime<Local> {
+        Local
+            .from_local_datetime(
+                &NaiveDate::from_ymd_opt(y, mo, d)
+                    .unwrap()
+                    .and_hms_opt(h, mi, 0)
+                    .unwrap(),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn next_fire_weekly_anchor_pins_weekday() {
+        let s = crate::config::Schedule {
+            kind: ScheduleKind::Weekly,
+            at: at(4, 0),
+        };
+        // Wednesday 2024-03-13 12:00, anchored to Monday -> Monday 2024-03-18 04:00
+        let from = local(2024, 3, 13, 12, 0);
+        assert_eq!(from.weekday(), chrono::Weekday::Wed);
+        let next = next_fire(&s, from, Some(&chrono::Weekday::Mon));
+        assert_eq!(next.weekday(), chrono::Weekday::Mon);
+        assert_eq!((next.year(), next.month(), next.day()), (2024, 3, 18));
+        assert_eq!((next.hour(), next.minute()), (4, 0));
+        // same weekday as `from`, later time, no anchor -> next week
+        let from = local(2024, 3, 10, 5, 0); // Sunday
+        let next = next_fire(&s, from, None);
+        assert_eq!((next.month(), next.day()), (3, 17));
+        // same weekday, earlier time -> today
+        let from = local(2024, 3, 10, 3, 0);
+        let next = next_fire(&s, from, None);
+        assert_eq!((next.month(), next.day()), (3, 10));
+        // anchor equal to from's weekday but time already passed -> +7 days
+        let from = local(2024, 3, 10, 5, 0);
+        let next = next_fire(&s, from, Some(&chrono::Weekday::Sun));
+        assert_eq!((next.month(), next.day()), (3, 17));
+    }
+
+    #[test]
+    fn next_fire_monthly_month_end_and_strictly_after() {
+        let s = crate::config::Schedule {
+            kind: ScheduleKind::Monthly,
+            at: at(4, 0),
+        };
+        // from Jan 31 -> Feb 1 (not "Jan 32")
+        let next = next_fire(&s, local(2024, 1, 31, 23, 0), None);
+        assert_eq!((next.month(), next.day()), (2, 1));
+        // exactly at the fire time -> strictly after, so next month
+        let next = next_fire(&s, local(2024, 2, 1, 4, 0), None);
+        assert_eq!((next.month(), next.day()), (3, 1));
+        // year rollover (existing behavior, pinned here)
+        let next = next_fire(&s, local(2024, 12, 31, 23, 0), None);
+        assert_eq!((next.year(), next.month(), next.day()), (2025, 1, 1));
+    }
+
+    #[test]
+    fn next_fire_daily_dst_gap_falls_back() {
+        // In America/New_York, 2024-03-10 02:30 does not exist (spring forward
+        // 02:00 -> 03:00). The nonexistent candidate must not be returned;
+        // the run fires the next day instead.
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("TZ", "America/New_York");
+        let s = crate::config::Schedule {
+            kind: ScheduleKind::Daily,
+            at: at(2, 30),
+        };
+        let from = local(2024, 3, 10, 1, 30);
+        let next = next_fire(&s, from, None);
+        assert!(
+            (next.month(), next.day()) != (3, 10) || (next.hour(), next.minute()) != (2, 30),
+            "must never return the nonexistent 2024-03-10 02:30 local time"
+        );
+        assert_eq!((next.month(), next.day()), (3, 11));
+        assert_eq!((next.hour(), next.minute()), (2, 30));
+        std::env::remove_var("TZ");
+    }
+
+    fn job_keys(jobs: &[ChatJob]) -> Vec<String> {
+        let mut v: Vec<String> = jobs.iter().map(|j| j.key.to_string()).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn scope_filtering_from_config() {
+        let cfg: Config = toml::from_str(
+            r#"token = "t"
+[dm]
+policy = "nominate"
+users = ["1"]
+[chat."dm:1"]
+schedule = "daily"
+retention_days = 7
+[chat."dm:2"]
+schedule = "daily"
+retention_days = 7
+[chat."guild:10/channel:20"]
+schedule = "weekly"
+retention_days = 30
+"#,
+        )
+        .unwrap();
+        let jobs = jobs_from_config(&cfg);
+        // dm:2 is configured but out of scope under nominate -> dropped;
+        // guild channels always in scope
+        assert_eq!(job_keys(&jobs), vec!["dm:1", "guild:10/channel:20"]);
+        assert_eq!(jobs.iter().find(|j| j.key.to_string() == "dm:1").unwrap().settings.retention_days, 7);
+
+        let cfg: Config = toml::from_str(
+            r#"token = "t"
+[dm]
+policy = "exclude"
+users = ["9"]
+default_retention_days = 30
+[chat."dm:9"]
+schedule = "daily"
+retention_days = 7
+"#,
+        )
+        .unwrap();
+        // exclude policy: the excluded user's own entry is still dropped
+        let jobs = jobs_from_config(&cfg);
+        assert!(jobs.is_empty());
+    }
+
+    #[test]
+    fn scope_filtering_dm_defaults() {
+        let cfg: Config = toml::from_str(
+            r#"token = "t"
+[dm]
+policy = "exclude"
+users = ["9"]
+default_retention_days = 30
+default_schedule = "weekly"
+[chat."dm:1"]
+schedule = "daily"
+retention_days = 7
+"#,
+        )
+        .unwrap();
+        // API DM list: user 1 (has own entry -> not duplicated), user 2 (defaults), user 9 (excluded)
+        let dm_users = vec![
+            ("1".to_string(), "c1".to_string()),
+            ("2".to_string(), "c2".to_string()),
+            ("9".to_string(), "c9".to_string()),
+        ];
+        let jobs = dm_default_jobs(&cfg, &dm_users);
+        assert_eq!(job_keys(&jobs), vec!["dm:2"]);
+        let j = &jobs[0];
+        assert_eq!(j.settings.retention_days, 30);
+        assert_eq!(j.settings.schedule.kind, ScheduleKind::Weekly);
+
+        // under nominate, only the nominated user is in scope; without an own
+        // entry they get the dm defaults, unlisted users get nothing
+        let cfg: Config = toml::from_str(
+            r#"token = "t"
+[dm]
+policy = "nominate"
+users = ["1"]
+default_retention_days = 14
+"#,
+        )
+        .unwrap();
+        let jobs = dm_default_jobs(&cfg, &dm_users);
+        assert_eq!(job_keys(&jobs), vec!["dm:1"]);
+        assert_eq!(jobs[0].settings.retention_days, 14);
     }
 
     #[test]
