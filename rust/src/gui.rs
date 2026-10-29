@@ -1549,8 +1549,17 @@ impl LogsState {
         let mut files: Vec<PathBuf> = std::fs::read_dir(&log_dir)
             .map(|rd| rd.flatten().map(|e| e.path()).collect())
             .unwrap_or_default();
-        files.sort();
-        if let Some(latest) = files.last().cloned() {
+        // Prefer the active (unrotated) guillotine.log; else newest by mtime.
+        let active = log_dir.join("guillotine.log");
+        let latest = if active.is_file() {
+            Some(active)
+        } else {
+            files.sort_by_key(|f| {
+                std::fs::metadata(f).and_then(|m| m.modified()).unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+            });
+            files.last().cloned()
+        };
+        if let Some(latest) = latest {
             if self.last_daemon_file.as_deref() != Some(&latest) {
                 self.daemon.clear();
                 self.last_daemon_file = Some(latest.clone());

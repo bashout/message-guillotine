@@ -180,8 +180,13 @@ pub async fn run_chat_job(
     Ok(summary)
 }
 
-/// The next local fire time for a schedule, strictly after `from`.
-pub fn next_fire(schedule: &crate::config::Schedule, from: DateTime<Local>) -> DateTime<Local> {
+/// The next local fire time for a schedule, strictly after `from`. For
+/// weekly schedules, `anchor` pins the weekday (set on first fire).
+pub fn next_fire(
+    schedule: &crate::config::Schedule,
+    from: DateTime<Local>,
+    anchor: Option<&chrono::Weekday>,
+) -> DateTime<Local> {
     let at: NaiveTime = schedule.at;
     let candidate = |d: chrono::NaiveDate| {
         d.and_time(at)
@@ -199,11 +204,14 @@ pub fn next_fire(schedule: &crate::config::Schedule, from: DateTime<Local>) -> D
             }
         }
         ScheduleKind::Weekly => {
+            let target = anchor.copied().unwrap_or_else(|| from.weekday());
             let mut day = from.date_naive();
             loop {
-                let t = candidate(day);
-                if t > from {
-                    return t;
+                if day.weekday() == target {
+                    let t = candidate(day);
+                    if t > from {
+                        return t;
+                    }
                 }
                 day += Duration::days(1);
             }
@@ -323,11 +331,13 @@ pub async fn run_loop(cfg: &Config, config_path: &std::path::Path) -> anyhow::Re
     let mut next: Vec<(DateTime<Local>, usize)> = jobs
         .iter()
         .enumerate()
-        .map(|(i, j)| (next_fire(&j.settings.schedule, Local::now()), i))
+        .map(|(i, j)| (next_fire(&j.settings.schedule, Local::now(), None), i))
         .collect();
 
+    let anchors: std::collections::HashMap<String, chrono::Weekday> = std::collections::HashMap::new();
     loop {
-        // Pick up config edits (GUI save, manual edits) without a restart.
+        // Pick up config edits (GUI save, manual edits) without a restart —
+        // and re-resolve the job list so removed chats stop firing immediately.
         let cfg = match Config::load(config_path) {
             Ok(fresh) => fresh,
             Err(e) => {
@@ -335,6 +345,22 @@ pub async fn run_loop(cfg: &Config, config_path: &std::path::Path) -> anyhow::Re
                 cfg.clone()
             }
         };
+        match resolve_jobs(&client, &cfg).await {
+            Ok(fresh_jobs) => {
+                let fresh_keys: std::collections::HashSet<String> =
+                    fresh_jobs.iter().map(|j| j.key.to_string()).collect();
+                for gone in jobs.iter().filter(|j| !fresh_keys.contains(&j.key.to_string())) {
+                    tracing::info!(chat = %gone.key, "chat removed from config; no longer scheduled");
+                }
+                jobs = fresh_jobs;
+                next = jobs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, j)| (next_fire(&j.settings.schedule, Local::now(), anchors.get(&j.key.to_string())), i))
+                    .collect();
+            }
+            Err(e) => tracing::warn!(error = %e, "job re-resolution failed; keeping previous jobs"),
+        }
         let cfg = &cfg;
         let now = Local::now();
         next.sort_by_key(|(t, _)| *t);
@@ -354,7 +380,7 @@ pub async fn run_loop(cfg: &Config, config_path: &std::path::Path) -> anyhow::Re
                     next = jobs
                         .iter()
                         .enumerate()
-                        .map(|(i, j)| (next_fire(&j.settings.schedule, Local::now()), i))
+                        .map(|(i, j)| (next_fire(&j.settings.schedule, Local::now(), None), i))
                         .collect();
                 }
             }
@@ -369,7 +395,7 @@ pub async fn run_loop(cfg: &Config, config_path: &std::path::Path) -> anyhow::Re
             }
             Err(e) => tracing::error!(chat = %job.key, error = %e, "job failed"),
         }
-        next[idx] = (next_fire(&job.settings.schedule, Local::now()), idx);
+        next[idx] = (next_fire(&job.settings.schedule, Local::now(), anchors.get(&job.key.to_string())), idx);
     }
 }
 
@@ -396,7 +422,7 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-        let next = next_fire(&s, from);
+        let next = next_fire(&s, from, None);
         assert_eq!((next.hour(), next.minute()), (4, 0));
         assert_eq!(next.day(), 10);
         let from = Local
@@ -407,7 +433,7 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-        let next = next_fire(&s, from);
+        let next = next_fire(&s, from, None);
         assert_eq!(next.day(), 11);
     }
 
@@ -425,7 +451,7 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-        let next = next_fire(&s, from);
+        let next = next_fire(&s, from, None);
         assert_eq!((next.month(), next.day()), (2, 1));
         let from = Local
             .from_local_datetime(
@@ -435,7 +461,7 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-        let next = next_fire(&s, from);
+        let next = next_fire(&s, from, None);
         assert_eq!((next.year(), next.month(), next.day()), (2025, 1, 1));
     }
 
@@ -453,7 +479,7 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-        let next = next_fire(&s, from);
+        let next = next_fire(&s, from, None);
         let delta = (next - from).num_seconds();
         assert!(delta <= 7 * 86_400 && delta > 0);
     }

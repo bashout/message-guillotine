@@ -91,7 +91,11 @@ pub fn last_runs_file() -> PathBuf {
     config::data_dir().join("last_runs.json")
 }
 
+static LAST_RUNS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn record_last_run(chat: &str, summary: &crate::deletion::Summary) {
+    // Serialized: concurrent run-now tasks must not lose each other's records.
+    let _g = LAST_RUNS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let file = last_runs_file();
     let mut runs: Value = std::fs::read_to_string(&file)
         .ok()
@@ -115,7 +119,7 @@ pub fn record_last_run(chat: &str, summary: &crate::deletion::Summary) {
         let _ = std::fs::create_dir_all(parent);
     }
     let tmp = file.with_extension("json.part");
-    if std::fs::write(&tmp, serde_json::to_string_pretty(&runs).unwrap() + "\n").is_ok() {
+    if crate::config::write_file_private(&tmp, &(serde_json::to_string_pretty(&runs).unwrap() + "\n")).is_ok() {
         let _ = std::fs::rename(&tmp, &file);
     }
 }
@@ -183,7 +187,7 @@ async fn handle(
     use tokio::io::{AsyncBufReadExt, AsyncReadExt};
     reader.take(64 * 1024).read_line(&mut line).await?;
     let req: Value = serde_json::from_str(line.trim())?;
-    if req.get("secret").and_then(|s| s.as_str()) != Some(secret.as_str()) {
+    if !secret_eq(req.get("secret").and_then(|s| s.as_str()).unwrap_or(""), &secret) {
         let resp = json!({ "ok": false, "error": "unauthorized" });
         writer.write_all((serde_json::to_string(&resp)? + "\n").as_bytes()).await?;
         return Ok(());
@@ -191,6 +195,28 @@ async fn handle(
     let resp = match req.get("cmd").and_then(|c| c.as_str()) {
         Some("status") => json!({ "ok": true, "runs": read_last_runs() }),
         Some("jobs") => json!({ "ok": true, "running": registry.snapshot(), "last": read_last_runs() }),
+        Some("archive") => {
+            let channel = req.get("channel").and_then(|c| c.as_str()).unwrap_or("").to_string();
+            if !crate::config::valid_id(&channel) {
+                json!({ "ok": false, "error": "channel id must be numeric" })
+            } else {
+                let cfg = cfg.clone();
+                let channel_job = channel.clone();
+                tokio::spawn(async move {
+                    let channel = channel_job;
+                    let _guard = crate::deletion::deletion_lock().lock().await;
+                    let client = match crate::api::Client::new(cfg.token().unwrap_or("")) {
+                        Ok(mut c) => { let _ = c.get_current_user().await; c }
+                        Err(e) => { tracing::warn!(error = %e, "archive: client"); return; }
+                    };
+                    let dir = cfg.resolve_archive_dir(None);
+                    if let Err(e) = crate::archiver::archive_chat(&client, &channel, &channel, &dir).await {
+                        tracing::warn!(channel = %channel, error = %e, "archive failed");
+                    }
+                });
+                json!({ "ok": true, "accepted": true, "channel": channel })
+            }
+        }
         Some("run_now") => {
             let chat = req.get("chat").and_then(|c| c.as_str()).unwrap_or("").to_string();
             let all = req.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -227,6 +253,19 @@ async fn handle(
 
 pub fn read_last_runs_public() -> serde_json::Map<String, serde_json::Value> {
     read_last_runs().as_object().cloned().unwrap_or_default()
+}
+
+/// Constant-time string compare (avoids a timing oracle on the IPC secret).
+fn secret_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut acc = 0u8;
+    for i in 0..a.len() {
+        acc |= a[i] ^ b[i];
+    }
+    acc == 0
 }
 
 fn read_last_runs() -> Value {

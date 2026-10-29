@@ -27,6 +27,7 @@ pub async fn run(config_arg: Option<&Path>) -> anyhow::Result<()> {
 
     // Layer a rolling file appender under the stderr one so a service has
     // persistent logs without changing CLI behavior.
+    config::ensure_data_dir()?; // 0700 before anything is written into it
     let log_dir = config::data_dir().join("logs");
     std::fs::create_dir_all(&log_dir)?;
     let file_appender = tracing_appender::rolling::daily(&log_dir, "guillotine.log");
@@ -84,9 +85,17 @@ pub async fn run(config_arg: Option<&Path>) -> anyhow::Result<()> {
 /// systemd --user unit (Linux).
 #[cfg(target_os = "linux")]
 fn systemd_quote(path: &Path) -> String {
-    // systemd quoting: wrap in double quotes, escape \, ", $, `
+    // systemd quoting: wrap in double quotes, escape \, ", $, `, and %
+    // (specifier expansion), and reject newlines outright.
     let raw = path.display().to_string();
-    format!("\"{}\"", raw.replace('\\', "\\\\").replace('"', "\\\"").replace('$', "\\$").replace('`', "\\`"))
+    assert!(!raw.contains('\n'), "path contains a newline");
+    let escaped = raw
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('$', "\\$")
+        .replace('`', "\\`")
+        .replace('%', "%%");
+    format!("\"{escaped}\"")
 }
 
 #[cfg(target_os = "linux")]

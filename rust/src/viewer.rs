@@ -941,6 +941,21 @@ fn host_allowed(host: &str) -> bool {
     name.parse::<std::net::IpAddr>().is_ok()
 }
 
+/// Baseline security headers on every viewer response.
+async fn security_headers(req: axum::extract::Request, next: middleware::Next) -> Response {
+    let mut resp = next.run(req).await;
+    let h = resp.headers_mut();
+    h.insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        "default-src 'self'; img-src 'self' data:; media-src 'self'; frame-ancestors 'none'"
+            .parse()
+            .unwrap(),
+    );
+    h.insert(header::X_FRAME_OPTIONS, "DENY".parse().unwrap());
+    resp
+}
+
 async fn host_guard(req: axum::extract::Request, next: middleware::Next) -> Response {
     let host = req
         .headers()
@@ -1341,9 +1356,15 @@ pub async fn run(
         .route("/api/attachments", axum::routing::get(api_attachments))
         .route("/api/stats", axum::routing::get(api_stats))
         .route("/media/{*name}", axum::routing::get(media))
+        .layer(middleware::from_fn(security_headers))
         .layer(middleware::from_fn(host_guard))
         .with_state(library.clone());
 
+    if !host.is_empty() && host != "127.0.0.1" && host != "localhost" && host != "::1" && host != "[::1]" {
+        eprintln!(
+            "WARNING: viewer is bound to {host} — all archives are readable by anyone who can reach this port with no authentication. Use the default 127.0.0.1 unless you know what you're doing."
+        );
+    }
     let listener = match tokio::net::TcpListener::bind((host, port)).await {
         Ok(l) => l,
         Err(e) if port != 0 => {

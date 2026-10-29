@@ -67,10 +67,11 @@ pub fn load_session(channel_id: &str, root: Option<&Path>) -> Option<Session> {
 pub fn save_session(channel_id: &str, state: &Session, root: Option<&Path>) {
     let path = session_path(channel_id, root);
     if let Some(parent) = path.parent() {
+        let _ = config::ensure_data_dir();
         let _ = std::fs::create_dir_all(parent);
     }
     let tmp = path.with_extension("json.part");
-    if std::fs::write(&tmp, serde_json::to_string(state).unwrap() + "\n").is_ok() {
+    if config::write_file_private(&tmp, &(serde_json::to_string(state).unwrap() + "\n")).is_ok() {
         let _ = std::fs::rename(&tmp, &path);
     }
 }
@@ -281,9 +282,9 @@ pub async fn run_deletion(
         aborted = Some(e);
     }
 
-    if aborted.is_none() {
+    if aborted.is_none() && !dry_run {
         clear_session(&channel_id, root);
-    } else {
+    } else if !dry_run {
         save_session(&channel_id, &state, root);
     }
 
@@ -320,12 +321,18 @@ pub async fn scan(
     channel: &str,
     retention_days: Option<u32>,
 ) -> anyhow::Result<()> {
+    if !config::valid_id(channel) {
+        anyhow::bail!("channel id must be numeric");
+    }
     let (cfg, _path) = crate::load_config(config_arg)?;
     let mut client = Client::new(cfg.token()?)?;
     if client.get_current_user().await?.is_none() {
         anyhow::bail!("invalid token or authentication failed");
     }
-    let cutoff = retention_days.map(|d| Utc::now() - chrono::Duration::days(d as i64));
+    let cutoff = retention_days.map(|d| {
+        let d = d.min(36_500);
+        Utc::now() - chrono::Duration::days(d as i64)
+    });
     let _guard = deletion_lock().lock().await;
     let summary = run_deletion(
         &client,

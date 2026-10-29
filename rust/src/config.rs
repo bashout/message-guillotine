@@ -46,6 +46,27 @@ pub fn sessions_dir() -> PathBuf {
     data_dir().join("deletion_sessions")
 }
 
+/// Write a file with owner-only permissions (0600 on unix), creating it if
+/// needed. Used for session files, last_runs, and other private state.
+pub fn write_file_private(path: &Path, contents: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?
+            .write_all(contents.as_bytes())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, contents)
+    }
+}
+
 /// Create the per-OS data dir with owner-only permissions (0700) and return
 /// it. Safe to call repeatedly.
 pub fn ensure_data_dir() -> std::io::Result<PathBuf> {
@@ -61,6 +82,16 @@ pub fn ensure_data_dir() -> std::io::Result<PathBuf> {
     #[cfg(not(unix))]
     {
         std::fs::create_dir_all(&dir)?;
+    }
+    // An existing dir is never re-chmodded by DirBuilder; enforce 0700.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(&dir) {
+            if meta.permissions().mode() & 0o077 != 0 {
+                let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+            }
+        }
     }
     Ok(dir)
 }
@@ -153,18 +184,24 @@ pub enum ChatKey {
     GuildChannel { guild: String, channel: String },
 }
 
+/// Snowflake ids are all digits; anything else is rejected so chat keys can
+/// never traverse paths in session/archive file names or API URLs.
+pub fn valid_id(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
 impl ChatKey {
     pub fn parse(raw: &str) -> anyhow::Result<Self> {
         if let Some(user) = raw.strip_prefix("dm:") {
-            if user.is_empty() {
-                bail!("invalid chat key {raw:?}: empty user id");
+            if !valid_id(user) {
+                bail!("invalid chat key {raw:?}: user id must be numeric");
             }
             return Ok(ChatKey::Dm(user.to_string()));
         }
         if let Some(rest) = raw.strip_prefix("guild:") {
             if let Some((guild, channel)) = rest.split_once("/channel:") {
-                if guild.is_empty() || channel.is_empty() {
-                    bail!("invalid chat key {raw:?}: empty guild or channel id");
+                if !valid_id(guild) || !valid_id(channel) {
+                    bail!("invalid chat key {raw:?}: guild/channel ids must be numeric");
                 }
                 return Ok(ChatKey::GuildChannel {
                     guild: guild.to_string(),
@@ -269,6 +306,14 @@ impl Config {
                 "no token: set `token` in {} or the {ENV_TOKEN} environment variable",
                 path.display()
             );
+        }
+        for (key, chat) in &self.chat {
+            if chat.retention_days > 36_500 {
+                bail!("retention_days for chat {key} is {}; max 36500 (100 years)", chat.retention_days);
+            }
+        }
+        if self.dm.default_retention_days > 36_500 {
+            bail!("dm.default_retention_days is {}; max 36500", self.dm.default_retention_days);
         }
         for key in self.chat.keys() {
             ChatKey::parse(key)
