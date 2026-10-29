@@ -1,84 +1,58 @@
-name: Release
+name: Release (Rust)
 
 on:
   push:
     tags:
-      - "v*"
+      - "v2.*"
 
 jobs:
-  test:
-    name: Test
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 0  # full history: setuptools-scm derives the version from tags
-
-      - name: Set up uv
-        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
-        with:
-          enable-cache: true
-
-      - name: Install dependencies
-        run: uv sync --extra dev --locked --python 3.14
-
-      - name: Run tests
-        run: uv run --no-sync pytest
-
   build:
-    name: Build ${{ matrix.os }}
+    name: Build ${{ matrix.artifact }}
     runs-on: ${{ matrix.os }}
-    needs: test
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: windows-latest
-            artifact: message-guillotine-windows.exe
-            rename_ext: .exe
-          - os: macos-latest
-            artifact: message-guillotine-macos-arm64
-            rename_ext: ""
-          - os: macos-15-intel
-            artifact: message-guillotine-macos-x86_64
-            rename_ext: ""
           - os: ubuntu-latest
-            artifact: message-guillotine-linux
-            rename_ext: ""
-
+            target: x86_64-unknown-linux-gnu
+            artifact: guillotine-linux-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: guillotine-macos-aarch64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: guillotine-windows-x86_64.exe
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          fetch-depth: 0  # full history: setuptools-scm derives the version from tags
+          targets: ${{ matrix.target }}
 
-      - name: Set up uv
-        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
-        with:
-          enable-cache: true
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
 
-      - name: Install dependencies
-        run: uv sync --extra build --locked --python 3.14
-
-      - name: Build executable
-        run: uv run --no-sync python build_exe.py
-
-      - name: Rename binary
-        shell: bash
+      - name: Install system deps (tray/GUI libs, Linux only)
+        if: runner.os == 'Linux'
         run: |
-          cd dist
-          mv message-guillotine${{ matrix.rename_ext }} ${{ matrix.artifact }}
+          sudo apt-get update
+          sudo apt-get install -y libxdo-dev libayatana-appindicator3-dev pkg-config libgtk-3-dev
+
+      - name: cargo build --release
+        working-directory: rust
+        run: cargo build --release --target ${{ matrix.target }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
-          path: dist/${{ matrix.artifact }}
+          path: rust/target/${{ matrix.target }}/release/${{ matrix.artifact }}
 
   release:
-    name: Create Release
-    needs: [test, build]
+    name: Create GitHub Release
+    needs: [build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -95,5 +69,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
           generate_release_notes: true
           files: artifacts/*

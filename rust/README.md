@@ -72,8 +72,10 @@ V1 archives, so anything produced by the V1 tool is still readable.
 ## Development
 
 ```bash
-cargo test                       # unit tests
-cargo build --no-default-features  # headless (no tray deps)
+cargo test --release                  # unit tests (CI gate)
+cargo clippy --all-targets -- -D warnings
+cargo build --release                 # full build (default `gui` feature; needs tray libs on Linux)
+cargo build --release --no-default-features  # headless (no tray deps)
 ```
 
 Release: the V2 line is cut as git tag `v2.x.y` when this branch merges to
