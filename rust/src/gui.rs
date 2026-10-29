@@ -40,9 +40,6 @@ fn tray_icon_rgba() -> tray_icon::Icon {
     fallback_icon()
 }
 
-/// A simple generated 32x32 RGBA icon (a dark square with a lighter blade),
-/// so no asset files are needed.
-
 /// A simple generated 32x32 RGBA icon (a dark square with a lighter blade).
 fn fallback_icon() -> tray_icon::Icon {
     let size = 32u32;
