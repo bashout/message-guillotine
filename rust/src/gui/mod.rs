@@ -98,6 +98,33 @@ fn tray_icon_rgba() -> tray_icon::Icon {
     fallback_icon()
 }
 
+/// Install the .desktop entry and hicolor icon so docks/launches show
+/// "Message Guillotine" with the branding icon instead of a template icon.
+#[cfg(target_os = "linux")]
+fn install_desktop_entry() {
+    let Some(home) = dirs::home_dir() else { return };
+    let apps = home.join(".local/share/applications");
+    let icons = home.join(".local/share/icons/hicolor/256x256/apps");
+    let exe = std::env::current_exe().ok();
+    if let (Ok(_), Some(exe)) = (std::fs::create_dir_all(&apps), exe) {
+        let desktop = format!(
+            "[Desktop Entry]\nType=Application\nName=Message Guillotine\nComment=Scheduled bulk delete and archive of your own chat messages\nExec={} gui\nIcon=guillotine\nTerminal=false\nCategories=Utility;\n",
+            exe.display()
+        );
+        let _ = std::fs::write(apps.join("guillotine.desktop"), desktop);
+    }
+    if std::fs::create_dir_all(&icons).is_ok() {
+        if let Some((rgba, w, h)) = brand_icon_pixels() {
+            // save a 256px version for the icon theme
+            if let Ok(img) = image::load_from_memory(include_bytes!("../../../branding/icon-transparent.png")) {
+                let big = image::imageops::resize(&img.to_rgba8(), 256, 256, image::imageops::FilterType::Lanczos3);
+                let _ = big.save(icons.join("guillotine.png"));
+            }
+            let _ = (rgba, w, h);
+        }
+    }
+}
+
 /// The window icon: same branding pixels, for the Iced panel window.
 pub(crate) fn window_icon() -> Option<iced::window::Icon> {
     let (rgba, w, h) = brand_icon_pixels()?;
@@ -167,6 +194,9 @@ pub fn run_sync(config_arg: Option<PathBuf>) -> anyhow::Result<()> {
         .or_else(|| std::env::var_os("GUILLOTINE_VIEWER").map(PathBuf::from));
 
     let chats: Vec<String> = cfg.chats().map(|(k, _)| k.to_string()).collect();
+    #[cfg(target_os = "linux")]
+    install_desktop_entry();
+
     let menu = build_menu(&chats, &archive_dir, viewer.as_deref(), &labels)?;
     let _tray = tray_icon::TrayIconBuilder::new()
         .with_menu(Box::new(menu))

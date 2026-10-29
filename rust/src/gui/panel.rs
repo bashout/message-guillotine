@@ -80,12 +80,22 @@ pub(crate) fn panel_theme(_: &PanelApp, _: window::Id) -> Theme {
 }
 
 pub(crate) fn panel_title(_: &PanelApp, _: window::Id) -> String {
-    String::from("guillotine")
+    String::from("Message Guillotine")
 }
 
 fn panel_window_settings() -> window::Settings {
+    // The Wayland app_id must match the .desktop basename so docks show the
+    // right name + icon instead of a generic "template" one.
+    #[cfg(target_os = "linux")]
+    let platform_specific = iced::window::settings::PlatformSpecific {
+        application_id: "guillotine".to_string(),
+        ..Default::default()
+    };
+    #[cfg(not(target_os = "linux"))]
+    let platform_specific = Default::default();
     window::Settings {
         icon: crate::gui::window_icon(),
+        platform_specific,
         size: Size::new(1080.0, 760.0),
         min_size: Some(Size::new(820.0, 560.0)),
         visible: true,
