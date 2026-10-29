@@ -41,18 +41,18 @@ pub(crate) use settings::{
     DmRow, ManualChat, SettingsState,
 };
 
-/// A simple generated 32x32 RGBA icon (a dark square with a lighter blade),
-/// so no asset files are needed.
-fn tray_icon_rgba() -> tray_icon::Icon {
+/// The branding icon as autocropped 64px RGBA pixels — shared by the tray
+/// icon and the window icon so they match.
+fn brand_icon_pixels() -> Option<(Vec<u8>, u32, u32)> {
     // The repo's transparent branding icon (1024px, upscaled by the user),
     // embedded at compile time, original colors, rendered at 64px so the
     // tray's own downscale stays crisp.
     const EMBEDDED: &[u8] = include_bytes!("../../../branding/icon-transparent.png");
-    match image::load_from_memory(EMBEDDED) {
-        Ok(img) => {
-            let size = 64u32;
-            // Autocrop transparent margins so the glyph fills the icon and
-            // matches the visual weight of other tray icons.
+    let img = image::load_from_memory(EMBEDDED).ok()?;
+    let size = 64u32;
+    // Autocrop transparent margins so the glyph fills the icon and
+    // matches the visual weight of other tray icons.
+    {
             let full = img.to_rgba8();
             let (w, h) = full.dimensions();
             let px = full.as_raw();
@@ -80,16 +80,34 @@ fn tray_icon_rgba() -> tray_icon::Icon {
                 size,
                 image::imageops::FilterType::Lanczos3,
             );
-            match tray_icon::Icon::from_rgba(glyph.into_raw(), size, size) {
-                Ok(icon) => return icon,
-                Err(e) => {
-                    tracing::warn!(error = %e, "tray icon from branding png failed; using fallback")
-                }
+            Some((glyph.into_raw(), size, size))
+    }
+}
+
+/// The tray icon: branding PNG pixels, or a generated fallback.
+fn tray_icon_rgba() -> tray_icon::Icon {
+    match brand_icon_pixels() {
+        Some((rgba, w, h)) => match tray_icon::Icon::from_rgba(rgba, w, h) {
+            Ok(icon) => return icon,
+            Err(e) => {
+                tracing::warn!(error = %e, "tray icon from branding png failed; using fallback")
             }
-        }
-        Err(e) => tracing::warn!(error = %e, "cannot decode branding png; using fallback icon"),
+        },
+        None => tracing::warn!("cannot decode branding png; using fallback icon"),
     }
     fallback_icon()
+}
+
+/// The window icon: same branding pixels, for the Iced panel window.
+pub(crate) fn window_icon() -> Option<iced::window::Icon> {
+    let (rgba, w, h) = brand_icon_pixels()?;
+    match iced::window::icon::from_rgba(rgba, w, h) {
+        Ok(icon) => Some(icon),
+        Err(e) => {
+            tracing::warn!(error = %e, "window icon failed; using default");
+            None
+        }
+    }
 }
 
 /// A simple generated 32x32 RGBA icon (a dark square with a lighter blade).

@@ -85,6 +85,7 @@ pub(crate) fn panel_title(_: &PanelApp, _: window::Id) -> String {
 
 fn panel_window_settings() -> window::Settings {
     window::Settings {
+        icon: crate::gui::window_icon(),
         size: Size::new(1080.0, 760.0),
         min_size: Some(Size::new(820.0, 560.0)),
         visible: true,
