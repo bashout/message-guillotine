@@ -22,8 +22,31 @@ fn tray_icon_rgba() -> tray_icon::Icon {
     match image::load_from_memory(EMBEDDED) {
         Ok(img) => {
             let size = 64u32;
+            // Autocrop transparent margins so the glyph fills the icon and
+            // matches the visual weight of other tray icons.
+            let full = img.to_rgba8();
+            let (w, h) = full.dimensions();
+            let px = full.as_raw();
+            let alpha = |x: u32, y: u32| px[((y * w + x) * 4 + 3) as usize];
+            let (mut minx, mut miny, mut maxx, mut maxy) = (w, h, 0u32, 0u32);
+            for y in 0..h {
+                for x in 0..w {
+                    if alpha(x, y) > 10 {
+                        minx = minx.min(x);
+                        maxx = maxx.max(x);
+                        miny = miny.min(y);
+                        maxy = maxy.max(y);
+                    }
+                }
+            }
+            let cropped = if maxx > minx && maxy > miny {
+                image::imageops::crop_imm(&full, minx, miny, maxx - minx + 1, maxy - miny + 1)
+                    .to_image()
+            } else {
+                full
+            };
             let glyph = image::imageops::resize(
-                &img.to_rgba8(),
+                &cropped,
                 size,
                 size,
                 image::imageops::FilterType::Lanczos3,
