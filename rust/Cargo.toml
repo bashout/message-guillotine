@@ -13,13 +13,12 @@ path = "src/main.rs"
 
 [features]
 default = ["gui"]
-gui = ["dep:tray-icon", "dep:muda", "dep:eframe", "dep:egui", "dep:gtk", "dep:winit", "dep:image"]
+gui = ["dep:tray-icon", "dep:muda", "dep:iced", "dep:gtk", "dep:image"]
 
 [dependencies]
 tray-icon = { version = "0.19", optional = true }
 muda = { version = "0.15", optional = true }
-eframe = { version = "0.29", optional = true }
-egui = { version = "0.29", optional = true }
+iced = { version = "0.14", features = ["tokio"], optional = true }
 image = { version = "0.25", optional = true, default-features = false, features = ["png", "jpeg"] }
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
@@ -40,7 +39,6 @@ axum = { version = "0.8", default-features = false, features = ["http1", "tokio"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = { version = "0.18", optional = true }
-winit = { version = "0.30", optional = true }
 
 [profile.release]
 opt-level = 2
