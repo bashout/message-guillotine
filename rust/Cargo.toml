@@ -13,7 +13,7 @@ path = "src/main.rs"
 
 [features]
 default = ["gui"]
-gui = ["dep:tray-icon", "dep:muda", "dep:eframe", "dep:egui"]
+gui = ["dep:tray-icon", "dep:muda", "dep:eframe", "dep:egui", "dep:gtk"]
 
 [dependencies]
 tray-icon = { version = "0.19", optional = true }
@@ -35,6 +35,9 @@ tracing-appender = "0.2"
 anyhow = "1"
 thiserror = "2"
 futures = "0.3"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = { version = "0.18", optional = true }
 
 [profile.release]
 opt-level = 2

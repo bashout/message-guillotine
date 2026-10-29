@@ -32,11 +32,13 @@ fn tray_icon_rgba() -> tray_icon::Icon {
 }
 
 pub async fn run(config_arg: Option<&PathBuf>) -> anyhow::Result<()> {
+    // GTK must be initialized before any tray/menu is created on Linux.
+    #[cfg(target_os = "linux")]
+    gtk::init()?;
     let (cfg, path) = crate::load_config(config_arg)?;
     let chats: Vec<String> = cfg.chats().map(|(k, _)| k.to_string()).collect();
 
     let menu = build_menu(&chats)?;
-    let menu_for_events = menu.clone();
     let _tray = tray_icon::TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_tooltip("guillotine")
@@ -53,63 +55,91 @@ pub async fn run(config_arg: Option<&PathBuf>) -> anyhow::Result<()> {
         }
     });
 
-    let config_path = path.clone();
-    let chats = chats.clone();
+    handle_events(rx, path)?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn handle_events(rx: mpsc::Receiver<MenuEvent>, config_path: PathBuf) -> anyhow::Result<()> {
+    // tray-icon/muda on Linux are GTK: pump its main loop so menu events are
+    // delivered (esp. on Wayland via XWayland/appindicator).
+    let rt = tokio::runtime::Handle::current();
     loop {
-        match rx.recv_timeout(std::time::Duration::from_millis(500)) {
+        while gtk::events_pending() {
+            gtk::main_iteration();
+        }
+        match rx.recv_timeout(std::time::Duration::from_millis(100)) {
             Ok(event) => {
-                let id = event.id().0.as_str();
-                match id {
-                    "settings" => {
-                        let path = config_path.clone();
-                        std::thread::spawn(move || {
-                            if let Err(e) = settings_window(path) {
-                                tracing::error!(error = %e, "settings window failed");
-                            }
-                        });
-                    }
-                    "status" => {
-                        let rt = tokio::runtime::Handle::current();
-                        let report = rt.block_on(async {
-                            crate::ipc::send(serde_json::json!({ "cmd": "status" }))
-                                .await
-                                .ok()
-                        });
-                        match report {
-                            Some(resp) => {
-                                tracing::info!(status = %resp, "status");
-                                println!(
-                                    "guillotine status: {}",
-                                    serde_json::to_string_pretty(&resp).unwrap_or_default()
-                                );
-                            }
-                            None => println!("guillotine daemon is not running"),
-                        }
-                    }
-                    "quit" => break,
-                    other => {
-                        if let Some(chat) = other.strip_prefix("run:") {
-                            let chat = chat.to_string();
-                            let rt = tokio::runtime::Handle::current();
-                            rt.spawn(async move {
-                                match crate::ipc::send(serde_json::json!({ "cmd": "run_now", "chat": chat })).await {
-                                    Ok(resp) if resp["ok"] == true => {
-                                        tracing::info!(chat = %chat, "run-now done: {}", &resp["summary"]);
-                                    }
-                                    Ok(resp) => tracing::warn!(chat = %chat, "run-now failed: {}", &resp["error"]),
-                                    Err(e) => tracing::warn!(chat = %chat, "daemon unreachable, running directly: {e}"),
-                                }
-                            });
-                        }
-                    }
+                if !dispatch(event.id().0.as_str(), &config_path, &rt) {
+                    break;
                 }
-                let _ = menu_for_events; // keep the menu alive
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
     Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn handle_events(rx: mpsc::Receiver<MenuEvent>, config_path: PathBuf) -> anyhow::Result<()> {
+    let rt = tokio::runtime::Handle::current();
+    loop {
+        match rx.recv_timeout(std::time::Duration::from_millis(500)) {
+            Ok(event) => {
+                if !dispatch(event.id().0.as_str(), &config_path, &rt) {
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    Ok(())
+}
+
+/// Returns false when the app should quit.
+fn dispatch(id: &str, config_path: &PathBuf, rt: &tokio::runtime::Handle) -> bool {
+    match id {
+        "settings" => {
+            let path = config_path.clone();
+            std::thread::spawn(move || {
+                if let Err(e) = settings_window(path) {
+                    tracing::error!(error = %e, "settings window failed");
+                }
+            });
+        }
+        "status" => {
+            let report = rt.block_on(async {
+                crate::ipc::send(serde_json::json!({ "cmd": "status" }))
+                    .await
+                    .ok()
+            });
+            match report {
+                Some(resp) => {
+                    tracing::info!(status = %resp, "status");
+                    println!("guillotine status: {}", serde_json::to_string_pretty(&resp).unwrap_or_default());
+                }
+                None => println!("guillotine daemon is not running"),
+            }
+        }
+        "quit" => return false,
+        other => {
+            if let Some(chat) = other.strip_prefix("run:") {
+                let chat = chat.to_string();
+                rt.spawn(async move {
+                    match crate::ipc::send(serde_json::json!({ "cmd": "run_now", "chat": chat })).await {
+                        Ok(resp) if resp["ok"] == true => {
+                            tracing::info!(chat = %chat, "run-now done: {}", &resp["summary"]);
+                        }
+                        Ok(resp) => tracing::warn!(chat = %chat, "run-now failed: {}", &resp["error"]),
+                        Err(e) => tracing::warn!(chat = %chat, "daemon unreachable, running directly: {e}"),
+                    }
+                });
+            }
+        }
+    }
+    true
 }
 
 fn build_menu(chats: &[String]) -> anyhow::Result<Menu> {
