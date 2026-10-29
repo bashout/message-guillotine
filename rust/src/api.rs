@@ -211,6 +211,7 @@ impl Client {
             .build()?;
 
         let download = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
             .default_headers({
                 let mut h = HeaderMap::new();
                 h.insert(
@@ -331,7 +332,7 @@ impl Client {
             .json()
             .await
             .map_err(|e| HistoryFetchError(e.to_string()))?;
-        messages.sort_by(|a, b| b.id.cmp(&a.id));
+        messages.sort_by_key(|m| std::cmp::Reverse(m.id.parse::<u128>().unwrap_or(0)));
         Ok(messages)
     }
 
@@ -355,7 +356,7 @@ impl Client {
             .json()
             .await
             .map_err(|e| HistoryFetchError(e.to_string()))?;
-        messages.sort_by(|a, b| a.id.cmp(&b.id));
+        messages.sort_by_key(|m| m.id.parse::<u128>().unwrap_or(0));
         Ok(messages)
     }
 
@@ -497,10 +498,15 @@ impl Client {
         let mut size = 0u64;
         let mut stream = resp.bytes_stream();
         use futures::StreamExt;
+        const MAX_ATTACHMENT_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB guard
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.ok()?;
-            file.write_all(&chunk).await.ok()?;
             size += chunk.len() as u64;
+            if size > MAX_ATTACHMENT_BYTES {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                return None;
+            }
+            file.write_all(&chunk).await.ok()?;
         }
         file.flush().await.ok()?;
         drop(file);

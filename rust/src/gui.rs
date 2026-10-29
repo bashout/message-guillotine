@@ -418,6 +418,7 @@ struct SettingsApp {
     path: PathBuf,
     token: String,
     archive_dir: String,
+    archive_viewer: Option<PathBuf>,
     dm_policy: String,
     dm_users: String,
     default_schedule: String,
@@ -481,16 +482,17 @@ impl SettingsApp {
     fn load(path: &PathBuf, rt: &tokio::runtime::Handle, client: Option<std::sync::Arc<crate::api::Client>>) -> Self {
         let raw = std::fs::read_to_string(path).unwrap_or_default();
         let parsed: Result<Config, _> = toml::from_str(&raw);
-        let (token, archive_dir, dm, chat) = match parsed {
+        let (token, archive_dir, archive_viewer, dm, chat) = match parsed {
             Ok(c) => (
                 c.token.clone().unwrap_or_default(),
                 c.archive_dir
                     .map(|p| p.display().to_string())
                     .unwrap_or_default(),
+                c.archive_viewer.clone(),
                 Some(c.dm.clone()),
                 c.chat,
             ),
-            Err(_) => (String::new(), String::new(), None, Default::default()),
+            Err(_) => (String::new(), String::new(), None, None, Default::default()),
         };
         let dm = dm.unwrap_or_default();
 
@@ -549,6 +551,7 @@ impl SettingsApp {
             path: path.clone(),
             token,
             archive_dir,
+            archive_viewer,
             dm_policy: format!("{:?}", dm.policy).to_lowercase(),
             dm_users: dm.users.join(", "),
             default_schedule: dm.default_schedule.to_string(),
@@ -671,10 +674,16 @@ impl SettingsApp {
         } else {
             doc.insert("token".into(), toml::Value::String(self.token.clone()));
         }
-        doc.insert(
-            "archive_dir".into(),
-            toml::Value::String(self.archive_dir.clone()),
-        );
+        // round-trip the viewer path so saving from the GUI doesn't drop it
+        if let Some(v) = &self.archive_viewer {
+            doc.insert("archive_viewer".into(), toml::Value::String(v.display().to_string()));
+        }
+        if !self.archive_dir.is_empty() {
+            doc.insert(
+                "archive_dir".into(),
+                toml::Value::String(self.archive_dir.clone()),
+            );
+        }
         let mut dm = toml::Table::new();
         dm.insert("policy".into(), toml::Value::String(self.dm_policy.clone()));
         let users: Vec<toml::Value> = self
@@ -720,7 +729,11 @@ impl SettingsApp {
         doc.insert("chat".into(), toml::Value::Table(chats));
 
         let rendered = toml::to_string_pretty(&doc).unwrap_or_default();
-        match std::fs::write(&self.path, rendered) {
+        // Atomic write: temp file + rename, so a crash mid-save can't corrupt
+        // the only config file.
+        let tmp = self.path.with_extension("toml.part");
+        let write_result = std::fs::write(&tmp, rendered).and_then(|_| std::fs::rename(&tmp, &self.path));
+        match write_result {
             Ok(()) => {
                 #[cfg(unix)]
                 {

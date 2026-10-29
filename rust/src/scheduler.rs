@@ -296,6 +296,29 @@ pub async fn run_loop(cfg: &Config, config_path: &std::path::Path) -> anyhow::Re
     ));
     // Re-resolve the DM scope periodically: DMs come and go.
     let mut jobs = resolve_jobs(&client, cfg).await?;
+    // Warn about jobs whose last run is older than their schedule interval:
+    // a fire missed while the service was down is not backfilled (retention is
+    // relative to now, so this is safe) but it should be visible.
+    {
+        let last = crate::ipc::read_last_runs_public();
+        for job in &jobs {
+            let interval_days = match job.settings.schedule.kind {
+                ScheduleKind::Daily => 1,
+                ScheduleKind::Weekly => 7,
+                ScheduleKind::Monthly => 31,
+            };
+            if let Some(run) = last.get(&job.key.to_string()) {
+                if let Some(ts) = run.get("last_run").and_then(|v| v.as_str()) {
+                    if let Ok(t) = chrono::DateTime::parse_from_rfc3339(ts) {
+                        let age = chrono::Utc::now() - t.with_timezone(&chrono::Utc);
+                        if age.num_days() > interval_days {
+                            tracing::warn!(chat = %job.key, last_run = %ts, "scheduled run overdue (service was down?); it will fire at the next scheduled time or via run-now");
+                        }
+                    }
+                }
+            }
+        }
+    }
     tracing::info!(count = jobs.len(), "scheduler started");
     let mut next: Vec<(DateTime<Local>, usize)> = jobs
         .iter()

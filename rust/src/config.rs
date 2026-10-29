@@ -264,7 +264,7 @@ impl Config {
     }
 
     fn validate(&self, path: &Path) -> anyhow::Result<()> {
-        if self.token.is_none() {
+        if self.token.as_deref().is_none_or(|t| t.trim().is_empty()) {
             bail!(
                 "no token: set `token` in {} or the {ENV_TOKEN} environment variable",
                 path.display()

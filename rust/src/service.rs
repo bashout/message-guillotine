@@ -48,8 +48,37 @@ pub async fn run(config_arg: Option<&Path>) -> anyhow::Result<()> {
     // The guard stays alive for the whole run; on exit it flushes the logs.
     let _guard = _guard;
 
+    // Age out old log files so months of uptime don't grow unbounded.
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86400);
+            if let Ok(rd) = std::fs::read_dir(&log_dir) {
+                for entry in rd.flatten() {
+                    if let Ok(meta) = entry.metadata() {
+                        if meta.modified().is_ok_and(|m| m < cutoff) {
+                            let _ = std::fs::remove_file(entry.path());
+                        }
+                    }
+                }
+            }
+        }
+    });
+
     tracing::info!(config = %path.display(), "guillotine service starting");
-    scheduler::run_loop(&cfg, &path).await
+    // Graceful shutdown: flush logs and exit cleanly on SIGINT/SIGTERM.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("shutdown signal received; flushing logs");
+        let _ = shutdown_tx.send(());
+    });
+    let result = tokio::select! {
+        r = scheduler::run_loop(&cfg, &path) => r,
+        _ = shutdown_rx => Ok(()),
+    };
+    drop(_guard); // flush the non-blocking log writer
+    result
 }
 
 /// systemd --user unit (Linux).

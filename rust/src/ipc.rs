@@ -44,6 +44,33 @@ fn write_private(path: &std::path::Path, contents: &str) -> anyhow::Result<()> {
 
 use std::io::{Read as _, Write as _};
 
+/// 32 random bytes hex-encoded; /dev/urandom on unix, time+pid hash elsewhere.
+fn random_secret() -> String {
+    #[cfg(unix)]
+    {
+        let mut raw = [0u8; 32];
+        if std::fs::File::open("/dev/urandom")
+            .and_then(|mut f| f.read_exact(&mut raw))
+            .is_ok()
+        {
+            return raw.iter().map(|b| format!("{b:02x}")).collect();
+        }
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut h = now ^ ((std::process::id() as u128) << 64);
+    let mut out = String::with_capacity(64);
+    for _ in 0..4 {
+        h ^= h << 13;
+        h ^= h >> 7;
+        h ^= h << 17;
+        out.push_str(&format!("{h:016x}"));
+    }
+    out
+}
+
 /// The daemon's secret: read the existing file, or create a fresh random one.
 fn load_or_create_secret() -> anyhow::Result<String> {
     let path = secret_file();
@@ -54,9 +81,7 @@ fn load_or_create_secret() -> anyhow::Result<String> {
         }
     }
     config::ensure_data_dir()?;
-    let mut raw = [0u8; 32];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut raw)?;
-    let secret = raw.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let secret = random_secret();
     write_private(&path, &format!("{secret}\n"))?;
     Ok(secret)
 }
@@ -133,7 +158,13 @@ pub async fn serve(
             // Reload the config per request: edits made in the GUI settings
             // apply to run-now immediately, without a daemon restart.
             let fresh = Config::load(&config_path).unwrap_or_else(|_| (*cfg).clone());
-            let _ = handle(stream, Arc::new(fresh), registry, secret).await;
+            // Bound the whole exchange: a peer that connects and sends nothing
+            // must not pin a task + fd forever.
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                handle(stream, Arc::new(fresh), registry, secret),
+            )
+            .await;
         });
     }
 }
@@ -192,6 +223,10 @@ async fn handle(
         .write_all((serde_json::to_string(&resp)? + "\n").as_bytes())
         .await?;
     Ok(())
+}
+
+pub fn read_last_runs_public() -> serde_json::Map<String, serde_json::Value> {
+    read_last_runs().as_object().cloned().unwrap_or_default()
 }
 
 fn read_last_runs() -> Value {
