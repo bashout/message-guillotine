@@ -1116,9 +1116,10 @@ struct PanelApp {
 
 impl eframe::App for PanelApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // winit allows one EventLoop per process: hide on close instead of
-        // exiting, so the tray can reopen the same window.
+        // winit allows one EventLoop per process: veto the close and hide
+        // instead, so the tray can reopen the same window later.
         if ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
         {
