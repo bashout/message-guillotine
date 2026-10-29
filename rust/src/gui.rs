@@ -106,23 +106,8 @@ fn handle_events(rx: mpsc::Receiver<MenuEvent>, config_path: PathBuf) -> anyhow:
 /// Returns false when the app should quit.
 fn dispatch(id: &str, config_path: &Path, rt: &tokio::runtime::Handle) -> bool {
     match id {
-        "settings" => {
-            let path = config_path.to_path_buf();
-            let rt = rt.clone();
-            std::thread::spawn(move || {
-                if let Err(e) = settings_window(path, rt) {
-                    tracing::error!(error = %e, "settings window failed");
-                }
-            });
-        }
-        "jobs" => {
-            let rt = rt.clone();
-            std::thread::spawn(move || {
-                if let Err(e) = jobs_window(rt) {
-                    tracing::error!(error = %e, "jobs window failed");
-                }
-            });
-        }
+        "settings" => open_panel(config_path, rt, Tab::Settings),
+        "jobs" => open_panel(config_path, rt, Tab::Jobs),
         "status" => {
             rt.spawn(async {
                 match crate::ipc::send(serde_json::json!({ "cmd": "status" })).await {
@@ -299,8 +284,8 @@ struct ChatRow {
 }
 
 struct SettingsApp {
-    path: PathBuf,
     rt: tokio::runtime::Handle,
+    path: PathBuf,
     token: String,
     archive_dir: String,
     dm_policy: String,
@@ -397,8 +382,8 @@ impl SettingsApp {
         }
 
         SettingsApp {
-            path: path.clone(),
             rt: rt.clone(),
+            path: path.clone(),
             token,
             archive_dir,
             dm_policy: format!("{:?}", dm.policy).to_lowercase(),
@@ -655,14 +640,14 @@ async fn fetch_guild_channels(token: &str, guild_id: &str) -> Vec<(String, Strin
 
 /// Two-click armed "Delete ALL now" button: first click arms, second sends
 /// run-now with all=true (retention 0) through the daemon's IPC.
-fn delete_all_button(ui: &mut egui::Ui, armed: &mut Option<String>, chat: &str) {
+fn delete_all_button(ui: &mut egui::Ui, armed: &mut Option<String>, chat: &str, rt: &tokio::runtime::Handle) {
     let is_armed = armed.as_deref() == Some(chat);
     let label = if is_armed { "Confirm: delete ALL messages?" } else { "Delete all now" };
     if ui.button(egui::RichText::new(label).color(egui::Color32::LIGHT_RED)).clicked() {
         if is_armed {
             *armed = None;
             let chat = chat.to_string();
-            let rt = tokio::runtime::Handle::current();
+            let rt = rt.clone();
             rt.spawn(async move {
                 match crate::ipc::send(serde_json::json!({ "cmd": "run_now", "chat": chat, "all": true })).await {
                     Ok(resp) if resp["ok"] == true => tracing::info!(chat = %chat, "delete-all done: {}", &resp["summary"]),
@@ -697,13 +682,13 @@ fn schedule_combo(ui: &mut egui::Ui, schedule: &mut String) {
         });
 }
 
-impl eframe::App for SettingsApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+impl SettingsApp {
+    fn show(&mut self, _ctx: &egui::Context, ui: &mut egui::Ui) {
         self.poll_dm_fetch();
         self.poll_guild_fetch();
         self.poll_channel_fetch();
         self.ensure_channels_fetched();
-        egui::CentralPanel::default().show(ctx, |ui| {
+        {
             ui.heading("guillotine settings");
             ui.label(format!("config file: {}", self.path.display()));
             ui.add_space(6.0);
@@ -809,7 +794,7 @@ impl eframe::App for SettingsApp {
                                             .desired_width(50.0),
                                     );
                                     ui.checkbox(&mut row.archive, "archive before delete");
-                                    delete_all_button(ui, &mut self.armed_delete_all, &format!("dm:{}", row.user_id));
+                                    delete_all_button(ui, &mut self.armed_delete_all, &format!("dm:{}", row.user_id), &self.rt);
                                 });
                             }
                             ui.separator();
@@ -890,7 +875,7 @@ impl eframe::App for SettingsApp {
                                 egui::TextEdit::singleline(&mut row.retention).desired_width(50.0),
                             );
                             ui.checkbox(&mut row.archive, "archive");
-                            delete_all_button(ui, &mut self.armed_delete_all, &row.key);
+                            delete_all_button(ui, &mut self.armed_delete_all, &row.key, &self.rt);
                             if ui.button("remove").clicked() {
                                 remove = Some(i);
                             }
@@ -916,20 +901,108 @@ impl eframe::App for SettingsApp {
                 }
                 ui.label(&self.status);
             });
+        }
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Single panel window: winit allows only one EventLoop per process, so
+// Settings and Jobs are tabs of one window. Tray items open the window (once)
+// and switch the tab; while open, they just repaint.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Settings,
+    Jobs,
+}
+
+struct PanelState {
+    tab: Tab,
+    config_path: PathBuf,
+    rt: tokio::runtime::Handle,
+    ctx: Option<egui::Context>,
+}
+
+static PANEL: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<PanelState>>> =
+    std::sync::OnceLock::new();
+static PANEL_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn open_panel(config_path: &Path, rt: &tokio::runtime::Handle, tab: Tab) {
+    let state = PANEL.get_or_init(|| {
+        std::sync::Arc::new(std::sync::Mutex::new(PanelState {
+            tab,
+            config_path: config_path.to_path_buf(),
+            rt: rt.clone(),
+            ctx: None,
+        }))
+    });
+    {
+        let mut g = state.lock().unwrap_or_else(|e| e.into_inner());
+        g.tab = tab;
+        if let Some(ctx) = &g.ctx {
+            ctx.request_repaint();
+        }
+    }
+    if PANEL_RUNNING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return; // already open: the tab switch above is enough
+    }
+    let state = state.clone();
+    std::thread::spawn(move || {
+        if let Err(e) = panel_window(state) {
+            tracing::error!(error = %e, "panel window failed");
+        }
+        PANEL_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+    });
+}
+
+struct PanelApp {
+    state: std::sync::Arc<std::sync::Mutex<PanelState>>,
+    settings: SettingsApp,
+    jobs: JobsApp,
+}
+
+impl eframe::App for PanelApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        {
+            let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            g.ctx = Some(ctx.clone());
+        }
+        egui::SidePanel::left("panel-tabs").show(ctx, |ui| {
+            ui.add_space(6.0);
+            ui.heading("guillotine");
+            ui.add_space(6.0);
+            let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            ui.selectable_value(&mut g.tab, Tab::Jobs, "Jobs");
+            ui.selectable_value(&mut g.tab, Tab::Settings, "Settings");
+        });
+        let tab = self.state.lock().unwrap_or_else(|e| e.into_inner()).tab;
+        egui::CentralPanel::default().show(ctx, |ui| match tab {
+            Tab::Settings => self.settings.show(ctx, ui),
+            Tab::Jobs => self.jobs.show(ctx, ui),
         });
     }
 }
 
-fn settings_window(path: PathBuf, rt: tokio::runtime::Handle) -> anyhow::Result<()> {
-    let app = SettingsApp::load(&path, &rt);
+fn panel_window(state: std::sync::Arc<std::sync::Mutex<PanelState>>) -> anyhow::Result<()> {
+    let (config_path, rt) = {
+        let g = state.lock().unwrap_or_else(|e| e.into_inner());
+        (g.config_path.clone(), g.rt.clone())
+    };
+    let app = PanelApp {
+        settings: SettingsApp::load(&config_path, &rt),
+        jobs: JobsApp::new(&rt),
+        state,
+    };
     let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([820.0, 640.0])
-            .with_title("guillotine settings"),
+            .with_inner_size([880.0, 700.0])
+            .with_title("guillotine"),
         ..Default::default()
     };
-    // The settings window runs on its own thread while the main thread owns
-    // the GTK tray loop; winit on Linux must then be told any_thread is ok.
+    // The panel runs on its own thread while the main thread owns the GTK tray
+    // loop; winit on Linux must then be told any_thread is ok.
     #[cfg(target_os = "linux")]
     {
         use winit::platform::wayland::EventLoopBuilderExtWayland;
@@ -939,16 +1012,9 @@ fn settings_window(path: PathBuf, rt: tokio::runtime::Handle) -> anyhow::Result<
             EventLoopBuilderExtX11::with_any_thread(builder, true);
         }));
     }
-    eframe::run_native(
-        "guillotine settings",
-        options,
-        Box::new(move |_cc| Ok(Box::new(app))),
-    )
-    .map_err(|e| anyhow::anyhow!("eframe error: {e}"))
+    eframe::run_native("guillotine", options, Box::new(move |_cc| Ok(Box::new(app))))
+        .map_err(|e| anyhow::anyhow!("eframe error: {e}"))
 }
-
-// Jobs window (live progress, auto-refreshing every second)
-// ---------------------------------------------------------------------------
 
 struct JobsApp {
     rx: mpsc::Receiver<serde_json::Value>,
@@ -957,8 +1023,34 @@ struct JobsApp {
     note: String,
 }
 
-impl eframe::App for JobsApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+impl JobsApp {
+    fn new(rt: &tokio::runtime::Handle) -> Self {
+        let (tx, rx) = mpsc::channel::<serde_json::Value>();
+        let rt = rt.clone();
+        rt.spawn(async move {
+            loop {
+                match crate::ipc::send(serde_json::json!({ "cmd": "jobs" })).await {
+                    Ok(resp) => {
+                        if tx.send(resp).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(serde_json::json!({ "ok": false, "error": format!("{e}") }));
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        });
+        JobsApp {
+            rx,
+            running: Vec::new(),
+            last: serde_json::json!({}),
+            note: String::new(),
+        }
+    }
+
+    fn show(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         while let Ok(resp) = self.rx.try_recv() {
             if resp["ok"] == true {
                 self.running = resp["running"].as_array().cloned().unwrap_or_default();
@@ -970,7 +1062,7 @@ impl eframe::App for JobsApp {
         }
         ctx.request_repaint_after(std::time::Duration::from_secs(1));
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        {
             ui.heading("guillotine jobs");
             if !self.note.is_empty() {
                 ui.label(&self.note);
@@ -1026,52 +1118,6 @@ impl eframe::App for JobsApp {
                     }
                 });
             }
-        });
-    }
-}
-
-fn jobs_window(rt: tokio::runtime::Handle) -> anyhow::Result<()> {
-    let (tx, rx) = mpsc::channel::<serde_json::Value>();
-    rt.spawn(async move {
-        loop {
-            match crate::ipc::send(serde_json::json!({ "cmd": "jobs" })).await {
-                Ok(resp) => {
-                    if tx.send(resp).is_err() {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    let _ = tx.send(serde_json::json!({ "ok": false, "error": format!("{e}") }));
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
-    });
-    let app = JobsApp {
-        rx,
-        running: Vec::new(),
-        last: serde_json::json!({}),
-        note: String::new(),
-    };
-    let mut options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([760.0, 420.0])
-            .with_title("guillotine jobs"),
-        ..Default::default()
-    };
-    #[cfg(target_os = "linux")]
-    {
-        use winit::platform::wayland::EventLoopBuilderExtWayland;
-        use winit::platform::x11::EventLoopBuilderExtX11;
-        options.event_loop_builder = Some(Box::new(|builder| {
-            EventLoopBuilderExtWayland::with_any_thread(builder, true);
-            EventLoopBuilderExtX11::with_any_thread(builder, true);
-        }));
     }
-    eframe::run_native(
-        "guillotine jobs",
-        options,
-        Box::new(move |_cc| Ok(Box::new(app))),
-    )
-    .map_err(|e| anyhow::anyhow!("eframe error: {e}"))
 }
