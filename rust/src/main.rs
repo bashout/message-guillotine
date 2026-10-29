@@ -16,6 +16,7 @@ mod ipc;
 mod progress;
 mod scheduler;
 mod service;
+mod viewer;
 
 use std::path::PathBuf;
 
@@ -49,6 +50,21 @@ enum Commands {
     },
     /// Tray icon app: status, run-now, and configuration
     Gui,
+    /// Browse archived chats in a local web UI (V2 viewer)
+    Viewer {
+        /// Archival folder, or a single archive folder (default: the
+        /// configured archive dir)
+        archives_dir: Option<PathBuf>,
+        /// Interface to bind
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Port to bind (falls back to an ephemeral port when taken)
+        #[arg(long, default_value_t = 8765)]
+        port: u16,
+        /// Print the URL instead of opening the browser
+        #[arg(long)]
+        no_browser: bool,
+    },
     /// One-shot scan of a channel: report what a deletion run would delete
     Scan {
         /// Channel id (DM channel or guild channel)
@@ -194,6 +210,12 @@ async fn main() -> anyhow::Result<()> {
         } => deletion::scan(config_arg.as_ref(), &channel, retention_days).await?,
         Commands::Archive { channel } => archiver::archive(config_arg.as_ref(), &channel).await?,
         Commands::RunNow { chat } => scheduler::run_now(config_arg.as_ref(), &chat).await?,
+        Commands::Viewer {
+            archives_dir,
+            host,
+            port,
+            no_browser,
+        } => viewer::run(archives_dir, &host, port, no_browser).await?,
     }
     Ok(())
 }
