@@ -1181,6 +1181,7 @@ impl eframe::App for PanelApp {
                 let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 ui.selectable_value(&mut g.tab, Tab::Jobs, "Jobs");
                 ui.selectable_value(&mut g.tab, Tab::Settings, "Settings");
+                ui.selectable_value(&mut g.tab, Tab::Logs, "Logs");
             });
             ui.add_space(6.0);
         });
