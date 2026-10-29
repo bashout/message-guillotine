@@ -110,18 +110,15 @@ fn dispatch(id: &str, config_path: &PathBuf, rt: &tokio::runtime::Handle) -> boo
             });
         }
         "status" => {
-            let report = rt.block_on(async {
-                crate::ipc::send(serde_json::json!({ "cmd": "status" }))
-                    .await
-                    .ok()
-            });
-            match report {
-                Some(resp) => {
-                    tracing::info!(status = %resp, "status");
-                    println!("guillotine status: {}", serde_json::to_string_pretty(&resp).unwrap_or_default());
+            rt.spawn(async {
+                match crate::ipc::send(serde_json::json!({ "cmd": "status" })).await {
+                    Ok(resp) => {
+                        tracing::info!(status = %resp, "status");
+                        println!("guillotine status: {}", serde_json::to_string_pretty(&resp).unwrap_or_default());
+                    }
+                    Err(_) => println!("guillotine daemon is not running"),
                 }
-                None => println!("guillotine daemon is not running"),
-            }
+            });
         }
         "quit" => return false,
         other => {
@@ -388,12 +385,23 @@ impl eframe::App for SettingsApp {
 
 fn settings_window(path: PathBuf) -> anyhow::Result<()> {
     let app = SettingsApp::load(&path);
-    let options = eframe::NativeOptions {
+    let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([760.0, 520.0])
             .with_title("guillotine settings"),
         ..Default::default()
     };
+    // The settings window runs on its own thread while the main thread owns
+    // the GTK tray loop; winit on Linux must then be told any_thread is ok.
+    #[cfg(target_os = "linux")]
+    {
+        use winit::platform::wayland::EventLoopBuilderExtWayland;
+        use winit::platform::x11::EventLoopBuilderExtX11;
+        options.event_loop_builder = Some(Box::new(|builder| {
+            EventLoopBuilderExtWayland::with_any_thread(builder, true);
+            EventLoopBuilderExtX11::with_any_thread(builder, true);
+        }));
+    }
     eframe::run_native(
         "guillotine settings",
         options,
