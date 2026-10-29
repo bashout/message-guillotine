@@ -806,7 +806,7 @@ impl SettingsApp {
                         ui.add(
                             egui::TextEdit::singleline(&mut self.token)
                                 .password(true)
-                                .desired_width(480.0),
+                                .desired_width(ui.available_width() * 0.75),
                         );
                     });
                 });
@@ -820,7 +820,7 @@ impl SettingsApp {
                 ui.horizontal(|ui| {
                     ui.label("Archive folder:");
                     ui.add(
-                        egui::TextEdit::singleline(&mut self.archive_dir).desired_width(480.0),
+                        egui::TextEdit::singleline(&mut self.archive_dir).desired_width(ui.available_width() * 0.75),
                     );
                     if ui.button("detect").clicked() {
                         self.archives = detect_archives(Path::new(&self.archive_dir));
@@ -863,7 +863,7 @@ impl SettingsApp {
                             });
                         ui.label("user ids:");
                         ui.add(
-                            egui::TextEdit::singleline(&mut self.dm_users).desired_width(240.0),
+                            egui::TextEdit::singleline(&mut self.dm_users).desired_width(ui.available_width() * 0.45),
                         );
                     });
                     ui.horizontal(|ui| {
@@ -888,7 +888,7 @@ impl SettingsApp {
                     if self.dm_rows.is_empty() && !self.dm_pending {
                         ui.add(egui::Label::new(muted(ui, "no DMs found — check the token above")));
                     }
-                    egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                    egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
                         for row in &mut self.dm_rows {
                             ui.horizontal(|ui| {
                                 ui.checkbox(&mut row.enabled, "");
@@ -983,7 +983,7 @@ impl SettingsApp {
                     for (i, row) in self.manual_chats.iter_mut().enumerate() {
                         ui.horizontal(|ui| {
                             ui.add(
-                                egui::TextEdit::singleline(&mut row.key).desired_width(260.0),
+                                egui::TextEdit::singleline(&mut row.key).desired_width(ui.available_width() * 0.4),
                             );
                             schedule_combo(ui, &mut row.schedule);
                             ui.add(
@@ -1117,6 +1117,27 @@ impl eframe::App for PanelApp {
     }
 }
 
+
+/// One-time egui style setup: roomier spacing, softer widgets, an accent
+/// color, and full-width-friendly defaults so nothing looks squished.
+fn apply_style(ctx: &egui::Context) {
+    let mut style = (*ctx.style()).clone();
+    style.spacing.item_spacing = egui::vec2(10.0, 8.0);
+    style.spacing.button_padding = egui::vec2(12.0, 7.0);
+    style.spacing.indent = 22.0;
+    style.spacing.scroll.bar_width = 12.0;
+    let visuals = &mut style.visuals;
+    visuals.widgets.noninteractive.rounding = egui::Rounding::same(6.0);
+    visuals.widgets.inactive.rounding = egui::Rounding::same(6.0);
+    visuals.widgets.hovered.rounding = egui::Rounding::same(6.0);
+    visuals.widgets.active.rounding = egui::Rounding::same(6.0);
+    visuals.selection.bg_fill = egui::Color32::from_rgb(0x3d, 0x6b, 0x99);
+    visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(0x6a, 0x9c, 0xc9));
+    visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(0x2e, 0x2e, 0x36);
+    visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(0x27, 0x27, 0x2e);
+    ctx.set_style(style);
+}
+
 fn panel_window(state: std::sync::Arc<std::sync::Mutex<PanelState>>) -> anyhow::Result<()> {
     let (config_path, rt) = {
         let g = state.lock().unwrap_or_else(|e| e.into_inner());
@@ -1129,7 +1150,8 @@ fn panel_window(state: std::sync::Arc<std::sync::Mutex<PanelState>>) -> anyhow::
     };
     let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([880.0, 700.0])
+            .with_inner_size([1080.0, 760.0])
+            .with_min_inner_size([820.0, 560.0])
             .with_title("guillotine"),
         ..Default::default()
     };
@@ -1144,7 +1166,10 @@ fn panel_window(state: std::sync::Arc<std::sync::Mutex<PanelState>>) -> anyhow::
             EventLoopBuilderExtX11::with_any_thread(builder, true);
         }));
     }
-    eframe::run_native("guillotine", options, Box::new(move |_cc| Ok(Box::new(app))))
+    eframe::run_native("guillotine", options, Box::new(move |cc| {
+            apply_style(&cc.egui_ctx);
+            Ok(Box::new(app))
+        }))
         .map_err(|e| anyhow::anyhow!("eframe error: {e}"))
 }
 
