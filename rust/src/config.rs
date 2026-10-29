@@ -1,0 +1,463 @@
+//! Configuration: TOML file at the per-OS config path, with environment
+//! overrides. Holds the token, the archive folder, the DM scope policy
+//! (nominated users or an exclusion list — never an unconditional "all"),
+//! and one entry per chat with its own schedule, retention and
+//! archive-before-delete flag.
+
+use std::collections::BTreeMap;
+use std::fmt;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
+
+use anyhow::{bail, Context};
+use chrono::NaiveTime;
+use serde::{Deserialize, Deserializer};
+
+/// Environment variable that overrides the token stored in the config file.
+pub const ENV_TOKEN: &str = "GUILLOTINE_TOKEN";
+/// Environment variable pointing at a non-default config file.
+pub const ENV_CONFIG: &str = "GUILLOTINE_CONFIG";
+/// V1-compatible environment variable overriding the archive folder.
+pub const ENV_ARCHIVE_DIR: &str = "DM_ARCHIVE_DIR";
+
+/// Per-OS configuration directory (holds config.toml).
+pub fn config_dir() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("guillotine")
+}
+
+/// Per-OS data directory (holds archives and deletion sessions by default).
+pub fn data_dir() -> PathBuf {
+    dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("guillotine")
+}
+
+pub fn default_config_path() -> PathBuf {
+    config_dir().join("config.toml")
+}
+
+pub fn default_archive_dir() -> PathBuf {
+    data_dir().join("archives")
+}
+
+pub fn sessions_dir() -> PathBuf {
+    data_dir().join("deletion_sessions")
+}
+
+/// How DM chats are brought into scope. There is deliberately no "all" mode:
+/// either individual users are nominated, or specific users are excluded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DmScope {
+    Nominate,
+    Exclude,
+}
+
+/// Schedule for one chat: how often a deletion run fires, and at what local
+/// time of day (default 04:00). `monthly` fires on the 1st of the month,
+/// `weekly` on the weekday the config was created (or a named weekday).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Schedule {
+    pub kind: ScheduleKind,
+    pub at: NaiveTime,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScheduleKind {
+    Daily,
+    Weekly,
+    Monthly,
+}
+
+pub const DEFAULT_SCHEDULE_TIME: &str = "04:00";
+
+impl Default for Schedule {
+    fn default() -> Self {
+        Schedule {
+            kind: ScheduleKind::Daily,
+            at: NaiveTime::from_hms_opt(4, 0, 0).unwrap(),
+        }
+    }
+}
+
+impl FromStr for Schedule {
+    type Err = anyhow::Error;
+
+    /// Accepted: "daily", "weekly", "monthly", each optionally followed by
+    /// "at HH:MM" (24h local time).
+    fn from_str(s: &str) -> anyhow::Result<Self> {
+        let (head, at) = match s.split_once(" at ") {
+            Some((h, t)) => (h.trim(), Some(t.trim())),
+            None => (s.trim(), None),
+        };
+        let kind = match head.to_ascii_lowercase().as_str() {
+            "daily" => ScheduleKind::Daily,
+            "weekly" => ScheduleKind::Weekly,
+            "monthly" => ScheduleKind::Monthly,
+            other => bail!("unknown schedule {other:?}: expected daily, weekly or monthly"),
+        };
+        let at = match at {
+            Some(t) => NaiveTime::parse_from_str(t, "%H:%M")
+                .with_context(|| format!("invalid time {t:?}: expected HH:MM"))?,
+            None => NaiveTime::from_hms_opt(4, 0, 0).unwrap(),
+        };
+        Ok(Schedule { kind, at })
+    }
+}
+
+impl fmt::Display for Schedule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self.kind {
+            ScheduleKind::Daily => "daily",
+            ScheduleKind::Weekly => "weekly",
+            ScheduleKind::Monthly => "monthly",
+        };
+        write!(f, "{kind} at {}", self.at.format("%H:%M"))
+    }
+}
+
+impl<'de> Deserialize<'de> for Schedule {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Schedule::from_str(&raw).map_err(serde::de::Error::custom)
+    }
+}
+
+/// A chat target: a DM with a user, or a channel inside a guild.
+/// Serialized in config as "dm:<user_id>" or "guild:<guild_id>/channel:<channel_id>".
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ChatKey {
+    Dm(String),
+    GuildChannel { guild: String, channel: String },
+}
+
+impl ChatKey {
+    pub fn parse(raw: &str) -> anyhow::Result<Self> {
+        if let Some(user) = raw.strip_prefix("dm:") {
+            if user.is_empty() {
+                bail!("invalid chat key {raw:?}: empty user id");
+            }
+            return Ok(ChatKey::Dm(user.to_string()));
+        }
+        if let Some(rest) = raw.strip_prefix("guild:") {
+            if let Some((guild, channel)) = rest.split_once("/channel:") {
+                if guild.is_empty() || channel.is_empty() {
+                    bail!("invalid chat key {raw:?}: empty guild or channel id");
+                }
+                return Ok(ChatKey::GuildChannel {
+                    guild: guild.to_string(),
+                    channel: channel.to_string(),
+                });
+            }
+            bail!("invalid chat key {raw:?}: expected guild:<id>/channel:<id>");
+        }
+        bail!("invalid chat key {raw:?}: expected dm:<user_id> or guild:<id>/channel:<id>")
+    }
+
+    /// The channel id used against the API: a DM chat's channel id is resolved
+    /// at runtime from the user id, so for DMs this returns the user id and
+    /// callers must resolve it first.
+    pub fn id(&self) -> &str {
+        match self {
+            ChatKey::Dm(user) => user,
+            ChatKey::GuildChannel { channel, .. } => channel,
+        }
+    }
+}
+
+impl fmt::Display for ChatKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ChatKey::Dm(user) => write!(f, "dm:{user}"),
+            ChatKey::GuildChannel { guild, channel } => {
+                write!(f, "guild:{guild}/channel:{channel}")
+            }
+        }
+    }
+}
+
+/// One chat's settings: when to run, what to keep, whether to archive first.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChatConfig {
+    pub schedule: Schedule,
+    pub retention_days: u32,
+    #[serde(default)]
+    pub archive_before_delete: bool,
+}
+
+/// The [dm] section: scope policy plus defaults for DM chats that have no
+/// own [chat] entry (used under the "exclude" policy).
+#[derive(Debug, Clone, Deserialize)]
+pub struct DmPolicy {
+    pub policy: DmScope,
+    #[serde(default)]
+    pub users: Vec<String>,
+    #[serde(default)]
+    pub default_schedule: Schedule,
+    #[serde(default = "default_retention")]
+    pub default_retention_days: u32,
+    #[serde(default)]
+    pub default_archive_before_delete: bool,
+}
+
+fn default_retention() -> u32 {
+    30
+}
+
+impl Default for DmPolicy {
+    fn default() -> Self {
+        DmPolicy {
+            policy: DmScope::Exclude,
+            users: Vec::new(),
+            default_schedule: Schedule::default(),
+            default_retention_days: default_retention(),
+            default_archive_before_delete: false,
+        }
+    }
+}
+
+/// Root configuration file.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Config {
+    /// Token may be omitted here when GUILLOTINE_TOKEN is set.
+    pub token: Option<String>,
+    pub archive_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub dm: DmPolicy,
+    /// Raw chat table keyed by strings like "dm:123"; parsed into ChatKey by
+    /// `chats()` so a bad key is a load error, not a silent skip.
+    #[serde(default)]
+    pub chat: BTreeMap<String, ChatConfig>,
+}
+
+impl Config {
+    /// Load and validate the config from `path`, applying environment
+    /// overrides for the token and archive dir.
+    pub fn load(path: &Path) -> anyhow::Result<Self> {
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("cannot read config file {}", path.display()))?;
+        let mut cfg: Config = toml::from_str(&raw)
+            .with_context(|| format!("invalid config file {}", path.display()))?;
+        if let Some(token) = std::env::var_os(ENV_TOKEN) {
+            cfg.token = Some(token.to_string_lossy().into_owned());
+        }
+        if let Some(dir) = std::env::var_os(ENV_ARCHIVE_DIR) {
+            cfg.archive_dir = Some(PathBuf::from(dir));
+        }
+        cfg.validate(path)?;
+        Ok(cfg)
+    }
+
+    /// Load from the default path, or GUILLOTINE_CONFIG when set.
+    pub fn load_default() -> anyhow::Result<(Self, PathBuf)> {
+        let path = std::env::var_os(ENV_CONFIG)
+            .map(PathBuf::from)
+            .unwrap_or_else(default_config_path);
+        let cfg = Self::load(&path)?;
+        Ok((cfg, path))
+    }
+
+    fn validate(&self, path: &Path) -> anyhow::Result<()> {
+        if self.token.is_none() {
+            bail!(
+                "no token: set `token` in {} or the {ENV_TOKEN} environment variable",
+                path.display()
+            );
+        }
+        for key in self.chat.keys() {
+            ChatKey::parse(key)
+                .with_context(|| format!("invalid [chat] key {key:?} in {}", path.display()))?;
+        }
+        if self.dm.users.is_empty() {
+            tracing::warn!(
+                "dm.users is empty: under the {:?} policy no DM chats will be in scope",
+                self.dm.policy
+            );
+        }
+        Ok(())
+    }
+
+    /// The configured chats as parsed keys. DM chats listed here are
+    /// intersected with the dm policy when resolving the run scope.
+    pub fn chats(&self) -> impl Iterator<Item = (ChatKey, &ChatConfig)> {
+        self.chat
+            .iter()
+            .map(|(k, v)| (ChatKey::parse(k).unwrap(), v))
+    }
+
+    /// The token, from the environment override or the file.
+    pub fn token(&self) -> anyhow::Result<&str> {
+        self.token
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("no token configured (set `token` or {ENV_TOKEN})"))
+    }
+
+    /// Archive folder resolution, same priority as V1: explicit argument,
+    /// then DM_ARCHIVE_DIR, then the config file, then the per-OS default.
+    pub fn resolve_archive_dir(&self, explicit: Option<&Path>) -> PathBuf {
+        if let Some(p) = explicit {
+            return p.to_path_buf();
+        }
+        if let Some(p) = std::env::var_os(ENV_ARCHIVE_DIR) {
+            return PathBuf::from(p);
+        }
+        if let Some(p) = &self.archive_dir {
+            return p.clone();
+        }
+        default_archive_dir()
+    }
+
+    /// Effective settings for a DM chat: its own [chat] entry when present,
+    /// otherwise the dm defaults (only reached under the exclude policy).
+    pub fn dm_chat_settings(&self, user_id: &str) -> Option<ChatConfig> {
+        if let Some(own) = self.chat.get(&format!("dm:{user_id}")) {
+            return Some(own.clone());
+        }
+        match self.dm.policy {
+            DmScope::Exclude if !self.dm.users.iter().any(|u| u == user_id) => Some(ChatConfig {
+                schedule: self.dm.default_schedule,
+                retention_days: self.dm.default_retention_days,
+                archive_before_delete: self.dm.default_archive_before_delete,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Whether a DM user is in scope at all under the dm policy.
+    pub fn dm_user_in_scope(&self, user_id: &str) -> bool {
+        match self.dm.policy {
+            DmScope::Nominate => self.dm.users.iter().any(|u| u == user_id),
+            DmScope::Exclude => !self.dm.users.iter().any(|u| u == user_id),
+        }
+    }
+}
+
+/// The example config written by `guillotine config init`.
+pub const EXAMPLE_CONFIG: &str = r##"# guillotine configuration
+# Token may also come from the GUILLOTINE_TOKEN environment variable.
+token = "YOUR_USER_TOKEN"
+# archive_dir = "/path/to/archives"   # default: per-OS data dir /guillotine/archives
+
+# How DM chats are scoped. There is no "all" mode:
+#   policy = "nominate" -> only the users listed below are in scope
+#   policy = "exclude"  -> every DM except the users listed below is in scope
+# DMs without their own [chat] entry use the defaults below (exclude policy).
+[dm]
+policy = "exclude"
+users = ["USER_ID_TO_EXCLUDE"]
+default_schedule = "weekly"
+default_retention_days = 30
+default_archive_before_delete = true
+
+# Each chat has its own schedule, retention and archive flag.
+# schedule: daily | weekly | monthly, optional "at HH:MM" (default 04:00).
+# retention_days: the most recent N days of your messages are kept;
+# on each run everything older is deleted.
+# archive_before_delete: archive the chat first, appending to the existing
+# archive for this chat when one is present.
+
+# [chat."dm:USER_ID"]
+# schedule = "monthly"
+# retention_days = 7
+# archive_before_delete = true
+
+# [chat."guild:GUILD_ID/channel:CHANNEL_ID"]
+# schedule = "daily"
+# retention_days = 30
+# archive_before_delete = false
+"##;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schedule_parsing() {
+        let s = Schedule::from_str("monthly").unwrap();
+        assert_eq!(s.kind, ScheduleKind::Monthly);
+        assert_eq!(s.at, NaiveTime::from_hms_opt(4, 0, 0).unwrap());
+        let s = Schedule::from_str("daily at 23:30").unwrap();
+        assert_eq!(s.kind, ScheduleKind::Daily);
+        assert_eq!(s.at, NaiveTime::from_hms_opt(23, 30, 0).unwrap());
+        assert!(Schedule::from_str("hourly").is_err());
+        assert!(Schedule::from_str("daily at 25:00").is_err());
+    }
+
+    #[test]
+    fn chat_key_roundtrip() {
+        assert_eq!(ChatKey::parse("dm:123").unwrap(), ChatKey::Dm("123".into()));
+        assert_eq!(
+            ChatKey::parse("guild:1/channel:2").unwrap(),
+            ChatKey::GuildChannel {
+                guild: "1".into(),
+                channel: "2".into()
+            }
+        );
+        assert_eq!(ChatKey::Dm("123".into()).to_string(), "dm:123");
+        assert!(ChatKey::parse("channel:2").is_err());
+        assert!(ChatKey::parse("dm:").is_err());
+    }
+
+    #[test]
+    fn dm_scope_never_all() {
+        let toml = r#"
+token = "t"
+[dm]
+policy = "exclude"
+users = ["9"]
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(cfg.dm_user_in_scope("1"));
+        assert!(!cfg.dm_user_in_scope("9"));
+        // Exclude policy: user 1 has no own entry, gets the defaults.
+        assert!(cfg.dm_chat_settings("1").is_some());
+        assert!(cfg.dm_chat_settings("9").is_none());
+
+        let toml = r#"
+token = "t"
+[dm]
+policy = "nominate"
+users = ["1"]
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(cfg.dm_user_in_scope("1"));
+        assert!(!cfg.dm_user_in_scope("2"));
+        // Nominate policy without an entry: not in scope at all.
+        assert!(cfg.dm_chat_settings("2").is_none());
+    }
+
+    #[test]
+    fn per_chat_entry_overrides_dm_defaults() {
+        let toml = r#"
+token = "t"
+[dm]
+policy = "exclude"
+users = []
+default_retention_days = 30
+[chat."dm:5"]
+schedule = "monthly"
+retention_days = 7
+archive_before_delete = true
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let own = cfg.dm_chat_settings("5").unwrap();
+        assert_eq!(own.retention_days, 7);
+        assert!(own.archive_before_delete);
+        assert_eq!(own.schedule.kind, ScheduleKind::Monthly);
+        let other = cfg.dm_chat_settings("6").unwrap();
+        assert_eq!(other.retention_days, 30);
+        assert!(!other.archive_before_delete);
+    }
+
+    #[test]
+    fn token_env_override() {
+        let toml = r#"archive_dir = "/tmp/x""#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(cfg.token.is_none());
+    }
+}
