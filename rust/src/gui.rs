@@ -1146,11 +1146,13 @@ struct PanelApp {
 
 impl eframe::App for PanelApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // X quits the whole gui app (winit allows one EventLoop per process,
-        // so the window can't be recreated in-process; relaunch `guillotine
-        // gui` to reopen). The in-panel Quit button does the same.
+        // The panel is transient: X hides the window (vetoing the close, since
+        // winit allows one EventLoop per process and the tray must stay
+        // persistent). Tray -> Settings/Jobs re-shows it. Quit (tray menu or
+        // the in-panel button) is the only way to shut the app down.
         if ctx.input(|i| i.viewport().close_requested()) {
-            QUIT.store(true, std::sync::atomic::Ordering::SeqCst);
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
         {
             let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
