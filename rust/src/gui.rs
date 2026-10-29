@@ -15,53 +15,20 @@ use crate::config::{self, Config};
 /// A simple generated 32x32 RGBA icon (a dark square with a lighter blade),
 /// so no asset files are needed.
 fn tray_icon_rgba() -> tray_icon::Icon {
-    // The repo's branding icon, embedded at compile time. The logo is dark
-    // navy, so it is brightened and composited onto a dark slate rounded
-    // badge with only a 2px margin — readable on dark and light trays alike
-    // and crisp at 32px. Falls back to a generated glyph on decode failure.
+    // The repo's branding icon, embedded at compile time, original colors on
+    // a transparent background, rendered at 64px so the tray's own downscale
+    // stays crisp (a 256px source crushed to 32px is what looked bad).
     const EMBEDDED: &[u8] = include_bytes!("../../branding/icon-256.png");
     match image::load_from_memory(EMBEDDED) {
         Ok(img) => {
-            let size = 32u32;
-            let pad = 2u32;
-            let mut glyph = image::imageops::resize(
+            let size = 64u32;
+            let glyph = image::imageops::resize(
                 &img.to_rgba8(),
-                size - pad * 2,
-                size - pad * 2,
+                size,
+                size,
                 image::imageops::FilterType::Lanczos3,
             );
-            // brighten toward white so the dark logo contrasts on the badge
-            for px in glyph.pixels_mut() {
-                let image::Rgba([r, g, b, a]) = *px;
-                *px = image::Rgba([
-                    r + ((255 - r as u16) * 7 / 10) as u8,
-                    g + ((255 - g as u16) * 7 / 10) as u8,
-                    b + ((255 - b as u16) * 7 / 10) as u8,
-                    a,
-                ]);
-            }
-            let mut canvas =
-                image::RgbaImage::from_pixel(size, size, image::Rgba([47, 53, 66, 255]));
-            let r = 8u32;
-            for y in 0..size {
-                for x in 0..size {
-                    let in_circle = |cx: u32, cy: u32| {
-                        (x as i64 - cx as i64).pow(2) + (y as i64 - cy as i64).pow(2)
-                            <= (r as i64).pow(2)
-                    };
-                    let corner = (x < r && y < r && !in_circle(r, r))
-                        || (x >= size - r && y < r && !in_circle(size - r - 1, r))
-                        || (x < r && y >= size - r && !in_circle(r, size - r - 1))
-                        || (x >= size - r
-                            && y >= size - r
-                            && !in_circle(size - r - 1, size - r - 1));
-                    if corner {
-                        canvas.put_pixel(x, y, image::Rgba([0, 0, 0, 0]));
-                    }
-                }
-            }
-            image::imageops::overlay(&mut canvas, &glyph, pad as i64, pad as i64);
-            match tray_icon::Icon::from_rgba(canvas.into_raw(), size, size) {
+            match tray_icon::Icon::from_rgba(glyph.into_raw(), size, size) {
                 Ok(icon) => return icon,
                 Err(e) => {
                     tracing::warn!(error = %e, "tray icon from branding png failed; using fallback")
@@ -72,6 +39,9 @@ fn tray_icon_rgba() -> tray_icon::Icon {
     }
     fallback_icon()
 }
+
+/// A simple generated 32x32 RGBA icon (a dark square with a lighter blade),
+/// so no asset files are needed.
 
 /// A simple generated 32x32 RGBA icon (a dark square with a lighter blade).
 fn fallback_icon() -> tray_icon::Icon {
