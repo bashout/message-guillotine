@@ -155,9 +155,44 @@ fn dispatch(id: &str, config_path: &PathBuf, rt: &tokio::runtime::Handle) -> boo
     true
 }
 
-/// Open an archive folder in the configured Python viewer, or the OS file
-/// manager when no viewer is configured.
+/// Whether this binary provides the `viewer` subcommand (`guillotine viewer
+/// <folder>`). Probed once per process via `viewer --help`: clap exits 0 when
+/// the subcommand exists and non-zero when it does not. ASSUMPTION: the
+/// viewer subcommand is being added in parallel; until it lands in main.rs
+/// this probe returns false and archives fall through to the Python viewer.
+fn rust_viewer_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        let Ok(exe) = std::env::current_exe() else {
+            return false;
+        };
+        std::process::Command::new(exe)
+            .args(["viewer", "--help"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    })
+}
+
+/// Open an archive folder in the best available viewer: the Rust `viewer`
+/// subcommand of this same binary when present, else the configured Python
+/// viewer (config `archive_viewer` / GUILLOTINE_VIEWER), else the OS file
+/// manager.
 fn open_archive(folder: &Path) {
+    if rust_viewer_available() {
+        if let Ok(exe) = std::env::current_exe() {
+            if std::process::Command::new(exe)
+                .arg("viewer")
+                .arg(folder)
+                .spawn()
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
     let viewer = crate::load_config(None)
         .ok()
         .and_then(|(cfg, _)| cfg.archive_viewer)
@@ -265,6 +300,7 @@ struct ChatRow {
 
 struct SettingsApp {
     path: PathBuf,
+    rt: tokio::runtime::Handle,
     token: String,
     archive_dir: String,
     dm_policy: String,
@@ -276,7 +312,18 @@ struct SettingsApp {
     armed_delete_all: Option<String>,
     dm_pending: bool,
     dm_rx: mpsc::Receiver<Vec<(String, String)>>,
-    archives: Vec<String>,
+    guilds: Vec<(String, String)>,
+    guild_pending: bool,
+    guild_rx: mpsc::Receiver<Vec<(String, String)>>,
+    selected_guild: String,
+    channels: Vec<(String, String)>,
+    /// Guild id the currently fetched `channels` belong to.
+    channels_for: String,
+    channels_pending: bool,
+    channels_tx: mpsc::Sender<(String, Vec<(String, String)>)>,
+    channels_rx: mpsc::Receiver<(String, Vec<(String, String)>)>,
+    selected_channel: String,
+    archives: Vec<(String, PathBuf)>,
     manual_chats: Vec<ChatRow>,
     status: String,
 }
@@ -332,19 +379,26 @@ impl SettingsApp {
             }
         }
 
-        // Fetch the available DM users in the background so they can be
-        // clicked instead of typed.
+        // Fetch the available DM users and guilds in the background so they
+        // can be clicked instead of typed.
         let (tx, rx) = mpsc::channel::<Vec<(String, String)>>();
+        let (gtx, grx) = mpsc::channel::<Vec<(String, String)>>();
+        let (ctx_tx, ctx_rx) = mpsc::channel::<(String, Vec<(String, String)>)>();
         let dm_pending = !token.is_empty();
         if dm_pending {
-            let token = token.clone();
+            let dtoken = token.clone();
             rt.spawn(async move {
-                let _ = tx.send(fetch_dm_users(&token).await);
+                let _ = tx.send(fetch_dm_users(&dtoken).await);
+            });
+            let gtoken = token.clone();
+            rt.spawn(async move {
+                let _ = gtx.send(fetch_guilds(&gtoken).await);
             });
         }
 
         SettingsApp {
             path: path.clone(),
+            rt: rt.clone(),
             token,
             archive_dir,
             dm_policy: format!("{:?}", dm.policy).to_lowercase(),
@@ -356,6 +410,16 @@ impl SettingsApp {
             armed_delete_all: None,
             dm_pending,
             dm_rx: rx,
+            guilds: Vec::new(),
+            guild_pending: dm_pending,
+            guild_rx: grx,
+            selected_guild: String::new(),
+            channels: Vec::new(),
+            channels_for: String::new(),
+            channels_pending: false,
+            channels_tx: ctx_tx,
+            channels_rx: ctx_rx,
+            selected_channel: String::new(),
             archives,
             manual_chats,
             status: String::new(),
@@ -387,6 +451,55 @@ impl SettingsApp {
             Err(mpsc::TryRecvError::Empty) => {}
             Err(mpsc::TryRecvError::Disconnected) => self.dm_pending = false,
         }
+    }
+
+    /// Poll the background guild fetch.
+    fn poll_guild_fetch(&mut self) {
+        match self.guild_rx.try_recv() {
+            Ok(guilds) => {
+                self.guild_pending = false;
+                self.guilds = guilds;
+                self.guilds
+                    .sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => self.guild_pending = false,
+        }
+    }
+
+    /// Poll the background channel fetch; ignores stale payloads for a
+    /// guild that is no longer selected.
+    fn poll_channel_fetch(&mut self) {
+        match self.channels_rx.try_recv() {
+            Ok((guild_id, channels)) => {
+                self.channels_pending = false;
+                if guild_id == self.channels_for {
+                    self.channels = channels;
+                    self.channels
+                        .sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+                }
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => self.channels_pending = false,
+        }
+    }
+
+    /// When the selected guild changes, fetch its text channels in the
+    /// background so the channel dropdown can be filled.
+    fn ensure_channels_fetched(&mut self) {
+        if self.selected_guild.is_empty() || self.selected_guild == self.channels_for {
+            return;
+        }
+        let guild = self.selected_guild.clone();
+        self.channels_for = guild.clone();
+        self.channels.clear();
+        self.selected_channel.clear();
+        self.channels_pending = true;
+        let token = self.token.clone();
+        let tx = self.channels_tx.clone();
+        self.rt.spawn(async move {
+            let _ = tx.send((guild.clone(), fetch_guild_channels(&token, &guild).await));
+        });
     }
 
     fn save(&mut self) {
@@ -469,18 +582,20 @@ impl SettingsApp {
     }
 }
 
-/// Existing archive folders in `dir`, as "name (chat label)" strings.
-fn detect_archives(dir: &Path) -> Vec<String> {
+/// Existing archive folders in `dir`, as ("name (chat label)", path) pairs.
+fn detect_archives(dir: &Path) -> Vec<(String, PathBuf)> {
     crate::archive_format::list_archives(dir)
         .iter()
         .map(|p| {
             let meta = crate::archive_format::read_meta(p);
             let chat = meta.get("chat").and_then(|c| c.as_str()).unwrap_or("");
-            if chat.is_empty() {
-                p.file_name().unwrap().to_string_lossy().into_owned()
+            let name = p.file_name().unwrap().to_string_lossy();
+            let label = if chat.is_empty() {
+                name.into_owned()
             } else {
-                format!("{} ({})", p.file_name().unwrap().to_string_lossy(), chat)
-            }
+                format!("{name} ({chat})")
+            };
+            (label, p.clone())
         })
         .collect()
 }
@@ -501,6 +616,34 @@ async fn fetch_dm_users(token: &str) -> Vec<(String, String)> {
                 .clone()
                 .unwrap_or_else(|| user.username.clone());
             out.push((user.id, format!("{name} (@{})", user.username)));
+        }
+    }
+    out
+}
+
+/// Fetch the user's guilds from the API: (guild id, name).
+async fn fetch_guilds(token: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let Ok(client) = crate::api::Client::new(token) else {
+        return out;
+    };
+    if let Ok(guilds) = client.get_guilds().await {
+        for g in guilds {
+            out.push((g.id, g.name));
+        }
+    }
+    out
+}
+
+/// Fetch a guild's text channels from the API: (channel id, "#name").
+async fn fetch_guild_channels(token: &str, guild_id: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let Ok(client) = crate::api::Client::new(token) else {
+        return out;
+    };
+    if let Ok(channels) = client.get_guild_channels(guild_id).await {
+        for c in channels {
+            out.push((c.id, format!("#{}", c.name)));
         }
     }
     out
@@ -553,6 +696,9 @@ fn schedule_combo(ui: &mut egui::Ui, schedule: &mut String) {
 impl eframe::App for SettingsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_dm_fetch();
+        self.poll_guild_fetch();
+        self.poll_channel_fetch();
+        self.ensure_channels_fetched();
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("guillotine settings");
             ui.label(format!("config file: {}", self.path.display()));
@@ -590,8 +736,14 @@ impl eframe::App for SettingsApp {
                     egui::ScrollArea::vertical()
                         .max_height(90.0)
                         .show(ui, |ui| {
-                            for a in &self.archives {
-                                ui.label(format!("• {a}"));
+                            for (label, path) in &self.archives {
+                                let link = egui::Label::new(
+                                    egui::RichText::new(format!("• {label}")).underline(),
+                                )
+                                .sense(egui::Sense::click());
+                                if ui.add(link).clicked() {
+                                    open_archive(path);
+                                }
                             }
                         });
                 } else {
@@ -662,9 +814,67 @@ impl eframe::App for SettingsApp {
                 });
 
             egui::CollapsingHeader::new(format!("Guild channels ({})", self.manual_chats.len()))
-                .default_open(false)
+                .default_open(true)
                 .show(ui, |ui| {
-                    ui.label("key format: guild:<guild_id>/channel:<channel_id>");
+                    if self.guild_pending {
+                        ui.label("fetching your guilds…");
+                    }
+                    if self.guilds.is_empty() && !self.guild_pending {
+                        ui.label("no guilds found — check the token above");
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label("guild:");
+                        let guild_name = self
+                            .guilds
+                            .iter()
+                            .find(|(id, _)| *id == self.selected_guild)
+                            .map(|(_, name)| name.clone())
+                            .unwrap_or_else(|| "select…".to_string());
+                        egui::ComboBox::from_id_salt("guild-picker")
+                            .selected_text(guild_name)
+                            .show_ui(ui, |ui| {
+                                for (id, name) in &self.guilds {
+                                    ui.selectable_value(&mut self.selected_guild, id.clone(), name);
+                                }
+                            });
+                        ui.label("channel:");
+                        if self.channels_pending {
+                            ui.label("fetching channels…");
+                        }
+                        let channel_name = self
+                            .channels
+                            .iter()
+                            .find(|(id, _)| *id == self.selected_channel)
+                            .map(|(_, name)| name.clone())
+                            .unwrap_or_else(|| "select…".to_string());
+                        egui::ComboBox::from_id_salt("channel-picker")
+                            .selected_text(channel_name)
+                            .show_ui(ui, |ui| {
+                                for (id, name) in &self.channels {
+                                    ui.selectable_value(&mut self.selected_channel, id.clone(), name);
+                                }
+                            });
+                        let key = format!(
+                            "guild:{}/channel:{}",
+                            self.selected_guild, self.selected_channel
+                        );
+                        let can_add = !self.selected_guild.is_empty()
+                            && !self.selected_channel.is_empty()
+                            && !self.manual_chats.iter().any(|r| r.key == key);
+                        if ui
+                            .add_enabled(can_add, egui::Button::new("add channel"))
+                            .clicked()
+                        {
+                            self.manual_chats.push(ChatRow {
+                                key,
+                                schedule: self.default_schedule.clone(),
+                                retention: self.default_retention.clone(),
+                                archive: self.default_archive,
+                            });
+                        }
+                    });
+                    ui.add_space(4.0);
+                    ui.label("manual entry (fallback) — key format: guild:<guild_id>/channel:<channel_id>");
                     let mut remove: Option<usize> = None;
                     for (i, row) in self.manual_chats.iter_mut().enumerate() {
                         ui.horizontal(|ui| {
