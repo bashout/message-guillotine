@@ -65,8 +65,9 @@ retention_days = 30
 archive_before_delete = false
 ```
 
-The Python archive viewer from V1 still works against archives written by
-this tool.
+`guillotine viewer` (above) is the archive viewer — the local web UI in
+`rust/src/viewer/`. Archives written here remain format-compatible with old
+V1 archives, so anything produced by the V1 tool is still readable.
 
 ## Development
 
