@@ -15,6 +15,50 @@ use crate::config::{self, Config};
 /// A simple generated 32x32 RGBA icon (a dark square with a lighter blade),
 /// so no asset files are needed.
 fn tray_icon_rgba() -> tray_icon::Icon {
+    // The repo's branding icon, embedded at compile time. The logo is dark
+    // navy, which is invisible on a dark tray, so it is composited onto a
+    // light rounded-square badge. Falls back to a generated glyph on any
+    // decode failure.
+    const EMBEDDED: &[u8] = include_bytes!("../../branding/icon-256.png");
+    match image::load_from_memory(EMBEDDED) {
+        Ok(img) => {
+            let size = 32u32;
+            let glyph = image::imageops::resize(
+                &img.to_rgba8(),
+                size - 6,
+                size - 6,
+                image::imageops::FilterType::Lanczos3,
+            );
+            let mut canvas =
+                image::RgbaImage::from_pixel(size, size, image::Rgba([245, 245, 247, 255]));
+            let r = 7u32;
+            for y in 0..size {
+                for x in 0..size {
+                    let in_circle = |cx: u32, cy: u32| {
+                        (x as i64 - cx as i64).pow(2) + (y as i64 - cy as i64).pow(2)
+                            <= (r as i64).pow(2)
+                    };
+                    let corner = (x < r && y < r && !in_circle(r, r))
+                        || (x >= size - r && y < r && !in_circle(size - r - 1, r))
+                        || (x < r && y >= size - r && !in_circle(r, size - r - 1))
+                        || (x >= size - r
+                            && y >= size - r
+                            && !in_circle(size - r - 1, size - r - 1));
+                    if corner {
+                        canvas.put_pixel(x, y, image::Rgba([0, 0, 0, 0]));
+                    }
+                }
+            }
+            image::imageops::overlay(&mut canvas, &glyph, 3, 3);
+            match tray_icon::Icon::from_rgba(canvas.into_raw(), size, size) {
+                Ok(icon) => return icon,
+                Err(e) => {
+                    tracing::warn!(error = %e, "tray icon from branding png failed; using fallback")
+                }
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "cannot decode branding png; using fallback icon"),
+    }
     let size = 32u32;
     let mut rgba = vec![0u8; (size * size * 4) as usize];
     for y in 0..size {
