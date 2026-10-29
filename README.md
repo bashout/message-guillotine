@@ -31,7 +31,7 @@ V1 archives remain fully readable.
 
 ## Quickstart
 
-Everything lives in [`rust/`](rust/):
+Everything lives in the crate at the repo root:
 
 ```bash
 git clone https://github.com/bashout/message-guillotine.git
@@ -79,10 +79,9 @@ archive_before_delete = false
 
 ## Development
 
-All development happens in [`rust/`](rust/):
+All development happens in the crate at the repo root:
 
 ```bash
-cd rust
 cargo test --release             # unit tests — must pass
 cargo clippy --all-targets       # must be 0 warnings
 cargo build --no-default-features  # headless build (no tray deps) must compile

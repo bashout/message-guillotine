@@ -1,6 +1,6 @@
 # AGENTS.md — guillotine
 
-Bulk delete/archive of your own Discord messages (self-bot; violates the platform ToS). V1 is the Python CLI (`message_guillotine/`), V2 is the Rust service in `rust/` (branch `v2/rust-service`; released as git tag `v2.x.y` on merge to `main`).
+Bulk delete/archive of your own Discord messages (self-bot; violates the platform ToS). The Rust service in this repo (branch `v2/rust-service`; released as git tag `v2.x.y` on merge to `main`). The old Python V1 was removed; archives remain format-compatible with V1 archives.
 
 ## Hard rules
 
@@ -23,6 +23,6 @@ Bulk delete/archive of your own Discord messages (self-bot; violates the platfor
 
 ## Layout
 
-- `rust/src/`: `config` (TOML + env), `api` (Discord client), `deletion` (streaming delete + sessions), `archiver`/`archive_format` (V1 format), `scheduler` (per-chat daily/weekly/monthly + run-now), `service` (daemon + native autostart), `ipc` (loopback JSON, secret), `progress` (live job registry), `gui` (tray + panel), `viewer` (axum archive viewer).
+- `src/`: `config` (TOML + env), `api` (Discord client), `deletion` (streaming delete + sessions), `archiver`/`archive_format` (V1 format), `scheduler` (per-chat daily/weekly/monthly + run-now), `service` (daemon + native autostart), `ipc` (loopback JSON, secret), `progress` (live job registry), `gui` (tray + panel), `viewer` (axum archive viewer).
 - Data dir (`dirs::data_dir()/guillotine`): `archives/`, `deletion_sessions/`, `logs/`, `last_runs.json`, `ipc.port`, `ipc.secret`.
 - Config: per-OS config dir `config.toml` (or `--config` / `GUILLOTINE_CONFIG`); token also via `GUILLOTINE_TOKEN`.

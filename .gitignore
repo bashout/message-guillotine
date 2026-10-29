@@ -3,4 +3,4 @@
 .vscode/
 *.swp
 *.swo
-rust/target/
+target/

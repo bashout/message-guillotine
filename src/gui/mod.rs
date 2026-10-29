@@ -47,7 +47,7 @@ fn brand_icon_pixels() -> Option<(Vec<u8>, u32, u32)> {
     // The repo's transparent branding icon (1024px, upscaled by the user),
     // embedded at compile time, original colors, rendered at 64px so the
     // tray's own downscale stays crisp.
-    const EMBEDDED: &[u8] = include_bytes!("../../../branding/icon-transparent.png");
+    const EMBEDDED: &[u8] = include_bytes!("../../branding/icon-transparent.png");
     let img = image::load_from_memory(EMBEDDED).ok()?;
     let size = 64u32;
     // Autocrop transparent margins so the glyph fills the icon and
@@ -116,7 +116,7 @@ fn install_desktop_entry() {
     if std::fs::create_dir_all(&icons).is_ok() {
         if let Some((rgba, w, h)) = brand_icon_pixels() {
             // save a 256px version for the icon theme
-            if let Ok(img) = image::load_from_memory(include_bytes!("../../../branding/icon-transparent.png")) {
+            if let Ok(img) = image::load_from_memory(include_bytes!("../../branding/icon-transparent.png")) {
                 let big = image::imageops::resize(&img.to_rgba8(), 256, 256, image::imageops::FilterType::Lanczos3);
                 let _ = big.save(icons.join("guillotine.png"));
             }
