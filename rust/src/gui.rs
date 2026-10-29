@@ -3,7 +3,7 @@
 //! daemon over loopback IPC so run-now stays inside the single-deletion
 //! lock; falls back to running directly when no daemon is up.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
 use muda::accelerator::Accelerator;
@@ -103,8 +103,9 @@ fn dispatch(id: &str, config_path: &PathBuf, rt: &tokio::runtime::Handle) -> boo
     match id {
         "settings" => {
             let path = config_path.clone();
+            let rt = rt.clone();
             std::thread::spawn(move || {
-                if let Err(e) = settings_window(path) {
+                if let Err(e) = settings_window(path, rt) {
                     tracing::error!(error = %e, "settings window failed");
                 }
             });
@@ -179,6 +180,24 @@ fn build_menu(chats: &[String]) -> anyhow::Result<Menu> {
 // Settings window (egui)
 // ---------------------------------------------------------------------------
 
+/// One clickable DM user row: checking it adds a [chat."dm:<id>"] job.
+struct DmJobRow {
+    user_id: String,
+    name: String,
+    enabled: bool,
+    schedule: String,
+    retention: String,
+    archive: bool,
+}
+
+/// A manually entered (guild channel) chat row.
+struct ChatRow {
+    key: String,
+    schedule: String,
+    retention: String,
+    archive: bool,
+}
+
 struct SettingsApp {
     path: PathBuf,
     token: String,
@@ -188,19 +207,18 @@ struct SettingsApp {
     default_schedule: String,
     default_retention: String,
     default_archive: bool,
-    chats: Vec<ChatRow>,
+    dm_rows: Vec<DmJobRow>,
+    dm_pending: bool,
+    dm_rx: mpsc::Receiver<Vec<(String, String)>>,
+    archives: Vec<String>,
+    manual_chats: Vec<ChatRow>,
     status: String,
 }
 
-struct ChatRow {
-    key: String,
-    schedule: String,
-    retention: String,
-    archive: bool,
-}
+const SCHEDULE_OPTIONS: [&str; 3] = ["daily", "weekly", "monthly"];
 
 impl SettingsApp {
-    fn load(path: &PathBuf) -> Self {
+    fn load(path: &PathBuf, rt: &tokio::runtime::Handle) -> Self {
         let raw = std::fs::read_to_string(path).unwrap_or_default();
         let parsed: Result<Config, _> = toml::from_str(&raw);
         let (token, archive_dir, dm, chat) = match parsed {
@@ -215,6 +233,50 @@ impl SettingsApp {
             Err(_) => (String::new(), String::new(), None, Default::default()),
         };
         let dm = dm.unwrap_or_default();
+
+        // Prefill the archive dir with the per-OS default when unset.
+        let archive_dir = if archive_dir.is_empty() {
+            config::default_archive_dir().display().to_string()
+        } else {
+            archive_dir
+        };
+        let archives = detect_archives(Path::new(&archive_dir));
+
+        // Split existing chat entries into DM rows (matched against the
+        // fetched DM list later) and manual rows.
+        let mut dm_rows: Vec<DmJobRow> = Vec::new();
+        let mut manual_chats: Vec<ChatRow> = Vec::new();
+        for (k, c) in chat {
+            if let Some(user) = k.strip_prefix("dm:") {
+                dm_rows.push(DmJobRow {
+                    user_id: user.to_string(),
+                    name: user.to_string(),
+                    enabled: true,
+                    schedule: c.schedule.to_string(),
+                    retention: c.retention_days.to_string(),
+                    archive: c.archive_before_delete,
+                });
+            } else {
+                manual_chats.push(ChatRow {
+                    key: k,
+                    schedule: c.schedule.to_string(),
+                    retention: c.retention_days.to_string(),
+                    archive: c.archive_before_delete,
+                });
+            }
+        }
+
+        // Fetch the available DM users in the background so they can be
+        // clicked instead of typed.
+        let (tx, rx) = mpsc::channel::<Vec<(String, String)>>();
+        let dm_pending = !token.is_empty();
+        if dm_pending {
+            let token = token.clone();
+            rt.spawn(async move {
+                let _ = tx.send(fetch_dm_users(&token).await);
+            });
+        }
+
         SettingsApp {
             path: path.clone(),
             token,
@@ -224,28 +286,63 @@ impl SettingsApp {
             default_schedule: dm.default_schedule.to_string(),
             default_retention: dm.default_retention_days.to_string(),
             default_archive: dm.default_archive_before_delete,
-            chats: chat
-                .into_iter()
-                .map(|(k, c)| ChatRow {
-                    key: k,
-                    schedule: c.schedule.to_string(),
-                    retention: c.retention_days.to_string(),
-                    archive: c.archive_before_delete,
-                })
-                .collect(),
+            dm_rows,
+            dm_pending,
+            dm_rx: rx,
+            archives,
+            manual_chats,
             status: String::new(),
         }
     }
 
+    /// Poll the background DM fetch; merge names into existing rows and add
+    /// new users as disabled rows.
+    fn poll_dm_fetch(&mut self) {
+        match self.dm_rx.try_recv() {
+            Ok(users) => {
+                self.dm_pending = false;
+                for (id, name) in users {
+                    if let Some(row) = self.dm_rows.iter_mut().find(|r| r.user_id == id) {
+                        row.name = name;
+                    } else {
+                        self.dm_rows.push(DmJobRow {
+                            user_id: id,
+                            name,
+                            enabled: false,
+                            schedule: "daily".to_string(),
+                            retention: self.default_retention.clone(),
+                            archive: self.default_archive,
+                        });
+                    }
+                }
+                self.dm_rows.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => self.dm_pending = false,
+        }
+    }
+
     fn save(&mut self) {
+        // Validate schedules/retentions first so a bad row doesn't corrupt the file.
+        for row in self.dm_rows.iter().filter(|r| r.enabled) {
+            validate_row(&row.schedule, &row.retention, &mut self.status);
+            if !self.status.is_empty() {
+                return;
+            }
+        }
+        for row in &self.manual_chats {
+            validate_row(&row.schedule, &row.retention, &mut self.status);
+            if !self.status.is_empty() {
+                return;
+            }
+        }
+
         let mut doc = toml::Table::new();
         doc.insert("token".into(), toml::Value::String(self.token.clone()));
-        if !self.archive_dir.is_empty() {
-            doc.insert(
-                "archive_dir".into(),
-                toml::Value::String(self.archive_dir.clone()),
-            );
-        }
+        doc.insert(
+            "archive_dir".into(),
+            toml::Value::String(self.archive_dir.clone()),
+        );
         let mut dm = toml::Table::new();
         dm.insert("policy".into(), toml::Value::String(self.dm_policy.clone()));
         let users: Vec<toml::Value> = self
@@ -261,40 +358,42 @@ impl SettingsApp {
             toml::Value::String(self.default_schedule.clone()),
         );
         if let Ok(n) = self.default_retention.parse::<u32>() {
-            dm.insert(
-                "default_retention_days".into(),
-                toml::Value::Integer(n as i64),
-            );
+            dm.insert("default_retention_days".into(), toml::Value::Integer(n as i64));
         }
         dm.insert(
             "default_archive_before_delete".into(),
             toml::Value::Boolean(self.default_archive),
         );
         doc.insert("dm".into(), toml::Value::Table(dm));
+
         let mut chats = toml::Table::new();
-        for row in &self.chats {
+        for row in self.dm_rows.iter().filter(|r| r.enabled) {
             let mut t = toml::Table::new();
             t.insert("schedule".into(), toml::Value::String(row.schedule.clone()));
             if let Ok(n) = row.retention.parse::<u32>() {
                 t.insert("retention_days".into(), toml::Value::Integer(n as i64));
             }
-            t.insert(
-                "archive_before_delete".into(),
-                toml::Value::Boolean(row.archive),
-            );
+            t.insert("archive_before_delete".into(), toml::Value::Boolean(row.archive));
+            chats.insert(format!("dm:{}", row.user_id), toml::Value::Table(t));
+        }
+        for row in &self.manual_chats {
+            let mut t = toml::Table::new();
+            t.insert("schedule".into(), toml::Value::String(row.schedule.clone()));
+            if let Ok(n) = row.retention.parse::<u32>() {
+                t.insert("retention_days".into(), toml::Value::Integer(n as i64));
+            }
+            t.insert("archive_before_delete".into(), toml::Value::Boolean(row.archive));
             chats.insert(row.key.clone(), toml::Value::Table(t));
         }
         doc.insert("chat".into(), toml::Value::Table(chats));
+
         let rendered = toml::to_string_pretty(&doc).unwrap_or_default();
         match std::fs::write(&self.path, rendered) {
             Ok(()) => {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(
-                        &self.path,
-                        std::fs::Permissions::from_mode(0o600),
-                    );
+                    let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600));
                 }
                 self.status = format!("Saved {}", self.path.display());
             }
@@ -303,76 +402,208 @@ impl SettingsApp {
     }
 }
 
+/// Existing archive folders in `dir`, as "name (chat label)" strings.
+fn detect_archives(dir: &Path) -> Vec<String> {
+    crate::archive_format::list_archives(dir)
+        .iter()
+        .map(|p| {
+            let meta = crate::archive_format::read_meta(p);
+            let chat = meta.get("chat").and_then(|c| c.as_str()).unwrap_or("");
+            if chat.is_empty() {
+                p.file_name().unwrap().to_string_lossy().into_owned()
+            } else {
+                format!("{} ({})", p.file_name().unwrap().to_string_lossy(), chat)
+            }
+        })
+        .collect()
+}
+
+/// Fetch the user's DM partners from the API: (user id, "Display (@username)").
+async fn fetch_dm_users(token: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let Ok(mut client) = crate::api::Client::new(token) else {
+        return out;
+    };
+    if client.get_current_user().await.ok().flatten().is_none() {
+        return out;
+    }
+    if let Ok(channels) = client.get_dm_channels().await {
+        for (user, _channel) in client.dm_users(&channels) {
+            let name = user
+                .global_name
+                .clone()
+                .unwrap_or_else(|| user.username.clone());
+            out.push((user.id, format!("{name} (@{})", user.username)));
+        }
+    }
+    out
+}
+
+fn validate_row(schedule: &str, retention: &str, status: &mut String) {
+    use std::str::FromStr;
+    if crate::config::Schedule::from_str(schedule).is_err() {
+        *status = format!("invalid schedule {schedule:?} (use daily/weekly/monthly)");
+    } else if retention.parse::<u32>().is_err() {
+        *status = format!("invalid retention {retention:?} (days)");
+    } else {
+        status.clear();
+    }
+}
+
+fn schedule_combo(ui: &mut egui::Ui, schedule: &mut String) {
+    egui::ComboBox::from_id_salt(format!("sched-{schedule:p}"))
+        .selected_text(schedule.as_str())
+        .show_ui(ui, |ui| {
+            for opt in SCHEDULE_OPTIONS {
+                ui.selectable_value(schedule, opt.to_string(), opt);
+            }
+        });
+}
+
 impl eframe::App for SettingsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_dm_fetch();
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("guillotine settings");
             ui.label(format!("config file: {}", self.path.display()));
-            ui.add_space(8.0);
+            ui.add_space(6.0);
 
-            ui.horizontal(|ui| {
-                ui.label("Token:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.token)
-                        .password(true)
-                        .desired_width(420.0),
-                );
-            });
-            ui.horizontal(|ui| {
-                ui.label("Archive dir:");
-                ui.add(egui::TextEdit::singleline(&mut self.archive_dir).desired_width(420.0));
-            });
-            ui.add_space(8.0);
-
-            ui.label("DM scope (no 'all' mode):");
-            ui.horizontal(|ui| {
-                ui.label("policy:");
-                egui::ComboBox::from_id_salt("dm_policy")
-                    .selected_text(&self.dm_policy)
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.dm_policy, "nominate".into(), "nominate");
-                        ui.selectable_value(&mut self.dm_policy, "exclude".into(), "exclude");
-                    });
-                ui.label("user ids (comma separated):");
-                ui.add(egui::TextEdit::singleline(&mut self.dm_users).desired_width(280.0));
-            });
-            ui.horizontal(|ui| {
-                ui.label("DM defaults — schedule:");
-                ui.add(egui::TextEdit::singleline(&mut self.default_schedule).desired_width(120.0));
-                ui.label("retain days:");
-                ui.add(egui::TextEdit::singleline(&mut self.default_retention).desired_width(60.0));
-                ui.checkbox(&mut self.default_archive, "archive before delete");
-            });
-            ui.add_space(8.0);
-
-            ui.label("Chats (key: dm:<user_id> or guild:<id>/channel:<id>):");
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                let mut remove: Option<usize> = None;
-                for (i, row) in self.chats.iter_mut().enumerate() {
+            egui::CollapsingHeader::new("Connection")
+                .default_open(true)
+                .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.add(egui::TextEdit::singleline(&mut row.key).desired_width(220.0));
-                        ui.add(egui::TextEdit::singleline(&mut row.schedule).desired_width(120.0));
-                        ui.add(egui::TextEdit::singleline(&mut row.retention).desired_width(60.0));
-                        ui.checkbox(&mut row.archive, "archive");
-                        if ui.button("remove").clicked() {
-                            remove = Some(i);
+                        ui.label("Token:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.token)
+                                .password(true)
+                                .desired_width(480.0),
+                        );
+                    });
+                });
+
+            egui::CollapsingHeader::new(format!(
+                "Archives ({} detected)",
+                self.archives.len()
+            ))
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Archive folder:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.archive_dir).desired_width(480.0),
+                    );
+                    if ui.button("detect").clicked() {
+                        self.archives = detect_archives(Path::new(&self.archive_dir));
+                    }
+                });
+                if !self.archives.is_empty() {
+                    egui::ScrollArea::vertical()
+                        .max_height(90.0)
+                        .show(ui, |ui| {
+                            for a in &self.archives {
+                                ui.label(format!("• {a}"));
+                            }
+                        });
+                } else {
+                    ui.label("no existing archives found in this folder yet");
+                }
+            });
+
+            egui::CollapsingHeader::new("DM scope")
+                .default_open(true)
+                .show(ui, |ui| {
+                    ui.label("No 'all DMs' mode: nominate users, or exclude specific users.");
+                    ui.horizontal(|ui| {
+                        ui.label("policy:");
+                        egui::ComboBox::from_id_salt("dm_policy")
+                            .selected_text(&self.dm_policy)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.dm_policy, "nominate".into(), "nominate (only listed)");
+                                ui.selectable_value(&mut self.dm_policy, "exclude".into(), "exclude (all except listed)");
+                            });
+                        ui.label("user ids:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.dm_users).desired_width(240.0),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("DM defaults — schedule:");
+                        schedule_combo(ui, &mut self.default_schedule);
+                        ui.label("retain days:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.default_retention)
+                                .desired_width(50.0),
+                        );
+                        ui.checkbox(&mut self.default_archive, "archive before delete");
+                    });
+                });
+
+            egui::CollapsingHeader::new(format!("DM chats ({} available)", self.dm_rows.len()))
+                .default_open(true)
+                .show(ui, |ui| {
+                    if self.dm_pending {
+                        ui.label("fetching your DMs…");
+                    }
+                    if self.dm_rows.is_empty() && !self.dm_pending {
+                        ui.label("no DMs found — check the token above");
+                    }
+                    egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                        for row in &mut self.dm_rows {
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut row.enabled, "");
+                                ui.label(format!("{}  [{}]", row.name, row.user_id));
+                            });
+                            if row.enabled {
+                                ui.horizontal(|ui| {
+                                    ui.add_space(24.0);
+                                    schedule_combo(ui, &mut row.schedule);
+                                    ui.label("retain days:");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut row.retention)
+                                            .desired_width(50.0),
+                                    );
+                                    ui.checkbox(&mut row.archive, "archive before delete");
+                                });
+                            }
+                            ui.separator();
                         }
                     });
-                }
-                if let Some(i) = remove {
-                    self.chats.remove(i);
-                }
-                if ui.button("add chat").clicked() {
-                    self.chats.push(ChatRow {
-                        key: "dm:".into(),
-                        schedule: "daily".into(),
-                        retention: "30".into(),
-                        archive: false,
-                    });
-                }
-            });
-            ui.add_space(8.0);
+                });
 
+            egui::CollapsingHeader::new(format!("Guild channels ({})", self.manual_chats.len()))
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.label("key format: guild:<guild_id>/channel:<channel_id>");
+                    let mut remove: Option<usize> = None;
+                    for (i, row) in self.manual_chats.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut row.key).desired_width(260.0),
+                            );
+                            schedule_combo(ui, &mut row.schedule);
+                            ui.add(
+                                egui::TextEdit::singleline(&mut row.retention).desired_width(50.0),
+                            );
+                            ui.checkbox(&mut row.archive, "archive");
+                            if ui.button("remove").clicked() {
+                                remove = Some(i);
+                            }
+                        });
+                    }
+                    if let Some(i) = remove {
+                        self.manual_chats.remove(i);
+                    }
+                    if ui.button("add guild channel").clicked() {
+                        self.manual_chats.push(ChatRow {
+                            key: "guild:".into(),
+                            schedule: "daily".into(),
+                            retention: self.default_retention.clone(),
+                            archive: false,
+                        });
+                    }
+                });
+
+            ui.add_space(8.0);
             ui.horizontal(|ui| {
                 if ui.button("Save").clicked() {
                     self.save();
@@ -383,11 +614,11 @@ impl eframe::App for SettingsApp {
     }
 }
 
-fn settings_window(path: PathBuf) -> anyhow::Result<()> {
-    let app = SettingsApp::load(&path);
+fn settings_window(path: PathBuf, rt: tokio::runtime::Handle) -> anyhow::Result<()> {
+    let app = SettingsApp::load(&path, &rt);
     let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([760.0, 520.0])
+            .with_inner_size([820.0, 640.0])
             .with_title("guillotine settings"),
         ..Default::default()
     };
