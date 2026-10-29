@@ -37,8 +37,13 @@ pub async fn run(config_arg: Option<&PathBuf>) -> anyhow::Result<()> {
     gtk::init()?;
     let (cfg, path) = crate::load_config(config_arg)?;
     let chats: Vec<String> = cfg.chats().map(|(k, _)| k.to_string()).collect();
+    let archive_dir = cfg.resolve_archive_dir(None);
+    let viewer = cfg
+        .archive_viewer
+        .clone()
+        .or_else(|| std::env::var_os("GUILLOTINE_VIEWER").map(PathBuf::from));
 
-    let menu = build_menu(&chats)?;
+    let menu = build_menu(&chats, &archive_dir, viewer.as_deref())?;
     let _tray = tray_icon::TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_tooltip("guillotine")
@@ -131,7 +136,9 @@ fn dispatch(id: &str, config_path: &PathBuf, rt: &tokio::runtime::Handle) -> boo
         }
         "quit" => return false,
         other => {
-            if let Some(chat) = other.strip_prefix("run:") {
+            if let Some(archive_path) = other.strip_prefix("view:") {
+                open_archive(Path::new(archive_path));
+            } else if let Some(chat) = other.strip_prefix("run:") {
                 let chat = chat.to_string();
                 rt.spawn(async move {
                     match crate::ipc::send(serde_json::json!({ "cmd": "run_now", "chat": chat })).await {
@@ -148,11 +155,51 @@ fn dispatch(id: &str, config_path: &PathBuf, rt: &tokio::runtime::Handle) -> boo
     true
 }
 
-fn build_menu(chats: &[String]) -> anyhow::Result<Menu> {
+/// Open an archive folder in the configured Python viewer, or the OS file
+/// manager when no viewer is configured.
+fn open_archive(folder: &Path) {
+    let viewer = crate::load_config(None)
+        .ok()
+        .and_then(|(cfg, _)| cfg.archive_viewer)
+        .or_else(|| std::env::var_os("GUILLOTINE_VIEWER").map(PathBuf::from));
+    let spawned = viewer.and_then(|v| {
+        std::process::Command::new("python3")
+            .arg(&v)
+            .arg(folder)
+            .spawn()
+            .ok()
+    });
+    if spawned.is_none() {
+        open_in_file_manager(folder);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn open_in_file_manager(folder: &Path) {
+    let _ = std::process::Command::new("xdg-open").arg(folder).spawn();
+}
+
+#[cfg(target_os = "macos")]
+fn open_in_file_manager(folder: &Path) {
+    let _ = std::process::Command::new("open").arg(folder).spawn();
+}
+
+#[cfg(target_os = "windows")]
+fn open_in_file_manager(folder: &Path) {
+    let _ = std::process::Command::new("explorer").arg(folder).spawn();
+}
+
+fn build_menu(chats: &[String], archive_dir: &Path, _viewer: Option<&Path>) -> anyhow::Result<Menu> {
     let menu = Menu::new();
     menu.append(&MenuItem::with_id(
         "settings",
         "Settings…",
+        true,
+        None::<Accelerator>,
+    ))?;
+    menu.append(&MenuItem::with_id(
+        "jobs",
+        "Jobs…",
         true,
         None::<Accelerator>,
     ))?;
@@ -162,6 +209,16 @@ fn build_menu(chats: &[String]) -> anyhow::Result<Menu> {
         true,
         None::<Accelerator>,
     ))?;
+    let archives = crate::archive_format::list_archives(archive_dir);
+    if !archives.is_empty() {
+        let view_sub = Submenu::with_id("view-archive", "View archive ▸", true);
+        for folder in archives.iter().take(25) {
+            let name = folder.file_name().unwrap().to_string_lossy().into_owned();
+            let id = format!("view:{}", folder.display());
+            view_sub.append(&MenuItem::with_id(id, name, true, None::<Accelerator>))?;
+        }
+        menu.append(&view_sub)?;
+    }
     if !chats.is_empty() {
         let run_sub = Submenu::with_id("run-now", "Run now", true);
         for chat in chats {
@@ -216,6 +273,7 @@ struct SettingsApp {
     default_retention: String,
     default_archive: bool,
     dm_rows: Vec<DmJobRow>,
+    armed_delete_all: Option<String>,
     dm_pending: bool,
     dm_rx: mpsc::Receiver<Vec<(String, String)>>,
     archives: Vec<String>,
@@ -295,6 +353,7 @@ impl SettingsApp {
             default_retention: dm.default_retention_days.to_string(),
             default_archive: dm.default_archive_before_delete,
             dm_rows,
+            armed_delete_all: None,
             dm_pending,
             dm_rx: rx,
             archives,
@@ -447,6 +506,29 @@ async fn fetch_dm_users(token: &str) -> Vec<(String, String)> {
     out
 }
 
+/// Two-click armed "Delete ALL now" button: first click arms, second sends
+/// run-now with all=true (retention 0) through the daemon's IPC.
+fn delete_all_button(ui: &mut egui::Ui, armed: &mut Option<String>, chat: &str) {
+    let is_armed = armed.as_deref() == Some(chat);
+    let label = if is_armed { "Confirm: delete ALL messages?" } else { "Delete all now" };
+    if ui.button(egui::RichText::new(label).color(egui::Color32::LIGHT_RED)).clicked() {
+        if is_armed {
+            *armed = None;
+            let chat = chat.to_string();
+            let rt = tokio::runtime::Handle::current();
+            rt.spawn(async move {
+                match crate::ipc::send(serde_json::json!({ "cmd": "run_now", "chat": chat, "all": true })).await {
+                    Ok(resp) if resp["ok"] == true => tracing::info!(chat = %chat, "delete-all done: {}", &resp["summary"]),
+                    Ok(resp) => tracing::warn!(chat = %chat, "delete-all failed: {}", &resp["error"]),
+                    Err(e) => tracing::warn!(chat = %chat, "daemon unreachable: {e}"),
+                }
+            });
+        } else {
+            *armed = Some(chat.to_string());
+        }
+    }
+}
+
 fn validate_row(schedule: &str, retention: &str, status: &mut String) {
     use std::str::FromStr;
     if crate::config::Schedule::from_str(schedule).is_err() {
@@ -571,6 +653,7 @@ impl eframe::App for SettingsApp {
                                             .desired_width(50.0),
                                     );
                                     ui.checkbox(&mut row.archive, "archive before delete");
+                                    delete_all_button(ui, &mut self.armed_delete_all, &format!("dm:{}", row.user_id));
                                 });
                             }
                             ui.separator();
@@ -593,6 +676,7 @@ impl eframe::App for SettingsApp {
                                 egui::TextEdit::singleline(&mut row.retention).desired_width(50.0),
                             );
                             ui.checkbox(&mut row.archive, "archive");
+                            delete_all_button(ui, &mut self.armed_delete_all, &row.key);
                             if ui.button("remove").clicked() {
                                 remove = Some(i);
                             }

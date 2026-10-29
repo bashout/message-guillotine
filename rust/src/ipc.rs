@@ -90,7 +90,8 @@ async fn handle(stream: TcpStream, cfg: Arc<Config>, registry: crate::progress::
         Some("jobs") => json!({ "ok": true, "running": registry.snapshot(), "last": read_last_runs() }),
         Some("run_now") => {
             let chat = req.get("chat").and_then(|c| c.as_str()).unwrap_or("");
-            match run_now_via_daemon(&cfg, chat).await {
+            let all = req.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
+            match run_now_via_daemon(&cfg, chat, all).await {
                 Ok(summary) => json!({ "ok": true, "summary": {
                     "deleted": summary.deleted, "failed": summary.failed,
                     "skipped": summary.skipped, "scanned": summary.scanned,
@@ -113,7 +114,7 @@ fn read_last_runs() -> Value {
         .unwrap_or_else(|| json!({}))
 }
 
-async fn run_now_via_daemon(cfg: &Config, chat: &str) -> anyhow::Result<crate::deletion::Summary> {
+async fn run_now_via_daemon(cfg: &Config, chat: &str, delete_all: bool) -> anyhow::Result<crate::deletion::Summary> {
     let key = ChatKey::parse(chat)?;
     let settings = match &key {
         ChatKey::Dm(user) => cfg
@@ -128,6 +129,10 @@ async fn run_now_via_daemon(cfg: &Config, chat: &str) -> anyhow::Result<crate::d
     let mut client = Client::new(cfg.token()?)?;
     if client.get_current_user().await?.is_none() {
         anyhow::bail!("invalid token or authentication failed");
+    }
+    let mut settings = settings;
+    if delete_all {
+        settings.retention_days = 0; // cutoff = now: everything is deleted
     }
     let job = ChatJob { key, settings };
     let registry = crate::progress::new_registry();

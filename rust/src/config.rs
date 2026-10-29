@@ -227,6 +227,9 @@ pub struct Config {
     /// Token may be omitted here when GUILLOTINE_TOKEN is set.
     pub token: Option<String>,
     pub archive_dir: Option<PathBuf>,
+    /// Optional path to the V1 Python archive viewer (archive_viewer.py);
+    /// when unset, archive folders open in the OS file manager instead.
+    pub archive_viewer: Option<PathBuf>,
     #[serde(default)]
     pub dm: DmPolicy,
     /// Raw chat table keyed by strings like "dm:123"; parsed into ChatKey by
