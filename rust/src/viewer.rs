@@ -66,9 +66,9 @@ pub fn parse_filters(q: &HashMap<String, String>) -> Option<Filters> {
             date_to = Some(format!("{to}T23:59:59.999999+00:00"));
         }
     }
-    let has_attachment = q.get("has_attachment").map_or(false, |v| v == "true");
-    let has_link = q.get("has_link").map_or(false, |v| v == "true");
-    let pinned = q.get("pinned").map_or(false, |v| v == "true");
+    let has_attachment = q.get("has_attachment").is_some_and(|v| v == "true");
+    let has_link = q.get("has_link").is_some_and(|v| v == "true");
+    let pinned = q.get("pinned").is_some_and(|v| v == "true");
     let filters = Filters {
         date_from,
         date_to,
@@ -190,7 +190,7 @@ impl Archive {
                 if m
                     .get("attachment_ids")
                     .and_then(Value::as_array)
-                    .map_or(false, |a| !a.is_empty())
+                    .is_some_and(|a| !a.is_empty())
                 {
                     Some(i)
                 } else {
@@ -342,9 +342,7 @@ impl Archive {
     fn attachment_view(&self, attachment_id: &str) -> Option<Value> {
         let entry = self.attachments_by_id.get(attachment_id)?;
         let name = Self::attachment_name(entry);
-        if self.resolve(&name).is_none() {
-            return None;
-        }
+        self.resolve(&name)?;
         Some(json!({
             "id": entry.get("attachment_id").cloned().unwrap_or(Value::Null),
             "filename": entry.get("filename").cloned().filter(|f| !f.is_null())
@@ -621,14 +619,14 @@ impl Archive {
             if message
                 .get("edited_timestamp")
                 .and_then(Value::as_str)
-                .map_or(false, |s| !s.is_empty())
+                .is_some_and(|s| !s.is_empty())
             {
                 edited += 1;
             }
             if message
                 .get("reply_to")
                 .and_then(Value::as_str)
-                .map_or(false, |s| !s.is_empty())
+                .is_some_and(|s| !s.is_empty())
             {
                 replies += 1;
             }
@@ -638,7 +636,7 @@ impl Archive {
             if message
                 .get("attachment_ids")
                 .and_then(Value::as_array)
-                .map_or(false, |a| !a.is_empty())
+                .is_some_and(|a| !a.is_empty())
             {
                 with_attachments += 1;
             }
@@ -855,9 +853,7 @@ fn query_map(raw: Option<&str>) -> HashMap<String, String> {
         }
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
         let k = percent_decode(k);
-        if !out.contains_key(&k) {
-            out.insert(k, percent_decode(v));
-        }
+        out.entry(k).or_insert_with(|| percent_decode(v));
     }
     out
 }
@@ -933,7 +929,7 @@ fn host_allowed(host: &str) -> bool {
         }
     } else if host
         .rsplit_once(':')
-        .map_or(false, |(_, p)| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+        .is_some_and(|(_, p)| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
     {
         host.rsplit_once(':').unwrap().0
     } else {
@@ -1017,7 +1013,7 @@ async fn api_messages(State(library): State<Arc<Library>>, RawQuery(raw): RawQue
     let archive = request_archive(&library, &q)?;
     let count = q_int(&q, "count", PAGE_DEFAULT as i64)?.clamp(1, PAGE_MAX as i64) as usize;
     let filters = parse_filters(&q);
-    let reverse = q.get("dir").map_or(false, |d| d == "desc");
+    let reverse = q.get("dir").is_some_and(|d| d == "desc");
     if let Some(anchor) = q.get("anchor") {
         let payload = archive
             .anchor_payload(anchor, count, filters.as_ref(), reverse)

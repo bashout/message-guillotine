@@ -98,54 +98,6 @@ fn sort_message_records(folder: &Path) {
     }
 }
 
-/// Record channel_id as one of the channels archived in folder (a merge).
-fn register_merged_channel(folder: &Path, channel_id: &str) {
-    let mut meta = fmt::read_meta(folder);
-    let mut ids: Vec<String> = meta
-        .get("channel_ids")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|c| c.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_else(|| {
-            meta.get("channel_id")
-                .and_then(|c| c.as_str())
-                .map(|c| vec![c.to_string()])
-                .unwrap_or_default()
-        });
-    if !ids.iter().any(|c| c == channel_id) {
-        ids.push(channel_id.to_string());
-    }
-    let mut cursors: BTreeMap<String, String> = meta
-        .get("channel_cursors")
-        .and_then(|v| v.as_object())
-        .map(|o| {
-            o.iter()
-                .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("0").to_string()))
-                .collect()
-        })
-        .unwrap_or_default();
-    if cursors.is_empty() && !ids.is_empty() && ids[0] != channel_id {
-        if let Some(records) = std::fs::read_to_string(folder.join("messages.jsonl")).ok() {
-            if let Some(last) = records.lines().last() {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(last) {
-                    if let Some(id) = v.get("id").and_then(|x| x.as_str()) {
-                        cursors.insert(ids[0].clone(), id.to_string());
-                    }
-                }
-            }
-        }
-    }
-    cursors
-        .entry(channel_id.to_string())
-        .or_insert_with(|| "0".to_string());
-    meta["channel_ids"] = serde_json::json!(ids);
-    meta["channel_cursors"] = serde_json::json!(cursors);
-    fmt::write_meta(folder, &meta);
-}
-
 /// Advance the channel's resume cursor to last_id.
 fn update_channel_cursor(folder: &Path, channel_id: &str, last_id: Option<&str>) {
     let Some(last_id) = last_id else { return };
@@ -179,7 +131,7 @@ pub async fn archive_chat(
     let channel_id = channel_id.to_string();
     let archive_dir = archive_dir.to_path_buf();
 
-    let (folder, mut archived_ids, mut after_id) =
+    let (folder, mut archived_ids, after_id) =
         match fmt::find_existing_archive(&channel_id, &archive_dir) {
             Some(folder) => {
                 let records = fmt::load_message_records(&folder.join("messages.jsonl"));
@@ -231,16 +183,14 @@ pub async fn archive_chat(
 
     let att_dir = folder.join("attachments");
     if att_dir.exists() {
-        for stale in std::fs::read_dir(&att_dir)? {
-            if let Ok(e) = stale {
-                if e.file_name().to_string_lossy().ends_with(".part") {
-                    let _ = std::fs::remove_file(e.path());
-                }
+        for e in std::fs::read_dir(&att_dir)?.flatten() {
+            if e.file_name().to_string_lossy().ends_with(".part") {
+                let _ = std::fs::remove_file(e.path());
             }
         }
     }
 
-    let mut entries = compact_manifest(&folder);
+    let entries = compact_manifest(&folder);
     let mut recorded: BTreeMap<String, serde_json::Value> = BTreeMap::new();
     let mut seq = 0u64;
     for e in &entries {
@@ -273,9 +223,9 @@ pub async fn archive_chat(
                     continue;
                 }
                 for att in &msg.attachments {
-                    let already = recorded.get(&att.id).map_or(false, |e| {
+                    let already = recorded.get(&att.id).is_some_and(|e| {
                         e.get("status").and_then(|s| s.as_str()) == Some("ok")
-                            && e.get("local_path").and_then(|p| p.as_str()).map_or(false, |p| {
+                            && e.get("local_path").and_then(|p| p.as_str()).is_some_and(|p| {
                                 folder.join(p).exists()
                             })
                     });

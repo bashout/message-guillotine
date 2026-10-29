@@ -3,7 +3,7 @@
 //! (systemd --user on Linux, launchd LaunchAgent on macOS, registry Run key
 //! on Windows).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::config::{self, Config};
@@ -13,15 +13,15 @@ fn exe_path() -> anyhow::Result<PathBuf> {
     Ok(std::env::current_exe()?.canonicalize()?)
 }
 
-fn config_path(config_arg: Option<&PathBuf>) -> PathBuf {
+fn config_path(config_arg: Option<&Path>) -> PathBuf {
     config_arg
-        .cloned()
+        .map(Path::to_path_buf)
         .or_else(|| std::env::var_os(config::ENV_CONFIG).map(PathBuf::from))
         .unwrap_or_else(config::default_config_path)
 }
 
 /// Run the daemon in the foreground, logging to the per-OS data dir.
-pub async fn run(config_arg: Option<&PathBuf>) -> anyhow::Result<()> {
+pub async fn run(config_arg: Option<&Path>) -> anyhow::Result<()> {
     let path = config_path(config_arg);
     let cfg = Config::load(&path)?;
 
@@ -45,8 +45,8 @@ pub async fn run(config_arg: Option<&PathBuf>) -> anyhow::Result<()> {
             .with(file_layer)
             .try_init();
     }
-    // Keep the guard alive for the lifetime of the process.
-    std::mem::forget(_guard);
+    // The guard stays alive for the whole run; on exit it flushes the logs.
+    let _guard = _guard;
 
     tracing::info!(config = %path.display(), "guillotine service starting");
     scheduler::run_loop(&cfg).await
@@ -54,18 +54,25 @@ pub async fn run(config_arg: Option<&PathBuf>) -> anyhow::Result<()> {
 
 /// systemd --user unit (Linux).
 #[cfg(target_os = "linux")]
-fn systemd_unit(exe: &PathBuf, config: &PathBuf) -> String {
+fn systemd_quote(path: &Path) -> String {
+    // systemd quoting: wrap in double quotes, escape \, ", $, `
+    let raw = path.display().to_string();
+    format!("\"{}\"", raw.replace('\\', "\\\\").replace('"', "\\\"").replace('$', "\\$").replace('`', "\\`"))
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_unit(exe: &Path, config: &Path) -> String {
     format!(
         "[Unit]\nDescription=guillotine — scheduled message deletion/archival\n\n\
          [Service]\nType=simple\nExecStart={} --config {} service run\nRestart=on-failure\nRestartSec=30\n\n\
          [Install]\nWantedBy=default.target\n",
-        exe.display(),
-        config.display()
+        systemd_quote(exe),
+        systemd_quote(config)
     )
 }
 
 #[cfg(target_os = "linux")]
-pub fn install(config_arg: Option<&PathBuf>) -> anyhow::Result<()> {
+pub fn install(config_arg: Option<&Path>) -> anyhow::Result<()> {
     let exe = exe_path()?;
     let config = config_path(config_arg);
     let unit_dir = dirs::config_dir()
@@ -85,7 +92,7 @@ pub fn install(config_arg: Option<&PathBuf>) -> anyhow::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-pub fn uninstall(config_arg: Option<&PathBuf>) -> anyhow::Result<()> {
+pub fn uninstall(config_arg: Option<&Path>) -> anyhow::Result<()> {
     let _ = Command::new("systemctl")
         .args(["--user", "disable", "--now", "guillotine.service"])
         .status();
@@ -99,7 +106,7 @@ pub fn uninstall(config_arg: Option<&PathBuf>) -> anyhow::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-pub fn status(_config_arg: Option<&PathBuf>) -> anyhow::Result<()> {
+pub fn status(_config_arg: Option<&Path>) -> anyhow::Result<()> {
     let s = Command::new("systemctl")
         .args(["--user", "is-active", "guillotine.service"])
         .status()?;
@@ -112,26 +119,31 @@ pub fn status(_config_arg: Option<&PathBuf>) -> anyhow::Result<()> {
 
 /// launchd LaunchAgent (macOS).
 #[cfg(target_os = "macos")]
-fn launchd_plist(exe: &PathBuf, config: &PathBuf) -> String {
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_plist(exe: &Path, config: &Path) -> String {
+    let exe = xml_escape(&exe.display().to_string());
+    let config = xml_escape(&config.display().to_string());
+    let out = xml_escape(&config::data_dir().join("logs/stdout.log").display().to_string());
+    let err = xml_escape(&config::data_dir().join("logs/stderr.log").display().to_string());
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
          <plist version=\"1.0\"><dict>\n\
          <key>Label</key><string>com.guillotine.service</string>\n\
-         <key>ProgramArguments</key><array><string>{}</string><arg>--config</arg><string>{}</string><arg>service</arg><arg>run</arg></array>\n\
+         <key>ProgramArguments</key><array><string>{exe}</string><arg>--config</arg><string>{config}</string><arg>service</arg><arg>run</arg></array>\n\
          <key>RunAtLoad</key><true/>\n\
          <key>KeepAlive</key><true/>\n\
-         <key>StandardOutPath</key><string>{}</string>\n\
-         <key>StandardErrorPath</key><string>{}</string>\n\
-         </dict></plist>\n",
-        exe.display(),
-        config.display(),
-        config::data_dir().join("logs/stdout.log").display(),
-        config::data_dir().join("logs/stderr.log").display()
+         <key>StandardOutPath</key><string>{out}</string>\n\
+         <key>StandardErrorPath</key><string>{err}</string>\n\
+         </dict></plist>\n"
     )
 }
 
 #[cfg(target_os = "macos")]
-pub fn install(config_arg: Option<&PathBuf>) -> anyhow::Result<()> {
+pub fn install(config_arg: Option<&Path>) -> anyhow::Result<()> {
     let exe = exe_path()?;
     let config = config_path(config_arg);
     std::fs::create_dir_all(config::data_dir().join("logs"))?;
@@ -159,7 +171,7 @@ pub fn uninstall(_config_arg: Option<&PathBuf>) -> anyhow::Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-pub fn status(_config_arg: Option<&PathBuf>) -> anyhow::Result<()> {
+pub fn status(_config_arg: Option<&Path>) -> anyhow::Result<()> {
     let s = Command::new("launchctl")
         .args(["list", "com.guillotine.service"])
         .status()?;
@@ -172,7 +184,7 @@ pub fn status(_config_arg: Option<&PathBuf>) -> anyhow::Result<()> {
 
 /// Registry Run key (Windows): the native per-user autostart.
 #[cfg(target_os = "windows")]
-pub fn install(config_arg: Option<&PathBuf>) -> anyhow::Result<()> {
+pub fn install(config_arg: Option<&Path>) -> anyhow::Result<()> {
     use std::os::windows::process::CommandExt;
     let exe = exe_path()?;
     let config = config_path(config_arg);
@@ -219,7 +231,7 @@ pub fn uninstall(_config_arg: Option<&PathBuf>) -> anyhow::Result<()> {
 }
 
 #[cfg(target_os = "windows")]
-pub fn status(_config_arg: Option<&PathBuf>) -> anyhow::Result<()> {
+pub fn status(_config_arg: Option<&Path>) -> anyhow::Result<()> {
     use std::os::windows::process::CommandExt;
     let output = Command::new("reg")
         .args([

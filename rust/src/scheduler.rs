@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use chrono::{DateTime, Datelike, Duration, Local, NaiveTime, Timelike};
+use chrono::{DateTime, Datelike, Duration, Local, NaiveTime};
 
 use crate::api::Client;
 use crate::archiver;
@@ -107,12 +107,14 @@ pub async fn run_chat_job(
     let summary = deletion::run_deletion(
         client,
         &channel_id,
-        &label,
-        Some(cutoff),
-        resume,
-        false,
-        None,
-        Some(registry),
+        deletion::DeletionOptions {
+            label: &label,
+            cutoff: Some(cutoff),
+            resume,
+            dry_run: false,
+            root: None,
+            registry: Some(registry),
+        },
     )
     .await;
     registry.finish(
@@ -129,7 +131,7 @@ pub fn next_fire(schedule: &crate::config::Schedule, from: DateTime<Local>) -> D
         d.and_time(at)
             .and_local_timezone(Local)
             .single()
-            .unwrap_or_else(|| from)
+            .unwrap_or(from)
     };
     match schedule.kind {
         ScheduleKind::Daily => {
@@ -283,7 +285,7 @@ pub async fn run_loop(cfg: &Config) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{NaiveDate, TimeZone};
+    use chrono::{NaiveDate, TimeZone, Timelike};
 
     fn at(h: u32, m: u32) -> NaiveTime {
         NaiveTime::from_hms_opt(h, m, 0).unwrap()

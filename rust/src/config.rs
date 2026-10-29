@@ -90,8 +90,6 @@ pub enum ScheduleKind {
     Monthly,
 }
 
-pub const DEFAULT_SCHEDULE_TIME: &str = "04:00";
-
 impl Default for Schedule {
     fn default() -> Self {
         Schedule {
@@ -176,16 +174,6 @@ impl ChatKey {
             bail!("invalid chat key {raw:?}: expected guild:<id>/channel:<id>");
         }
         bail!("invalid chat key {raw:?}: expected dm:<user_id> or guild:<id>/channel:<id>")
-    }
-
-    /// The channel id used against the API: a DM chat's channel id is resolved
-    /// at runtime from the user id, so for DMs this returns the user id and
-    /// callers must resolve it first.
-    pub fn id(&self) -> &str {
-        match self {
-            ChatKey::Dm(user) => user,
-            ChatKey::GuildChannel { channel, .. } => channel,
-        }
     }
 }
 
@@ -273,15 +261,6 @@ impl Config {
         }
         cfg.validate(path)?;
         Ok(cfg)
-    }
-
-    /// Load from the default path, or GUILLOTINE_CONFIG when set.
-    pub fn load_default() -> anyhow::Result<(Self, PathBuf)> {
-        let path = std::env::var_os(ENV_CONFIG)
-            .map(PathBuf::from)
-            .unwrap_or_else(default_config_path);
-        let cfg = Self::load(&path)?;
-        Ok((cfg, path))
     }
 
     fn validate(&self, path: &Path) -> anyhow::Result<()> {

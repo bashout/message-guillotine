@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::api::Client;
@@ -138,7 +138,7 @@ async fn handle(
 ) -> anyhow::Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut line = String::new();
-    let mut reader = BufReader::new(reader);
+    let reader = BufReader::new(reader);
     // Cap the line length and bound the whole exchange so a local peer can
     // neither exhaust memory nor hold a task/fd forever.
     use tokio::io::{AsyncBufReadExt, AsyncReadExt};
@@ -217,7 +217,7 @@ pub async fn send(mut cmd: Value) -> anyhow::Result<Value> {
         stream
             .write_all((serde_json::to_string(&cmd)? + "\n").as_bytes())
             .await?;
-        let mut reader = BufReader::new(stream);
+        let reader = BufReader::new(stream);
         let mut line = String::new();
         use tokio::io::{AsyncBufReadExt, AsyncReadExt};
         reader.take(1024 * 1024).read_line(&mut line).await?;

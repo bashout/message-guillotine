@@ -63,10 +63,6 @@ impl JobRegistry {
         });
     }
 
-    pub fn remove(&self, chat: &str) {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).remove(chat);
-    }
-
     pub fn snapshot(&self) -> Vec<JobProgress> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).values().cloned().collect()
     }

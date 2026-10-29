@@ -68,6 +68,10 @@ pub struct HistoryFetchError(pub String);
 /// embed their creation time, so a datetime can bound a query by id.
 pub fn snowflake_for(dt: DateTime<Utc>) -> String {
     let ms = dt.timestamp_millis();
+    // Saturate pre-epoch dates at id 0 instead of wrapping to a huge id.
+    if ms <= DISCORD_EPOCH_MS {
+        return "0".to_string();
+    }
     (((ms - DISCORD_EPOCH_MS) << 22) as u64).to_string()
 }
 
@@ -139,8 +143,6 @@ pub struct DmChannel {
     pub id: String,
     #[serde(default)]
     pub recipients: Vec<User>,
-    #[serde(default)]
-    pub last_message_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -307,38 +309,6 @@ impl Client {
         Ok(None)
     }
 
-    /// Count of the author's messages with ids in [min_id, max_id] from the
-    /// search endpoint's total_results. One request on the search bucket —
-    /// it never touches the history or delete buckets. Returns None when
-    /// search is unavailable; callers just drop the estimate.
-    pub async fn count_my_messages(
-        &self,
-        channel_id: &str,
-        author_id: &str,
-        min_id: Option<&str>,
-        max_id: Option<&str>,
-    ) -> Option<u64> {
-        let mut query = vec![("author_id", author_id.to_string())];
-        if let Some(min) = min_id {
-            query.push(("min_id", min.to_string()));
-        }
-        if let Some(max) = max_id {
-            query.push(("max_id", max.to_string()));
-        }
-        let resp = self
-            .http
-            .get(format!("{API_BASE}/channels/{channel_id}/messages/search"))
-            .query(&query)
-            .send()
-            .await
-            .ok()?;
-        if resp.status() != 200 {
-            return None;
-        }
-        let body: serde_json::Value = resp.json().await.ok()?;
-        body.get("total_results").and_then(|t| t.as_u64())
-    }
-
     /// One page of channel history, newest-first, starting older than
     /// `before_id` (the whole channel when None). Retries rate limits and
     /// transient failures; raises HistoryFetchError when attempts run out.
@@ -489,7 +459,7 @@ impl Client {
                 if status == 403
                     && error_code(resp)
                         .await
-                        .map_or(false, |c| UNDELETABLE_MESSAGE_CODES.contains(&c))
+                        .is_some_and(|c| UNDELETABLE_MESSAGE_CODES.contains(&c))
                 {
                     return DeleteOutcome::Skipped;
                 }

@@ -7,9 +7,9 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
 use muda::accelerator::Accelerator;
-use muda::{ContextMenu, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
+use muda::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 
-use crate::config::{self, ChatKey, Config};
+use crate::config::{self, Config};
 
 /// A simple generated 32x32 RGBA icon (a dark square with a lighter blade),
 /// so no asset files are needed.
@@ -19,7 +19,7 @@ fn tray_icon_rgba() -> tray_icon::Icon {
     for y in 0..size {
         for x in 0..size {
             let i = ((y * size + x) * 4) as usize;
-            let in_blade = y >= 6 && y < 20 && x >= 8 && x < 26 && (x + y) % 7 != 0;
+            let in_blade = (6..20).contains(&y) && (8..26).contains(&x) && (x + y) % 7 != 0;
             let (r, g, b, a) = if in_blade {
                 (220, 60, 60, 255)
             } else {
@@ -104,10 +104,10 @@ fn handle_events(rx: mpsc::Receiver<MenuEvent>, config_path: PathBuf) -> anyhow:
 }
 
 /// Returns false when the app should quit.
-fn dispatch(id: &str, config_path: &PathBuf, rt: &tokio::runtime::Handle) -> bool {
+fn dispatch(id: &str, config_path: &Path, rt: &tokio::runtime::Handle) -> bool {
     match id {
         "settings" => {
-            let path = config_path.clone();
+            let path = config_path.to_path_buf();
             let rt = rt.clone();
             std::thread::spawn(move || {
                 if let Err(e) = settings_window(path, rt) {
@@ -446,7 +446,7 @@ impl SettingsApp {
                         });
                     }
                 }
-                self.dm_rows.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                self.dm_rows.sort_by_key(|a| a.name.to_lowercase());
             }
             Err(mpsc::TryRecvError::Empty) => {}
             Err(mpsc::TryRecvError::Disconnected) => self.dm_pending = false,
@@ -460,7 +460,7 @@ impl SettingsApp {
                 self.guild_pending = false;
                 self.guilds = guilds;
                 self.guilds
-                    .sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+                    .sort_by_key(|a| a.1.to_lowercase());
             }
             Err(mpsc::TryRecvError::Empty) => {}
             Err(mpsc::TryRecvError::Disconnected) => self.guild_pending = false,
@@ -476,7 +476,7 @@ impl SettingsApp {
                 if guild_id == self.channels_for {
                     self.channels = channels;
                     self.channels
-                        .sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+                        .sort_by_key(|a| a.1.to_lowercase());
                 }
             }
             Err(mpsc::TryRecvError::Empty) => {}
@@ -518,7 +518,11 @@ impl SettingsApp {
         }
 
         let mut doc = toml::Table::new();
-        doc.insert("token".into(), toml::Value::String(self.token.clone()));
+        if self.token.is_empty() {
+            doc.remove("token"); // let GUILLOTINE_TOKEN supply it
+        } else {
+            doc.insert("token".into(), toml::Value::String(self.token.clone()));
+        }
         doc.insert(
             "archive_dir".into(),
             toml::Value::String(self.archive_dir.clone()),
@@ -943,11 +947,6 @@ fn settings_window(path: PathBuf, rt: tokio::runtime::Handle) -> anyhow::Result<
     .map_err(|e| anyhow::anyhow!("eframe error: {e}"))
 }
 
-// Keep the config import used even if the GUI code changes shape.
-#[allow(dead_code)]
-fn _unused(_: &Config, _: ChatKey, _: &config::DmScope) {}
-
-// ---------------------------------------------------------------------------
 // Jobs window (live progress, auto-refreshing every second)
 // ---------------------------------------------------------------------------
 
@@ -1004,7 +1003,7 @@ impl eframe::App for JobsApp {
             });
             ui.add_space(10.0);
             ui.label("Last run per chat:");
-            let empty = self.last.as_object().map_or(true, |o| o.is_empty());
+            let empty = self.last.as_object().is_none_or(|o| o.is_empty());
             if empty {
                 ui.label("  none yet");
             }

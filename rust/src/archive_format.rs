@@ -141,15 +141,6 @@ pub fn load_message_records(path: &Path) -> Vec<serde_json::Value> {
     records
 }
 
-/// The completion flag recorded by the last run: Some(true) finished,
-/// Some(false) interrupted/failed, None when never written.
-pub fn read_archive_status(folder: &Path) -> Option<bool> {
-    std::fs::read_to_string(folder.join("status.json"))
-        .ok()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-        .and_then(|v| v.get("complete").and_then(|c| c.as_bool()))
-}
-
 pub fn mark_archive_status(folder: &Path, complete: bool) {
     let path = folder.join("status.json");
     let tmp = folder.join("status.json.part");

@@ -193,10 +193,10 @@ async fn main() -> anyhow::Result<()> {
             }
         },
         Commands::Service { action } => match action {
-            ServiceCommands::Run => service::run(config_arg.as_ref()).await?,
-            ServiceCommands::Install => service::install(config_arg.as_ref())?,
-            ServiceCommands::Uninstall => service::uninstall(config_arg.as_ref())?,
-            ServiceCommands::Status => service::status(config_arg.as_ref())?,
+            ServiceCommands::Run => service::run(config_arg.as_deref()).await?,
+            ServiceCommands::Install => service::install(config_arg.as_deref())?,
+            ServiceCommands::Uninstall => service::uninstall(config_arg.as_deref())?,
+            ServiceCommands::Status => service::status(config_arg.as_deref())?,
         },
         #[cfg(feature = "gui")]
         Commands::Gui => gui::run(config_arg.as_ref()).await?,

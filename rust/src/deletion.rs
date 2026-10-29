@@ -25,6 +25,8 @@ pub fn deletion_lock() -> &'static tokio::sync::Mutex<()> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
+    /// Kept for on-disk format parity with V1 session files.
+    #[allow(dead_code)]
     pub channel_id: String,
     pub label: String,
     /// ISO start bound (older messages are out of range), if any.
@@ -79,6 +81,7 @@ pub fn clear_session(channel_id: &str, root: Option<&Path>) {
 
 #[derive(Debug, Clone)]
 pub struct Summary {
+    #[allow(dead_code)] // part of the run report; kept for logging/IPC parity
     pub channel_id: String,
     pub scanned: u64,
     pub deleted: u64,
@@ -109,16 +112,22 @@ fn sample(msg: &api::Message) -> String {
 /// scan continues after the session's before-cursor and counters carry over.
 /// With `dry_run`, messages are only counted and quoted — nothing is deleted
 /// and no session is written.
+/// Everything a deletion run needs beyond the client and channel.
+pub struct DeletionOptions<'a> {
+    pub label: &'a str,
+    pub cutoff: Option<DateTime<Utc>>,
+    pub resume: Option<Session>,
+    pub dry_run: bool,
+    pub root: Option<&'a Path>,
+    pub registry: Option<&'a crate::progress::SharedRegistry>,
+}
+
 pub async fn run_deletion(
     client: &Client,
     channel_id: &str,
-    label: &str,
-    cutoff: Option<DateTime<Utc>>,
-    resume: Option<Session>,
-    dry_run: bool,
-    root: Option<&Path>,
-    registry: Option<&crate::progress::SharedRegistry>,
+    opts: DeletionOptions<'_>,
 ) -> Summary {
+    let DeletionOptions { label, cutoff, resume, dry_run, root, registry } = opts;
     let channel_id = channel_id.to_string();
     let cutoff_ts = cutoff.map(|c| c.timestamp() as f64);
 
@@ -193,14 +202,14 @@ pub async fn run_deletion(
                 }
 
                 if Some(&msg.author.id) != me_id.as_ref() {
-                    if !dry_run {
+                    if !dry_run && state.scanned.is_multiple_of(25) {
                         save_session(&channel_id, &state, root);
                     }
                     continue;
                 }
                 if msg.is_system() {
                     state.skipped += 1;
-                    if !dry_run {
+                    if !dry_run && state.scanned.is_multiple_of(25) {
                         save_session(&channel_id, &state, root);
                     }
                     continue;
@@ -255,7 +264,7 @@ pub async fn run_deletion(
                         return Ok(());
                     }
                 }
-                if !dry_run {
+                if !dry_run && state.scanned.is_multiple_of(25) {
                     save_session(&channel_id, &state, root);
                 }
             }
@@ -318,7 +327,12 @@ pub async fn scan(
     }
     let cutoff = retention_days.map(|d| Utc::now() - chrono::Duration::days(d as i64));
     let _guard = deletion_lock().lock().await;
-    let summary = run_deletion(&client, channel, channel, cutoff, None, true, None, None).await;
+    let summary = run_deletion(
+        &client,
+        channel,
+        DeletionOptions { label: channel, cutoff, resume: None, dry_run: true, root: None, registry: None },
+    )
+    .await;
     println!(
         "dry run: {} of your messages in range would be deleted ({} scanned, {} skipped)",
         summary.deleted, summary.scanned, summary.skipped
