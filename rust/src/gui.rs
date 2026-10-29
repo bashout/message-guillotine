@@ -139,6 +139,9 @@ fn handle_events(rx: mpsc::Receiver<MenuEvent>, config_path: PathBuf) -> anyhow:
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
+        if QUIT.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
     }
     Ok(())
 }
@@ -155,6 +158,9 @@ fn handle_events(rx: mpsc::Receiver<MenuEvent>, config_path: PathBuf) -> anyhow:
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        if QUIT.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
         }
     }
     Ok(())
@@ -1101,6 +1107,7 @@ struct PanelState {
 static PANEL: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<PanelState>>> =
     std::sync::OnceLock::new();
 static PANEL_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static QUIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn open_panel(config_path: &Path, rt: &tokio::runtime::Handle, tab: Tab) {
     let state = PANEL.get_or_init(|| {
