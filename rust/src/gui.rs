@@ -99,35 +99,44 @@ fn fallback_icon() -> tray_icon::Icon {
     tray_icon::Icon::from_rgba(rgba, size, size).expect("icon rgba")
 }
 
-pub async fn run(config_arg: Option<&PathBuf>) -> anyhow::Result<()> {
+/// GUI entry point. Runs on the main thread WITHOUT an ambient tokio runtime:
+/// iced::daemon creates its own runtime on this thread. The async boot work
+/// (login, label fetch) runs on a temporary runtime that is dropped before
+/// the daemon starts.
+pub fn run_sync(config_arg: Option<PathBuf>) -> anyhow::Result<()> {
     // GTK must be initialized before any tray/menu is created on Linux.
     // The Iced event loop below runs on this same (main) thread and pumps
     // GTK from its update loop, so the tray keeps receiving events.
     #[cfg(target_os = "linux")]
     gtk::init()?;
-    let (cfg, path) = crate::load_config(config_arg)?;
-    let chats: Vec<String> = cfg.chats().map(|(k, _)| k.to_string()).collect();
+    let (cfg, path) = crate::load_config(config_arg.as_ref())?;
+    let boot = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let (client, labels) = boot.block_on(async {
+        let chats: Vec<String> = cfg.chats().map(|(k, _)| k.to_string()).collect();
+        let client = match cfg.token() {
+            Ok(token) => {
+                let mut c = crate::api::Client::new(token)?;
+                let _ = c.get_current_user().await?;
+                Some(Arc::new(c))
+            }
+            Err(_) => None,
+        };
+        let labels = match &client {
+            Some(c) => fetch_chat_labels(c, &chats).await,
+            None => HashMap::new(),
+        };
+        Ok::<_, anyhow::Error>((client, labels))
+    })?;
+    drop(boot);
     let archive_dir = cfg.resolve_archive_dir(None);
     let viewer = cfg
         .archive_viewer
         .clone()
         .or_else(|| std::env::var_os("GUILLOTINE_VIEWER").map(PathBuf::from));
 
-    // One API login for the whole gui process; the client is shared by the
-    // tray label fetch and the panel window fetches.
-    let client = match cfg.token() {
-        Ok(token) => {
-            let mut c = crate::api::Client::new(token)?;
-            let _ = c.get_current_user().await?;
-            Some(Arc::new(c))
-        }
-        Err(_) => None,
-    };
-    let labels = match &client {
-        Some(c) => fetch_chat_labels(c, &chats).await,
-        None => HashMap::new(),
-    };
-
+    let chats: Vec<String> = cfg.chats().map(|(k, _)| k.to_string()).collect();
     let menu = build_menu(&chats, &archive_dir, viewer.as_deref(), &labels)?;
     let _tray = tray_icon::TrayIconBuilder::new()
         .with_menu(Box::new(menu))
@@ -147,19 +156,19 @@ pub async fn run(config_arg: Option<&PathBuf>) -> anyhow::Result<()> {
 
     // Iced owns the main-thread event loop from here on; the tray menu
     // events are drained from `rx` on the panel's fast tick.
-    let rt = tokio::runtime::Handle::current();
     let boot_rx = std::sync::Mutex::new(Some(rx));
-    let (boot_path, boot_rt, boot_client) = (path.clone(), rt.clone(), client.clone());
+    let (boot_path, boot_client) = (path.clone(), client.clone());
     iced::daemon(
         move || -> (PanelApp, Task<Message>) {
-            // Boot runs once; take the receiver out of the mutex so the
-            // closure stays `Fn`.
+            // Boot runs inside iced's own tokio runtime: take the current
+            // handle here (the boot-time runtime was dropped before this).
+            let rt = tokio::runtime::Handle::current();
             let rx = boot_rx
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .take()
                 .unwrap_or_else(|| mpsc::channel::<MenuEvent>().1);
-            PanelApp::boot(boot_path.clone(), boot_rt.clone(), boot_client.clone(), rx)
+            PanelApp::boot(boot_path.clone(), rt, boot_client.clone(), rx)
         },
         PanelApp::update,
         PanelApp::view,

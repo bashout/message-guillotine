@@ -171,12 +171,26 @@ fn init_tracing() {
         .init();
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let Cli {
         config: config_arg,
         command,
     } = Cli::parse();
+    // The Iced GUI runs its own event loop (and tokio runtime) on the main
+    // thread, so it must NOT be started from inside a #[tokio::main] runtime.
+    if matches!(command, Commands::Gui) {
+        #[cfg(feature = "gui")]
+        return gui::run_sync(config_arg);
+        #[cfg(not(feature = "gui"))]
+        anyhow::bail!("built without the gui feature; use `guillotine service run` and the CLI subcommands");
+    }
+    tokio::runtime::Runtime::new()?.block_on(run_async(config_arg, command))
+}
+
+async fn run_async(
+    config_arg: Option<PathBuf>,
+    command: Commands,
+) -> anyhow::Result<()> {
     // The service path installs its own file-logging subscriber; everything
     // else logs to stderr.
     if !matches!(
@@ -237,12 +251,7 @@ async fn main() -> anyhow::Result<()> {
             ServiceCommands::Uninstall => service::uninstall(config_arg.as_deref())?,
             ServiceCommands::Status => service::status(config_arg.as_deref())?,
         },
-        #[cfg(feature = "gui")]
-        Commands::Gui => gui::run(config_arg.as_ref()).await?,
-        #[cfg(not(feature = "gui"))]
-        Commands::Gui => anyhow::bail!(
-            "built without the gui feature; use `guillotine service run` and the CLI subcommands"
-        ),
+        Commands::Gui => unreachable!("handled in sync main before the runtime starts"),
         Commands::Scan {
             channel,
             retention_days,
