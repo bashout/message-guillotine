@@ -1101,6 +1101,7 @@ impl SettingsApp {
 enum Tab {
     Settings,
     Jobs,
+    Logs,
 }
 
 struct PanelState {
@@ -1155,6 +1156,7 @@ struct PanelApp {
     state: std::sync::Arc<std::sync::Mutex<PanelState>>,
     settings: SettingsApp,
     jobs: JobsApp,
+    logs: LogsApp,
 }
 
 impl eframe::App for PanelApp {
@@ -1186,6 +1188,7 @@ impl eframe::App for PanelApp {
         egui::CentralPanel::default().show(ctx, |ui| match tab {
             Tab::Settings => self.settings.show(ctx, ui),
             Tab::Jobs => self.jobs.show(ctx, ui),
+            Tab::Logs => self.logs.show(ctx, ui),
         });
     }
 }
@@ -1211,6 +1214,86 @@ fn apply_style(ctx: &egui::Context) {
     ctx.set_style(style);
 }
 
+// ---------------------------------------------------------------------------
+// Logs tab: daemon log files (tailed) + this gui process's own log buffer
+// ---------------------------------------------------------------------------
+
+struct LogsApp {
+    daemon: Vec<String>,
+    gui: Vec<String>,
+    last_daemon_file: Option<PathBuf>,
+}
+
+impl LogsApp {
+    fn new() -> Self {
+        LogsApp {
+            daemon: Vec::new(),
+            gui: Vec::new(),
+            last_daemon_file: None,
+        }
+    }
+
+    fn refresh(&mut self) {
+        // Tail the newest daemon log file (rolling daily), last 300 lines.
+        let log_dir = crate::config::data_dir().join("logs");
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&log_dir)
+            .map(|rd| rd.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default();
+        files.sort();
+        if let Some(latest) = files.last().cloned() {
+            if self.last_daemon_file.as_deref() != Some(&latest) {
+                self.daemon.clear();
+                self.last_daemon_file = Some(latest.clone());
+            }
+            if let Ok(content) = std::fs::read_to_string(&latest) {
+                let lines: Vec<&str> = content.lines().collect();
+                let tail: Vec<String> = lines
+                    .iter()
+                    .rev()
+                    .take(300)
+                    .rev()
+                    .map(|l| l.to_string())
+                    .collect();
+                self.daemon = tail;
+            }
+        }
+        let buf = crate::gui_log_buffer().lock().unwrap_or_else(|e| e.into_inner());
+        self.gui = buf.clone();
+    }
+
+    fn show(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        self.refresh();
+        ctx.request_repaint_after(std::time::Duration::from_secs(1));
+        ui.heading("logs");
+        ui.label(egui::RichText::new("daemon (service) — ~/.local/share/guillotine/logs, latest file, tail").weak());
+        egui::ScrollArea::vertical()
+            .id_salt("daemon-logs")
+            .max_height(ui.available_height() * 0.45)
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                for line in &self.daemon {
+                    ui.label(egui::RichText::new(line).monospace().size(11.0));
+                }
+                if self.daemon.is_empty() {
+                    ui.label("(no daemon logs yet — is `guillotine service run` active?)");
+                }
+            });
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new("this gui process (in-memory, last 500)").weak());
+        egui::ScrollArea::vertical()
+            .id_salt("gui-logs")
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                for line in &self.gui {
+                    ui.label(egui::RichText::new(line).monospace().size(11.0));
+                }
+                if self.gui.is_empty() {
+                    ui.label("(nothing logged yet)");
+                }
+            });
+    }
+}
+
 fn panel_window(state: std::sync::Arc<std::sync::Mutex<PanelState>>) -> anyhow::Result<()> {
     let (config_path, rt, client) = {
         let g = state.lock().unwrap_or_else(|e| e.into_inner());
@@ -1219,6 +1302,7 @@ fn panel_window(state: std::sync::Arc<std::sync::Mutex<PanelState>>) -> anyhow::
     let app = PanelApp {
         settings: SettingsApp::load(&config_path, &rt, client.clone()),
         jobs: JobsApp::new(&rt, &config_path, client),
+        logs: LogsApp::new(),
         state,
     };
     let mut options = eframe::NativeOptions {

@@ -122,13 +122,52 @@ fn load_config(config_arg: Option<&PathBuf>) -> anyhow::Result<(Config, PathBuf)
     Ok((cfg, path))
 }
 
+/// Last 500 log lines of this process, shown in the gui Logs tab.
+pub fn gui_log_buffer() -> &'static std::sync::Arc<std::sync::Mutex<Vec<String>>> {
+    static BUF: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<Vec<String>>>> =
+        std::sync::OnceLock::new();
+    BUF.get_or_init(|| std::sync::Arc::new(std::sync::Mutex::new(Vec::new())))
+}
+
 fn init_tracing() {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("guillotine=info,tower_http=warn,reqwest=warn"));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
+    // Ring-buffer layer so the gui can show its own output in the Logs tab.
+    struct RingBuf;
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RingBuf {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+            use tracing::field::Visit;
+            struct V(String);
+            impl Visit for V {
+                fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                    self.0.push_str(&format!(" {}={value:?}", field.name()));
+                }
+            }
+            let mut v = V(String::new());
+            event.record(&mut v);
+            let meta = event.metadata();
+            let line = format!(
+                "{} {:<5} {}{}",
+                chrono::Local::now().format("%H:%M:%S"),
+                meta.level(),
+                meta.target(),
+                v.0
+            );
+            let mut buf = gui_log_buffer().lock().unwrap_or_else(|e| e.into_inner());
+            buf.push(line);
+            if buf.len() > 500 {
+                let excess = buf.len() - 500;
+                buf.drain(..excess);
+            }
+        }
+    }
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer().with_target(false))
+        .with(RingBuf)
         .init();
 }
 
