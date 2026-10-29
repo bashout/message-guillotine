@@ -13,6 +13,7 @@ mod deletion;
 #[cfg(feature = "gui")]
 mod gui;
 mod ipc;
+mod progress;
 mod scheduler;
 mod service;
 

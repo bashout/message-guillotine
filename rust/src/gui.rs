@@ -110,6 +110,14 @@ fn dispatch(id: &str, config_path: &PathBuf, rt: &tokio::runtime::Handle) -> boo
                 }
             });
         }
+        "jobs" => {
+            let rt = rt.clone();
+            std::thread::spawn(move || {
+                if let Err(e) = jobs_window(rt) {
+                    tracing::error!(error = %e, "jobs window failed");
+                }
+            });
+        }
         "status" => {
             rt.spawn(async {
                 match crate::ipc::send(serde_json::json!({ "cmd": "status" })).await {
@@ -644,3 +652,133 @@ fn settings_window(path: PathBuf, rt: tokio::runtime::Handle) -> anyhow::Result<
 // Keep the config import used even if the GUI code changes shape.
 #[allow(dead_code)]
 fn _unused(_: &Config, _: ChatKey, _: &config::DmScope) {}
+
+// ---------------------------------------------------------------------------
+// Jobs window (live progress, auto-refreshing every second)
+// ---------------------------------------------------------------------------
+
+struct JobsApp {
+    rx: mpsc::Receiver<serde_json::Value>,
+    running: Vec<serde_json::Value>,
+    last: serde_json::Value,
+    note: String,
+}
+
+impl eframe::App for JobsApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        while let Ok(resp) = self.rx.try_recv() {
+            if resp["ok"] == true {
+                self.running = resp["running"].as_array().cloned().unwrap_or_default();
+                self.last = resp["last"].clone();
+                self.note.clear();
+            } else {
+                self.note = "daemon not running".to_string();
+            }
+        }
+        ctx.request_repaint_after(std::time::Duration::from_secs(1));
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("guillotine jobs");
+            if !self.note.is_empty() {
+                ui.label(&self.note);
+            }
+            ui.add_space(6.0);
+            ui.label("Running now:");
+            if self.running.is_empty() {
+                ui.label("  none");
+            }
+            egui::Grid::new("jobs-grid").striped(true).show(ui, |ui| {
+                ui.label(egui::RichText::new("chat").strong());
+                ui.label(egui::RichText::new("phase").strong());
+                ui.label(egui::RichText::new("scanned").strong());
+                ui.label(egui::RichText::new("deleted").strong());
+                ui.label(egui::RichText::new("failed").strong());
+                ui.label(egui::RichText::new("skipped").strong());
+                ui.label(egui::RichText::new("since").strong());
+                ui.end_row();
+                for job in &self.running {
+                    ui.label(job["chat"].as_str().unwrap_or(""));
+                    ui.label(format!("{} — {}", job["phase"].as_str().unwrap_or(""), job["note"].as_str().unwrap_or("")));
+                    ui.label(job["scanned"].to_string());
+                    ui.label(job["deleted"].to_string());
+                    ui.label(job["failed"].to_string());
+                    ui.label(job["skipped"].to_string());
+                    let started = job["started"].as_str().unwrap_or("");
+                    ui.label(if started.len() > 19 { &started[..19] } else { started });
+                    ui.end_row();
+                }
+            });
+            ui.add_space(10.0);
+            ui.label("Last run per chat:");
+            let empty = self.last.as_object().map_or(true, |o| o.is_empty());
+            if empty {
+                ui.label("  none yet");
+            }
+            if let Some(obj) = self.last.as_object() {
+                egui::Grid::new("last-grid").striped(true).show(ui, |ui| {
+                    ui.label(egui::RichText::new("chat").strong());
+                    ui.label(egui::RichText::new("last run").strong());
+                    ui.label(egui::RichText::new("deleted").strong());
+                    ui.label(egui::RichText::new("failed").strong());
+                    ui.label(egui::RichText::new("complete").strong());
+                    ui.end_row();
+                    for (chat, r) in obj {
+                        ui.label(chat);
+                        let when = r["last_run"].as_str().unwrap_or("");
+                        ui.label(if when.len() > 19 { &when[..19] } else { when });
+                        ui.label(r["deleted"].to_string());
+                        ui.label(r["failed"].to_string());
+                        ui.label(r["complete"].to_string());
+                        ui.end_row();
+                    }
+                });
+            }
+        });
+    }
+}
+
+fn jobs_window(rt: tokio::runtime::Handle) -> anyhow::Result<()> {
+    let (tx, rx) = mpsc::channel::<serde_json::Value>();
+    rt.spawn(async move {
+        loop {
+            match crate::ipc::send(serde_json::json!({ "cmd": "jobs" })).await {
+                Ok(resp) => {
+                    if tx.send(resp).is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(serde_json::json!({ "ok": false, "error": format!("{e}") }));
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    });
+    let app = JobsApp {
+        rx,
+        running: Vec::new(),
+        last: serde_json::json!({}),
+        note: String::new(),
+    };
+    let mut options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([760.0, 420.0])
+            .with_title("guillotine jobs"),
+        ..Default::default()
+    };
+    #[cfg(target_os = "linux")]
+    {
+        use winit::platform::wayland::EventLoopBuilderExtWayland;
+        use winit::platform::x11::EventLoopBuilderExtX11;
+        options.event_loop_builder = Some(Box::new(|builder| {
+            EventLoopBuilderExtWayland::with_any_thread(builder, true);
+            EventLoopBuilderExtX11::with_any_thread(builder, true);
+        }));
+    }
+    eframe::run_native(
+        "guillotine jobs",
+        options,
+        Box::new(move |_cc| Ok(Box::new(app))),
+    )
+    .map_err(|e| anyhow::anyhow!("eframe error: {e}"))
+}

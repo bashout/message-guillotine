@@ -117,6 +117,7 @@ pub async fn run_deletion(
     resume: Option<Session>,
     dry_run: bool,
     root: Option<&Path>,
+    registry: Option<&crate::progress::SharedRegistry>,
 ) -> Summary {
     let channel_id = channel_id.to_string();
     let cutoff_ts = cutoff.map(|c| c.timestamp() as f64);
@@ -174,6 +175,14 @@ pub async fn run_deletion(
                 }
                 state.scanned += 1;
                 state.before_cursor = Some(msg.id.clone());
+                if let Some(reg) = registry {
+                    reg.update(&channel_id, |p| {
+                        p.scanned = state.scanned;
+                        p.deleted = state.deleted;
+                        p.failed = state.failed;
+                        p.skipped = state.skipped;
+                    });
+                }
 
                 if Some(&msg.author.id) != me_id.as_ref() {
                     if !dry_run {
@@ -205,9 +214,34 @@ pub async fn run_deletion(
                         }
                         pending_pace = std::cmp::max(api::RATE_LIMIT_DELAY, wait);
                         state.deleted += 1;
+                        if let Some(reg) = registry {
+                            reg.update(&channel_id, |p| {
+                                p.deleted = state.deleted;
+                                p.failed = state.failed;
+                                p.skipped = state.skipped;
+                            });
+                        }
                     }
-                    DeleteOutcome::Skipped => state.skipped += 1,
-                    DeleteOutcome::Failed => state.failed += 1,
+                    DeleteOutcome::Skipped => {
+                        state.skipped += 1;
+                        if let Some(reg) = registry {
+                            reg.update(&channel_id, |p| {
+                                p.skipped = state.skipped;
+                                p.deleted = state.deleted;
+                                p.failed = state.failed;
+                            });
+                        }
+                    }
+                    DeleteOutcome::Failed => {
+                        state.failed += 1;
+                        if let Some(reg) = registry {
+                            reg.update(&channel_id, |p| {
+                                p.failed = state.failed;
+                                p.deleted = state.deleted;
+                                p.skipped = state.skipped;
+                            });
+                        }
+                    }
                     other => {
                         aborted = Some(format!("{other:?}"));
                         return Ok(());
@@ -276,7 +310,7 @@ pub async fn scan(
     }
     let cutoff = retention_days.map(|d| Utc::now() - chrono::Duration::days(d as i64));
     let _guard = deletion_lock().lock().await;
-    let summary = run_deletion(&client, channel, channel, cutoff, None, true, None).await;
+    let summary = run_deletion(&client, channel, channel, cutoff, None, true, None, None).await;
     println!(
         "dry run: {} of your messages in range would be deleted ({} scanned, {} skipped)",
         summary.deleted, summary.scanned, summary.skipped

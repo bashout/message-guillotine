@@ -53,7 +53,7 @@ pub fn record_last_run(chat: &str, summary: &crate::deletion::Summary) {
 }
 
 /// Serve IPC requests until the process exits. Spawned by the daemon.
-pub async fn serve(cfg: Arc<Config>) {
+pub async fn serve(cfg: Arc<Config>, registry: crate::progress::SharedRegistry) {
     let listener = match TcpListener::bind("127.0.0.1:0").await {
         Ok(l) => l,
         Err(e) => {
@@ -72,13 +72,14 @@ pub async fn serve(cfg: Arc<Config>) {
             Err(_) => continue,
         };
         let cfg = cfg.clone();
+        let registry = registry.clone();
         tokio::spawn(async move {
-            let _ = handle(stream, cfg).await;
+            let _ = handle(stream, cfg, registry).await;
         });
     }
 }
 
-async fn handle(stream: TcpStream, cfg: Arc<Config>) -> anyhow::Result<()> {
+async fn handle(stream: TcpStream, cfg: Arc<Config>, registry: crate::progress::SharedRegistry) -> anyhow::Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut line = String::new();
     let mut reader = BufReader::new(reader);
@@ -86,6 +87,7 @@ async fn handle(stream: TcpStream, cfg: Arc<Config>) -> anyhow::Result<()> {
     let req: Value = serde_json::from_str(line.trim())?;
     let resp = match req.get("cmd").and_then(|c| c.as_str()) {
         Some("status") => json!({ "ok": true, "runs": read_last_runs() }),
+        Some("jobs") => json!({ "ok": true, "running": registry.snapshot(), "last": read_last_runs() }),
         Some("run_now") => {
             let chat = req.get("chat").and_then(|c| c.as_str()).unwrap_or("");
             match run_now_via_daemon(&cfg, chat).await {
@@ -128,7 +130,8 @@ async fn run_now_via_daemon(cfg: &Config, chat: &str) -> anyhow::Result<crate::d
         anyhow::bail!("invalid token or authentication failed");
     }
     let job = ChatJob { key, settings };
-    let summary = scheduler::run_chat_job(&client, cfg, &job).await?;
+    let registry = crate::progress::new_registry();
+    let summary = scheduler::run_chat_job(&client, cfg, &job, &registry).await?;
     record_last_run(&job.key.to_string(), &summary);
     Ok(summary)
 }

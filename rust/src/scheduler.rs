@@ -80,21 +80,29 @@ pub async fn run_chat_job(
     client: &Client,
     cfg: &Config,
     job: &ChatJob,
+    registry: &crate::progress::SharedRegistry,
 ) -> anyhow::Result<deletion::Summary> {
     let channel_id = resolve_channel_id(client, &job.key).await?;
     let label = job.key.to_string();
     let archive_dir = cfg.resolve_archive_dir(None);
 
+    let chat_key = job.key.to_string();
+    registry.start(&chat_key, "starting");
     if job.settings.archive_before_delete {
         tracing::info!(chat = %label, "archiving before deletion");
-        archiver::archive_chat(client, &channel_id, &label, &archive_dir).await?;
+        registry.set_phase(&chat_key, "archiving", "writing archive (appends to existing)");
+        if let Err(e) = archiver::archive_chat(client, &channel_id, &label, &archive_dir).await {
+            registry.finish(&chat_key, &format!("archive failed: {e:#}"));
+            return Err(e);
+        }
     }
 
     let cutoff = chrono::Utc::now() - Duration::days(job.settings.retention_days as i64);
     let resume = deletion::load_session(&channel_id, None);
     let _guard = deletion::deletion_lock().lock().await;
     tracing::info!(chat = %label, retention_days = job.settings.retention_days, "deletion run starting");
-    Ok(deletion::run_deletion(
+    registry.set_phase(&chat_key, "deleting", &format!("keeping last {} days", job.settings.retention_days));
+    let summary = deletion::run_deletion(
         client,
         &channel_id,
         &label,
@@ -102,8 +110,14 @@ pub async fn run_chat_job(
         resume,
         false,
         None,
+        Some(registry),
     )
-    .await)
+    .await;
+    registry.finish(
+        &chat_key,
+        &format!("deleted {} (failed {}, skipped {})", summary.deleted, summary.failed, summary.skipped),
+    );
+    Ok(summary)
 }
 
 /// The next local fire time for a schedule, strictly after `from`.
@@ -182,7 +196,9 @@ pub async fn run_now(config_arg: Option<&PathBuf>, chat: &str) -> anyhow::Result
     if client.get_current_user().await?.is_none() {
         anyhow::bail!("invalid token or authentication failed");
     }
-    tokio::spawn(crate::ipc::serve(std::sync::Arc::new(cfg.clone())));
+    let registry = crate::progress::new_registry();
+    tokio::spawn(crate::ipc::serve(std::sync::Arc::new(cfg.clone()), registry.clone()));
+    let _ = &registry;
     let settings = match &key {
         ChatKey::Dm(user) => cfg
             .dm_chat_settings(user)
@@ -194,7 +210,7 @@ pub async fn run_now(config_arg: Option<&PathBuf>, chat: &str) -> anyhow::Result
             .ok_or_else(|| anyhow::anyhow!("chat {key} has no [chat] entry in the config"))?,
     };
     let job = ChatJob { key, settings };
-    let summary = run_chat_job(&client, &cfg, &job).await?;
+    let summary = run_chat_job(&client, &cfg, &job, &registry).await?;
     println!(
         "run-now {}: deleted {}, failed {}, skipped {} ({} scanned, complete={})",
         job.key,
@@ -214,7 +230,9 @@ pub async fn run_loop(cfg: &Config) -> anyhow::Result<()> {
     if client.get_current_user().await?.is_none() {
         anyhow::bail!("invalid token or authentication failed");
     }
-    tokio::spawn(crate::ipc::serve(std::sync::Arc::new(cfg.clone())));
+    let registry = crate::progress::new_registry();
+    tokio::spawn(crate::ipc::serve(std::sync::Arc::new(cfg.clone()), registry.clone()));
+    let _ = &registry;
     // Re-resolve the DM scope periodically: DMs come and go.
     let mut jobs = resolve_jobs(&client, cfg).await?;
     tracing::info!(count = jobs.len(), "scheduler started");
@@ -251,7 +269,7 @@ pub async fn run_loop(cfg: &Config) -> anyhow::Result<()> {
         }
         let job = jobs[idx].clone();
         tracing::info!(chat = %job.key, "scheduled run firing");
-        match run_chat_job(&client, cfg, &job).await {
+        match run_chat_job(&client, cfg, &job, &registry).await {
             Ok(summary) => {
                 tracing::info!(chat = %job.key, deleted = summary.deleted, complete = summary.complete, "job done");
                 crate::ipc::record_last_run(&job.key.to_string(), &summary);
