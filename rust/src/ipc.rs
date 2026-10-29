@@ -161,13 +161,28 @@ async fn handle(
         Some("status") => json!({ "ok": true, "runs": read_last_runs() }),
         Some("jobs") => json!({ "ok": true, "running": registry.snapshot(), "last": read_last_runs() }),
         Some("run_now") => {
-            let chat = req.get("chat").and_then(|c| c.as_str()).unwrap_or("");
+            let chat = req.get("chat").and_then(|c| c.as_str()).unwrap_or("").to_string();
             let all = req.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
-            match run_now_via_daemon(&cfg, chat, all, &registry).await {
-                Ok(summary) => json!({ "ok": true, "summary": {
-                    "deleted": summary.deleted, "failed": summary.failed,
-                    "skipped": summary.skipped, "scanned": summary.scanned,
-                    "complete": summary.complete, "aborted": summary.aborted } }),
+            // Ack immediately and run in the background: a deletion can take
+            // many minutes at the 24/min pace, and the client must not time
+            // out (or worse, fall back to an unlocked second run). The job
+            // still serializes through the daemon's deletion lock.
+            match prepare_run_now(&cfg, &chat, all) {
+                Ok(job) => {
+                    let cfg = cfg.clone();
+                    let registry = registry.clone();
+                    let chat_log = chat.clone();
+                    tokio::spawn(async move {
+                        match run_now_via_daemon(&cfg, job, &registry).await {
+                            Ok(summary) => {
+                                tracing::info!(chat = %chat_log, deleted = summary.deleted, "run-now finished");
+                                record_last_run(&chat_log, &summary);
+                            }
+                            Err(e) => tracing::warn!(chat = %chat_log, error = %e, "run-now failed"),
+                        }
+                    });
+                    json!({ "ok": true, "accepted": true, "chat": chat })
+                }
                 Err(e) => json!({ "ok": false, "error": format!("{e:#}") }),
             }
         }
@@ -186,7 +201,8 @@ fn read_last_runs() -> Value {
         .unwrap_or_else(|| json!({}))
 }
 
-async fn run_now_via_daemon(cfg: &Config, chat: &str, delete_all: bool, registry: &crate::progress::SharedRegistry) -> anyhow::Result<crate::deletion::Summary> {
+/// Validate and build the job for a run-now request (no API calls).
+fn prepare_run_now(cfg: &Config, chat: &str, delete_all: bool) -> anyhow::Result<ChatJob> {
     let key = ChatKey::parse(chat)?;
     let settings = match &key {
         ChatKey::Dm(user) => cfg
@@ -198,18 +214,19 @@ async fn run_now_via_daemon(cfg: &Config, chat: &str, delete_all: bool, registry
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("chat {key} has no [chat] entry"))?,
     };
-    let mut client = Client::new(cfg.token()?)?;
-    if client.get_current_user().await?.is_none() {
-        anyhow::bail!("invalid token or authentication failed");
-    }
     let mut settings = settings;
     if delete_all {
         settings.retention_days = 0; // cutoff = now: everything is deleted
     }
-    let job = ChatJob { key, settings };
-    let summary = scheduler::run_chat_job(&client, cfg, &job, registry).await?;
-    record_last_run(&job.key.to_string(), &summary);
-    Ok(summary)
+    Ok(ChatJob { key, settings })
+}
+
+async fn run_now_via_daemon(cfg: &Config, job: ChatJob, registry: &crate::progress::SharedRegistry) -> anyhow::Result<crate::deletion::Summary> {
+    let mut client = Client::new(cfg.token()?)?;
+    if client.get_current_user().await?.is_none() {
+        anyhow::bail!("invalid token or authentication failed");
+    }
+    scheduler::run_chat_job(&client, cfg, &job, registry).await
 }
 
 /// Client side: send one command to the running daemon.

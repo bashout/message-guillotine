@@ -127,6 +127,9 @@ fn dispatch(id: &str, config_path: &Path, rt: &tokio::runtime::Handle) -> bool {
                 let chat = chat.to_string();
                 rt.spawn(async move {
                     match crate::ipc::send(serde_json::json!({ "cmd": "run_now", "chat": chat })).await {
+                        Ok(resp) if resp["ok"] == true && resp["accepted"] == true => {
+                            tracing::info!(chat = %chat, "run-now accepted by daemon, running in background");
+                        }
                         Ok(resp) if resp["ok"] == true => {
                             tracing::info!(chat = %chat, "run-now done: {}", &resp["summary"]);
                         }
@@ -650,6 +653,9 @@ fn delete_all_button(ui: &mut egui::Ui, armed: &mut Option<String>, chat: &str, 
             let rt = rt.clone();
             rt.spawn(async move {
                 match crate::ipc::send(serde_json::json!({ "cmd": "run_now", "chat": chat, "all": true })).await {
+                    Ok(resp) if resp["ok"] == true && resp["accepted"] == true => {
+                        tracing::info!(chat = %chat, "delete-all accepted by daemon, running in background")
+                    }
                     Ok(resp) if resp["ok"] == true => tracing::info!(chat = %chat, "delete-all done: {}", &resp["summary"]),
                     Ok(resp) => tracing::warn!(chat = %chat, "delete-all failed: {}", &resp["error"]),
                     Err(e) => tracing::warn!(chat = %chat, "daemon unreachable: {e}"),
@@ -942,6 +948,7 @@ fn open_panel(config_path: &Path, rt: &tokio::runtime::Handle, tab: Tab) {
         let mut g = state.lock().unwrap_or_else(|e| e.into_inner());
         g.tab = tab;
         if let Some(ctx) = &g.ctx {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             ctx.request_repaint();
         }
     }
@@ -965,6 +972,11 @@ struct PanelApp {
 
 impl eframe::App for PanelApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // winit allows one EventLoop per process: hide on close instead of
+        // exiting, so the tray can reopen the same window.
+        if ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
         {
             let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
             g.ctx = Some(ctx.clone());
