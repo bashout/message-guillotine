@@ -193,7 +193,7 @@ pub async fn run_deletion(
                 state.scanned += 1;
                 state.before_cursor = Some(msg.id.clone());
                 if let Some(reg) = registry {
-                    reg.update(&channel_id, |p| {
+                    reg.update(label, |p| {
                         p.scanned = state.scanned;
                         p.deleted = state.deleted;
                         p.failed = state.failed;
@@ -232,7 +232,7 @@ pub async fn run_deletion(
                         pending_pace = std::cmp::max(api::RATE_LIMIT_DELAY, wait);
                         state.deleted += 1;
                         if let Some(reg) = registry {
-                            reg.update(&channel_id, |p| {
+                            reg.update(label, |p| {
                                 p.deleted = state.deleted;
                                 p.failed = state.failed;
                                 p.skipped = state.skipped;
@@ -242,7 +242,7 @@ pub async fn run_deletion(
                     DeleteOutcome::Skipped => {
                         state.skipped += 1;
                         if let Some(reg) = registry {
-                            reg.update(&channel_id, |p| {
+                            reg.update(label, |p| {
                                 p.skipped = state.skipped;
                                 p.deleted = state.deleted;
                                 p.failed = state.failed;
@@ -252,7 +252,7 @@ pub async fn run_deletion(
                     DeleteOutcome::Failed => {
                         state.failed += 1;
                         if let Some(reg) = registry {
-                            reg.update(&channel_id, |p| {
+                            reg.update(label, |p| {
                                 p.failed = state.failed;
                                 p.deleted = state.deleted;
                                 p.skipped = state.skipped;
