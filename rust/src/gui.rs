@@ -15,10 +15,10 @@ use crate::config::{self, Config};
 /// A simple generated 32x32 RGBA icon (a dark square with a lighter blade),
 /// so no asset files are needed.
 fn tray_icon_rgba() -> tray_icon::Icon {
-    // The repo's branding icon, embedded at compile time, original colors on
-    // a transparent background, rendered at 64px so the tray's own downscale
-    // stays crisp (a 256px source crushed to 32px is what looked bad).
-    const EMBEDDED: &[u8] = include_bytes!("../../branding/icon-256.png");
+    // The repo's transparent branding icon (1024px, upscaled by the user),
+    // embedded at compile time, original colors, rendered at 64px so the
+    // tray's own downscale stays crisp.
+    const EMBEDDED: &[u8] = include_bytes!("../../branding/icon-transparent.png");
     match image::load_from_memory(EMBEDDED) {
         Ok(img) => {
             let size = 64u32;
