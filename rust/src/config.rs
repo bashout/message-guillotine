@@ -314,19 +314,20 @@ impl Config {
     }
 
     /// Effective settings for a DM chat: its own [chat] entry when present,
-    /// otherwise the dm defaults (only reached under the exclude policy).
+    /// otherwise the dm defaults for any in-scope user (nominated or not
+    /// excluded). None when the user is out of scope.
     pub fn dm_chat_settings(&self, user_id: &str) -> Option<ChatConfig> {
         if let Some(own) = self.chat.get(&format!("dm:{user_id}")) {
             return Some(own.clone());
         }
-        match self.dm.policy {
-            DmScope::Exclude if !self.dm.users.iter().any(|u| u == user_id) => Some(ChatConfig {
+        if self.dm_user_in_scope(user_id) {
+            return Some(ChatConfig {
                 schedule: self.dm.default_schedule,
                 retention_days: self.dm.default_retention_days,
                 archive_before_delete: self.dm.default_archive_before_delete,
-            }),
-            _ => None,
+            });
         }
+        None
     }
 
     /// Whether a DM user is in scope at all under the dm policy.

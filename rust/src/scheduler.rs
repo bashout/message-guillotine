@@ -201,7 +201,6 @@ pub async fn run_now(config_arg: Option<&PathBuf>, chat: &str) -> anyhow::Result
         anyhow::bail!("invalid token or authentication failed");
     }
     let registry = crate::progress::new_registry();
-    tokio::spawn(crate::ipc::serve(std::sync::Arc::new(cfg.clone()), registry.clone()));
     let settings = match &key {
         ChatKey::Dm(user) => cfg
             .dm_chat_settings(user)
@@ -228,13 +227,17 @@ pub async fn run_now(config_arg: Option<&PathBuf>, chat: &str) -> anyhow::Result
 
 /// The service loop: resolve jobs, sleep until each chat's next fire time,
 /// run due jobs one at a time, and recompute. Runs forever.
-pub async fn run_loop(cfg: &Config) -> anyhow::Result<()> {
+pub async fn run_loop(cfg: &Config, config_path: &std::path::Path) -> anyhow::Result<()> {
     let mut client = Client::new(cfg.token()?)?;
     if client.get_current_user().await?.is_none() {
         anyhow::bail!("invalid token or authentication failed");
     }
     let registry = crate::progress::new_registry();
-    tokio::spawn(crate::ipc::serve(std::sync::Arc::new(cfg.clone()), registry.clone()));
+    tokio::spawn(crate::ipc::serve(
+        std::sync::Arc::new(cfg.clone()),
+        registry.clone(),
+        config_path.to_path_buf(),
+    ));
     // Re-resolve the DM scope periodically: DMs come and go.
     let mut jobs = resolve_jobs(&client, cfg).await?;
     tracing::info!(count = jobs.len(), "scheduler started");
@@ -245,6 +248,15 @@ pub async fn run_loop(cfg: &Config) -> anyhow::Result<()> {
         .collect();
 
     loop {
+        // Pick up config edits (GUI save, manual edits) without a restart.
+        let cfg = match Config::load(config_path) {
+            Ok(fresh) => fresh,
+            Err(e) => {
+                tracing::warn!(error = %e, "config reload failed; keeping last good config");
+                cfg.clone()
+            }
+        };
+        let cfg = &cfg;
         let now = Local::now();
         next.sort_by_key(|(t, _)| *t);
         let Some((due, idx)) = next.first().copied() else {

@@ -49,7 +49,7 @@ pub async fn run(config_arg: Option<&Path>) -> anyhow::Result<()> {
     let _guard = _guard;
 
     tracing::info!(config = %path.display(), "guillotine service starting");
-    scheduler::run_loop(&cfg).await
+    scheduler::run_loop(&cfg, &path).await
 }
 
 /// systemd --user unit (Linux).

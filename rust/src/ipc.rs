@@ -96,7 +96,11 @@ pub fn record_last_run(chat: &str, summary: &crate::deletion::Summary) {
 }
 
 /// Serve IPC requests until the process exits. Spawned by the daemon.
-pub async fn serve(cfg: Arc<Config>, registry: crate::progress::SharedRegistry) {
+pub async fn serve(
+    cfg: Arc<Config>,
+    registry: crate::progress::SharedRegistry,
+    config_path: std::path::PathBuf,
+) {
     let listener = match TcpListener::bind("127.0.0.1:0").await {
         Ok(l) => l,
         Err(e) => {
@@ -124,8 +128,12 @@ pub async fn serve(cfg: Arc<Config>, registry: crate::progress::SharedRegistry) 
         let cfg = cfg.clone();
         let registry = registry.clone();
         let secret = secret.clone();
+        let config_path = config_path.clone();
         tokio::spawn(async move {
-            let _ = handle(stream, cfg, registry, secret).await;
+            // Reload the config per request: edits made in the GUI settings
+            // apply to run-now immediately, without a daemon restart.
+            let fresh = Config::load(&config_path).unwrap_or_else(|_| (*cfg).clone());
+            let _ = handle(stream, Arc::new(fresh), registry, secret).await;
         });
     }
 }
