@@ -94,10 +94,19 @@ pub async fn run(config_arg: Option<&PathBuf>) -> anyhow::Result<()> {
         .clone()
         .or_else(|| std::env::var_os("GUILLOTINE_VIEWER").map(PathBuf::from));
 
-    // Resolve raw chat keys to friendly names for the Run-now menu.
-    let labels = match cfg.token() {
-        Ok(token) => fetch_chat_labels(token, &chats).await,
-        Err(_) => HashMap::new(),
+    // One API login for the whole gui process; the client is shared by the
+    // tray label fetch and the settings window fetches.
+    let client = match cfg.token() {
+        Ok(token) => {
+            let mut c = crate::api::Client::new(token)?;
+            let _ = c.get_current_user().await?;
+            Some(std::sync::Arc::new(c))
+        }
+        Err(_) => None,
+    };
+    let labels = match &client {
+        Some(c) => fetch_chat_labels(c, &chats).await,
+        None => HashMap::new(),
     };
 
     let menu = build_menu(&chats, &archive_dir, viewer.as_deref(), &labels)?;
@@ -117,12 +126,12 @@ pub async fn run(config_arg: Option<&PathBuf>) -> anyhow::Result<()> {
         }
     });
 
-    handle_events(rx, path)?;
+    handle_events(rx, path, client)?;
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
-fn handle_events(rx: mpsc::Receiver<MenuEvent>, config_path: PathBuf) -> anyhow::Result<()> {
+fn handle_events(rx: mpsc::Receiver<MenuEvent>, config_path: PathBuf, client: Option<std::sync::Arc<crate::api::Client>>) -> anyhow::Result<()> {
     // tray-icon/muda on Linux are GTK: pump its main loop so menu events are
     // delivered (esp. on Wayland via XWayland/appindicator).
     let rt = tokio::runtime::Handle::current();
@@ -132,7 +141,7 @@ fn handle_events(rx: mpsc::Receiver<MenuEvent>, config_path: PathBuf) -> anyhow:
         }
         match rx.recv_timeout(std::time::Duration::from_millis(100)) {
             Ok(event) => {
-                if !dispatch(event.id().0.as_str(), &config_path, &rt) {
+                if !dispatch(event.id().0.as_str(), &config_path, &rt, &client) {
                     break;
                 }
             }
@@ -147,12 +156,12 @@ fn handle_events(rx: mpsc::Receiver<MenuEvent>, config_path: PathBuf) -> anyhow:
 }
 
 #[cfg(not(target_os = "linux"))]
-fn handle_events(rx: mpsc::Receiver<MenuEvent>, config_path: PathBuf) -> anyhow::Result<()> {
+fn handle_events(rx: mpsc::Receiver<MenuEvent>, config_path: PathBuf, client: Option<std::sync::Arc<crate::api::Client>>) -> anyhow::Result<()> {
     let rt = tokio::runtime::Handle::current();
     loop {
         match rx.recv_timeout(std::time::Duration::from_millis(500)) {
             Ok(event) => {
-                if !dispatch(event.id().0.as_str(), &config_path, &rt) {
+                if !dispatch(event.id().0.as_str(), &config_path, &rt, &client) {
                     break;
                 }
             }
@@ -167,10 +176,10 @@ fn handle_events(rx: mpsc::Receiver<MenuEvent>, config_path: PathBuf) -> anyhow:
 }
 
 /// Returns false when the app should quit.
-fn dispatch(id: &str, config_path: &Path, rt: &tokio::runtime::Handle) -> bool {
+fn dispatch(id: &str, config_path: &Path, rt: &tokio::runtime::Handle, client: &Option<std::sync::Arc<crate::api::Client>>) -> bool {
     match id {
-        "settings" => open_panel(config_path, rt, Tab::Settings),
-        "jobs" => open_panel(config_path, rt, Tab::Jobs),
+        "settings" => open_panel(config_path, rt, Tab::Settings, client.clone()),
+        "jobs" => open_panel(config_path, rt, Tab::Jobs, client.clone()),
         "status" => {
             rt.spawn(async {
                 match crate::ipc::send(serde_json::json!({ "cmd": "status" })).await {
@@ -279,15 +288,9 @@ fn open_in_file_manager(folder: &Path) {
 /// ("Display (@username)", "GuildName #channel") via the API. Keys that
 /// can't be resolved are simply absent from the map (callers fall back to
 /// the raw key).
-async fn fetch_chat_labels(token: &str, chats: &[String]) -> HashMap<String, String> {
+async fn fetch_chat_labels(client: &crate::api::Client, chats: &[String]) -> HashMap<String, String> {
     use crate::config::ChatKey;
     let mut map = HashMap::new();
-    let Ok(mut client) = crate::api::Client::new(token) else {
-        return map;
-    };
-    if client.get_current_user().await.ok().flatten().is_none() {
-        return map;
-    }
     if let Ok(channels) = client.get_dm_channels().await {
         for (user, _channel) in client.dm_users(&channels) {
             let name = user
@@ -315,7 +318,7 @@ async fn fetch_chat_labels(token: &str, chats: &[String]) -> HashMap<String, Str
             .entry(guild.clone())
             .or_default();
         if channels.is_empty() {
-            *channels = fetch_guild_channels(token, &guild).await;
+            *channels = fetch_guild_channels(client, &guild).await;
         }
         let channel_name = channels
             .iter()
@@ -411,6 +414,7 @@ struct ChatRow {
 
 struct SettingsApp {
     rt: tokio::runtime::Handle,
+    client: Option<std::sync::Arc<crate::api::Client>>,
     path: PathBuf,
     token: String,
     archive_dir: String,
@@ -474,7 +478,7 @@ fn short_time(iso: &str) -> String {
 }
 
 impl SettingsApp {
-    fn load(path: &PathBuf, rt: &tokio::runtime::Handle) -> Self {
+    fn load(path: &PathBuf, rt: &tokio::runtime::Handle, client: Option<std::sync::Arc<crate::api::Client>>) -> Self {
         let raw = std::fs::read_to_string(path).unwrap_or_default();
         let parsed: Result<Config, _> = toml::from_str(&raw);
         let (token, archive_dir, dm, chat) = match parsed {
@@ -527,20 +531,21 @@ impl SettingsApp {
         let (tx, rx) = mpsc::channel::<Vec<(String, String)>>();
         let (gtx, grx) = mpsc::channel::<Vec<(String, String)>>();
         let (ctx_tx, ctx_rx) = mpsc::channel::<(String, Vec<(String, String)>)>();
-        let dm_pending = !token.is_empty();
+        let dm_pending = client.is_some();
         if dm_pending {
-            let dtoken = token.clone();
+            let c1 = client.clone();
             rt.spawn(async move {
-                let _ = tx.send(fetch_dm_users(&dtoken).await);
+                let _ = tx.send(match &c1 { Some(c) => fetch_dm_users(c).await, None => Vec::new() });
             });
-            let gtoken = token.clone();
+            let c2 = client.clone();
             rt.spawn(async move {
-                let _ = gtx.send(fetch_guilds(&gtoken).await);
+                let _ = gtx.send(match &c2 { Some(c) => fetch_guilds(c).await, None => Vec::new() });
             });
         }
 
         SettingsApp {
             rt: rt.clone(),
+            client: client.clone(),
             path: path.clone(),
             token,
             archive_dir,
@@ -638,10 +643,10 @@ impl SettingsApp {
         self.channels.clear();
         self.selected_channel.clear();
         self.channels_pending = true;
-        let token = self.token.clone();
+        let client = self.client.clone();
         let tx = self.channels_tx.clone();
         self.rt.spawn(async move {
-            let _ = tx.send((guild.clone(), fetch_guild_channels(&token, &guild).await));
+            let _ = tx.send((guild.clone(), match &client { Some(c) => fetch_guild_channels(c, &guild).await, None => Vec::new() }));
         });
     }
 
@@ -748,14 +753,8 @@ fn detect_archives(dir: &Path) -> Vec<(String, PathBuf)> {
 }
 
 /// Fetch the user's DM partners from the API: (user id, "Display (@username)").
-async fn fetch_dm_users(token: &str) -> Vec<(String, String)> {
+async fn fetch_dm_users(client: &crate::api::Client) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    let Ok(mut client) = crate::api::Client::new(token) else {
-        return out;
-    };
-    if client.get_current_user().await.ok().flatten().is_none() {
-        return out;
-    }
     if let Ok(channels) = client.get_dm_channels().await {
         for (user, _channel) in client.dm_users(&channels) {
             let name = user
@@ -769,11 +768,8 @@ async fn fetch_dm_users(token: &str) -> Vec<(String, String)> {
 }
 
 /// Fetch the user's guilds from the API: (guild id, name).
-async fn fetch_guilds(token: &str) -> Vec<(String, String)> {
+async fn fetch_guilds(client: &crate::api::Client) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    let Ok(client) = crate::api::Client::new(token) else {
-        return out;
-    };
     if let Ok(guilds) = client.get_guilds().await {
         for g in guilds {
             out.push((g.id, g.name));
@@ -783,11 +779,8 @@ async fn fetch_guilds(token: &str) -> Vec<(String, String)> {
 }
 
 /// Fetch a guild's text channels from the API: (channel id, "#name").
-async fn fetch_guild_channels(token: &str, guild_id: &str) -> Vec<(String, String)> {
+async fn fetch_guild_channels(client: &crate::api::Client, guild_id: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    let Ok(client) = crate::api::Client::new(token) else {
-        return out;
-    };
     if let Ok(channels) = client.get_guild_channels(guild_id).await {
         for c in channels {
             out.push((c.id, format!("#{}", c.name)));
@@ -1102,6 +1095,7 @@ struct PanelState {
     config_path: PathBuf,
     rt: tokio::runtime::Handle,
     ctx: Option<egui::Context>,
+    client: Option<std::sync::Arc<crate::api::Client>>,
 }
 
 static PANEL: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<PanelState>>> =
@@ -1109,13 +1103,19 @@ static PANEL: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<PanelState>>> 
 static PANEL_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static QUIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-fn open_panel(config_path: &Path, rt: &tokio::runtime::Handle, tab: Tab) {
+fn open_panel(
+    config_path: &Path,
+    rt: &tokio::runtime::Handle,
+    tab: Tab,
+    client: Option<std::sync::Arc<crate::api::Client>>,
+) {
     let state = PANEL.get_or_init(|| {
         std::sync::Arc::new(std::sync::Mutex::new(PanelState {
             tab,
             config_path: config_path.to_path_buf(),
             rt: rt.clone(),
             ctx: None,
+            client,
         }))
     });
     {
@@ -1146,11 +1146,11 @@ struct PanelApp {
 
 impl eframe::App for PanelApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // winit allows one EventLoop per process: veto the close and hide
-        // instead, so the tray can reopen the same window later.
+        // X quits the whole gui app (winit allows one EventLoop per process,
+        // so the window can't be recreated in-process; relaunch `guillotine
+        // gui` to reopen). The in-panel Quit button does the same.
         if ctx.input(|i| i.viewport().close_requested()) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            QUIT.store(true, std::sync::atomic::Ordering::SeqCst);
         }
         {
             let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -1197,13 +1197,13 @@ fn apply_style(ctx: &egui::Context) {
 }
 
 fn panel_window(state: std::sync::Arc<std::sync::Mutex<PanelState>>) -> anyhow::Result<()> {
-    let (config_path, rt) = {
+    let (config_path, rt, client) = {
         let g = state.lock().unwrap_or_else(|e| e.into_inner());
-        (g.config_path.clone(), g.rt.clone())
+        (g.config_path.clone(), g.rt.clone(), g.client.clone())
     };
     let app = PanelApp {
-        settings: SettingsApp::load(&config_path, &rt),
-        jobs: JobsApp::new(&rt, &config_path),
+        settings: SettingsApp::load(&config_path, &rt, client.clone()),
+        jobs: JobsApp::new(&rt, &config_path, client),
         state,
     };
     let mut options = eframe::NativeOptions {
@@ -1241,7 +1241,7 @@ struct JobsApp {
 }
 
 impl JobsApp {
-    fn new(rt: &tokio::runtime::Handle, config_path: &Path) -> Self {
+    fn new(rt: &tokio::runtime::Handle, config_path: &Path, client: Option<std::sync::Arc<crate::api::Client>>) -> Self {
         let (tx, rx) = mpsc::channel::<serde_json::Value>();
         let rt = rt.clone();
         rt.spawn(async move {
@@ -1264,13 +1264,12 @@ impl JobsApp {
         {
             let labels = labels.clone();
             let config_path = config_path.to_path_buf();
+            let client = client.clone();
             rt.spawn(async move {
                 if let Ok((cfg, _)) = crate::load_config(Some(&config_path)) {
                     let chats: Vec<String> = cfg.chats().map(|(k, _)| k.to_string()).collect();
-                    if let Ok(token) = cfg.token() {
-                        let map = fetch_chat_labels(token, &chats).await;
-                        *labels.lock().unwrap_or_else(|e| e.into_inner()) = map;
-                    }
+                    let map = match &client { Some(c) => fetch_chat_labels(c, &chats).await, None => Default::default() };
+                    *labels.lock().unwrap_or_else(|e| e.into_inner()) = map;
                 }
             });
         }
