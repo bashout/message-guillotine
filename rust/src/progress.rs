@@ -25,7 +25,7 @@ pub struct JobRegistry {
 impl JobRegistry {
     pub fn start(&self, chat: &str, phase: &str) {
         let now = chrono::Utc::now().to_rfc3339();
-        self.inner.lock().unwrap().insert(
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).insert(
             chat.to_string(),
             JobProgress {
                 chat: chat.to_string(),
@@ -42,7 +42,7 @@ impl JobRegistry {
     }
 
     pub fn update(&self, chat: &str, f: impl FnOnce(&mut JobProgress)) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(p) = inner.get_mut(chat) {
             f(p);
             p.updated = chrono::Utc::now().to_rfc3339();
@@ -64,11 +64,11 @@ impl JobRegistry {
     }
 
     pub fn remove(&self, chat: &str) {
-        self.inner.lock().unwrap().remove(chat);
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).remove(chat);
     }
 
     pub fn snapshot(&self) -> Vec<JobProgress> {
-        self.inner.lock().unwrap().values().cloned().collect()
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).values().cloned().collect()
     }
 }
 

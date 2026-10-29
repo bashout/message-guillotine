@@ -18,6 +18,49 @@ pub fn port_file() -> PathBuf {
     config::data_dir().join("ipc.port")
 }
 
+/// Shared secret required on every IPC request. Stored 0600 in the data dir.
+pub fn secret_file() -> PathBuf {
+    config::data_dir().join("ipc.secret")
+}
+
+fn write_private(path: &std::path::Path, contents: &str) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?
+            .write_all(contents.as_bytes())?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, contents)?;
+    }
+    Ok(())
+}
+
+use std::io::{Read as _, Write as _};
+
+/// The daemon's secret: read the existing file, or create a fresh random one.
+fn load_or_create_secret() -> anyhow::Result<String> {
+    let path = secret_file();
+    if let Ok(secret) = std::fs::read_to_string(&path) {
+        let secret = secret.trim().to_string();
+        if !secret.is_empty() {
+            return Ok(secret);
+        }
+    }
+    config::ensure_data_dir()?;
+    let mut raw = [0u8; 32];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut raw)?;
+    let secret = raw.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    write_private(&path, &format!("{secret}\n"))?;
+    Ok(secret)
+}
+
 /// Per-chat record of the most recent run, persisted for the tray/status UI.
 pub fn last_runs_file() -> PathBuf {
     config::data_dir().join("last_runs.json")
@@ -62,9 +105,16 @@ pub async fn serve(cfg: Arc<Config>, registry: crate::progress::SharedRegistry) 
         }
     };
     let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
-    if let Err(e) = std::fs::write(port_file(), format!("{port}\n")) {
+    if let Err(e) = config::ensure_data_dir().and_then(|_| write_private(&port_file(), &format!("{port}\n")).map_err(std::io::Error::other)) {
         tracing::warn!(error = %e, "ipc: cannot write port file");
     }
+    let secret = match load_or_create_secret() {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = %e, "ipc: cannot create secret; refusing to serve unauthenticated");
+            return;
+        }
+    };
     tracing::info!(port, "ipc listening");
     loop {
         let (stream, _) = match listener.accept().await {
@@ -73,25 +123,39 @@ pub async fn serve(cfg: Arc<Config>, registry: crate::progress::SharedRegistry) 
         };
         let cfg = cfg.clone();
         let registry = registry.clone();
+        let secret = secret.clone();
         tokio::spawn(async move {
-            let _ = handle(stream, cfg, registry).await;
+            let _ = handle(stream, cfg, registry, secret).await;
         });
     }
 }
 
-async fn handle(stream: TcpStream, cfg: Arc<Config>, registry: crate::progress::SharedRegistry) -> anyhow::Result<()> {
+async fn handle(
+    stream: TcpStream,
+    cfg: Arc<Config>,
+    registry: crate::progress::SharedRegistry,
+    secret: String,
+) -> anyhow::Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut line = String::new();
     let mut reader = BufReader::new(reader);
-    reader.read_line(&mut line).await?;
+    // Cap the line length and bound the whole exchange so a local peer can
+    // neither exhaust memory nor hold a task/fd forever.
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+    reader.take(64 * 1024).read_line(&mut line).await?;
     let req: Value = serde_json::from_str(line.trim())?;
+    if req.get("secret").and_then(|s| s.as_str()) != Some(secret.as_str()) {
+        let resp = json!({ "ok": false, "error": "unauthorized" });
+        writer.write_all((serde_json::to_string(&resp)? + "\n").as_bytes()).await?;
+        return Ok(());
+    }
     let resp = match req.get("cmd").and_then(|c| c.as_str()) {
         Some("status") => json!({ "ok": true, "runs": read_last_runs() }),
         Some("jobs") => json!({ "ok": true, "running": registry.snapshot(), "last": read_last_runs() }),
         Some("run_now") => {
             let chat = req.get("chat").and_then(|c| c.as_str()).unwrap_or("");
             let all = req.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
-            match run_now_via_daemon(&cfg, chat, all).await {
+            match run_now_via_daemon(&cfg, chat, all, &registry).await {
                 Ok(summary) => json!({ "ok": true, "summary": {
                     "deleted": summary.deleted, "failed": summary.failed,
                     "skipped": summary.skipped, "scanned": summary.scanned,
@@ -114,7 +178,7 @@ fn read_last_runs() -> Value {
         .unwrap_or_else(|| json!({}))
 }
 
-async fn run_now_via_daemon(cfg: &Config, chat: &str, delete_all: bool) -> anyhow::Result<crate::deletion::Summary> {
+async fn run_now_via_daemon(cfg: &Config, chat: &str, delete_all: bool, registry: &crate::progress::SharedRegistry) -> anyhow::Result<crate::deletion::Summary> {
     let key = ChatKey::parse(chat)?;
     let settings = match &key {
         ChatKey::Dm(user) => cfg
@@ -135,27 +199,32 @@ async fn run_now_via_daemon(cfg: &Config, chat: &str, delete_all: bool) -> anyho
         settings.retention_days = 0; // cutoff = now: everything is deleted
     }
     let job = ChatJob { key, settings };
-    let registry = crate::progress::new_registry();
-    let summary = scheduler::run_chat_job(&client, cfg, &job, &registry).await?;
+    let summary = scheduler::run_chat_job(&client, cfg, &job, registry).await?;
     record_last_run(&job.key.to_string(), &summary);
     Ok(summary)
 }
 
 /// Client side: send one command to the running daemon.
-pub async fn send(cmd: Value) -> anyhow::Result<Value> {
-    let port: u16 = std::fs::read_to_string(port_file())?
-        .trim()
-        .parse()
-        .context("invalid ipc port file — is the service running?")?;
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).await?;
-    use tokio::io::AsyncWriteExt;
-    stream
-        .write_all((serde_json::to_string(&cmd)? + "\n").as_bytes())
-        .await?;
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    reader.read_line(&mut line).await?;
-    Ok(serde_json::from_str(line.trim())?)
+pub async fn send(mut cmd: Value) -> anyhow::Result<Value> {
+    let secret = std::fs::read_to_string(secret_file()).context("no ipc secret — is the service running?")?;
+    cmd["secret"] = Value::String(secret.trim().to_string());
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let port: u16 = std::fs::read_to_string(port_file())?
+            .trim()
+            .parse()
+            .context("invalid ipc port file — is the service running?")?;
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await?;
+        stream
+            .write_all((serde_json::to_string(&cmd)? + "\n").as_bytes())
+            .await?;
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+        reader.take(1024 * 1024).read_line(&mut line).await?;
+        Ok(serde_json::from_str(line.trim())?)
+    })
+    .await
+    .context("ipc request timed out")?
 }
 
 use anyhow::Context;

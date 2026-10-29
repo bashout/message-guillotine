@@ -96,8 +96,8 @@ fn sample(msg: &api::Message) -> String {
         .clone()
         .unwrap_or_else(|| msg.author.username.clone());
     let content = msg.content.split_whitespace().collect::<Vec<_>>().join(" ");
-    let content = if content.len() > 60 {
-        format!("{}...", &content[..57])
+    let content = if content.chars().count() > 60 {
+        format!("{}...", content.chars().take(57).collect::<String>())
     } else {
         content
     };
@@ -169,8 +169,16 @@ pub async fn run_deletion(
             }
             for msg in &page {
                 if let Some(cut) = cutoff_ts {
-                    if msg.epoch().unwrap_or(0.0) > cut {
-                        continue; // newer than the cutoff: keep scanning backwards
+                    match msg.epoch() {
+                        Ok(ts) if ts > cut => continue, // newer than the cutoff
+                        Ok(_) => {}
+                        Err(e) => {
+                            // Fail safe: never treat an undatable message as
+                            // old enough to delete.
+                            tracing::warn!(id = %msg.id, error = %e, "undatable message timestamp; skipping");
+                            state.failed += 1;
+                            continue;
+                        }
                     }
                 }
                 state.scanned += 1;

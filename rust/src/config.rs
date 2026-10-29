@@ -46,6 +46,25 @@ pub fn sessions_dir() -> PathBuf {
     data_dir().join("deletion_sessions")
 }
 
+/// Create the per-OS data dir with owner-only permissions (0700) and return
+/// it. Safe to call repeatedly.
+pub fn ensure_data_dir() -> std::io::Result<PathBuf> {
+    let dir = data_dir();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(&dir)?;
+    }
+    Ok(dir)
+}
+
 /// How DM chats are brought into scope. There is deliberately no "all" mode:
 /// either individual users are nominated, or specific users are excluded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -222,7 +241,7 @@ impl Default for DmPolicy {
 }
 
 /// Root configuration file.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Config {
     /// Token may be omitted here when GUILLOTINE_TOKEN is set.
     pub token: Option<String>,
@@ -337,6 +356,19 @@ impl Config {
             DmScope::Nominate => self.dm.users.iter().any(|u| u == user_id),
             DmScope::Exclude => !self.dm.users.iter().any(|u| u == user_id),
         }
+    }
+}
+
+impl fmt::Debug for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Never leak the token into logs or error chains.
+        f.debug_struct("Config")
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("archive_dir", &self.archive_dir)
+            .field("archive_viewer", &self.archive_viewer)
+            .field("dm", &self.dm)
+            .field("chat", &self.chat)
+            .finish()
     }
 }
 

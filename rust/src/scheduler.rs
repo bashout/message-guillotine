@@ -88,6 +88,9 @@ pub async fn run_chat_job(
 
     let chat_key = job.key.to_string();
     registry.start(&chat_key, "starting");
+    // One job at a time, archive phase included: two concurrent archives of
+    // the same chat would both append the same messages (duplicate records).
+    let _guard = deletion::deletion_lock().lock().await;
     if job.settings.archive_before_delete {
         tracing::info!(chat = %label, "archiving before deletion");
         registry.set_phase(&chat_key, "archiving", "writing archive (appends to existing)");
@@ -99,7 +102,6 @@ pub async fn run_chat_job(
 
     let cutoff = chrono::Utc::now() - Duration::days(job.settings.retention_days as i64);
     let resume = deletion::load_session(&channel_id, None);
-    let _guard = deletion::deletion_lock().lock().await;
     tracing::info!(chat = %label, retention_days = job.settings.retention_days, "deletion run starting");
     registry.set_phase(&chat_key, "deleting", &format!("keeping last {} days", job.settings.retention_days));
     let summary = deletion::run_deletion(
@@ -198,7 +200,6 @@ pub async fn run_now(config_arg: Option<&PathBuf>, chat: &str) -> anyhow::Result
     }
     let registry = crate::progress::new_registry();
     tokio::spawn(crate::ipc::serve(std::sync::Arc::new(cfg.clone()), registry.clone()));
-    let _ = &registry;
     let settings = match &key {
         ChatKey::Dm(user) => cfg
             .dm_chat_settings(user)
@@ -232,7 +233,6 @@ pub async fn run_loop(cfg: &Config) -> anyhow::Result<()> {
     }
     let registry = crate::progress::new_registry();
     tokio::spawn(crate::ipc::serve(std::sync::Arc::new(cfg.clone()), registry.clone()));
-    let _ = &registry;
     // Re-resolve the DM scope periodically: DMs come and go.
     let mut jobs = resolve_jobs(&client, cfg).await?;
     tracing::info!(count = jobs.len(), "scheduler started");

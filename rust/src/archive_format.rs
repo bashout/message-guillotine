@@ -92,10 +92,13 @@ pub fn find_existing_archive(channel_id: &str, archive_dir: &Path) -> Option<Pat
             continue;
         }
         let marker = path.join("messages.jsonl");
-        let mtime = std::fs::metadata(&marker)
+        let mtime = match std::fs::metadata(&marker)
             .or_else(|_| std::fs::metadata(&path))
             .and_then(|m| m.modified())
-            .ok()?;
+        {
+            Ok(t) => t,
+            Err(_) => continue, // unreadable candidate: skip, don't abort the search
+        };
         matches.push((mtime, path));
     }
     matches.sort_by_key(|(t, _)| *t);
@@ -148,8 +151,14 @@ pub fn read_archive_status(folder: &Path) -> Option<bool> {
 }
 
 pub fn mark_archive_status(folder: &Path, complete: bool) {
-    let _ = std::fs::write(
-        folder.join("status.json"),
+    let path = folder.join("status.json");
+    let tmp = folder.join("status.json.part");
+    if std::fs::write(
+        &tmp,
         serde_json::to_string(&serde_json::json!({ "complete": complete })).unwrap() + "\n",
-    );
+    )
+    .is_ok()
+    {
+        let _ = std::fs::rename(&tmp, &path);
+    }
 }
