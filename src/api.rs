@@ -193,6 +193,16 @@ pub struct Client {
     pub current_user: Option<User>,
 }
 
+/// Build a client from the config's token and verify the token by fetching
+/// the current user; bails when the token is missing, malformed, or rejected.
+pub async fn authed_client(cfg: &crate::config::Config) -> anyhow::Result<Client> {
+    let mut client = Client::new(cfg.token()?)?;
+    if client.get_current_user().await?.is_none() {
+        anyhow::bail!("invalid token or authentication failed");
+    }
+    Ok(client)
+}
+
 impl Client {
     pub fn new(token: &str) -> anyhow::Result<Self> {
         Self::build(token, API_BASE, true)

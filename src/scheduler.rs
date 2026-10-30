@@ -299,6 +299,21 @@ pub fn reconcile_schedules(
     }
 }
 
+/// Resolve a chat key to its effective settings: the chat's own [chat]
+/// entry, or the dm defaults for an in-scope DM user.
+pub fn resolve_chat_settings(cfg: &Config, key: &ChatKey) -> anyhow::Result<ChatConfig> {
+    match key {
+        ChatKey::Dm(user) => cfg
+            .dm_chat_settings(user)
+            .ok_or_else(|| anyhow::anyhow!("dm user {user} is not in scope under the dm policy")),
+        ChatKey::GuildChannel { .. } => cfg
+            .chat
+            .get(&key.to_string())
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("chat {key} has no [chat] entry in the config")),
+    }
+}
+
 /// `guillotine run-now <chat>`: run one configured chat immediately. Still
 /// serialized with any scheduled run via the deletion lock.
 pub async fn run_now(config_arg: Option<&PathBuf>, chat: &str) -> anyhow::Result<()> {
@@ -309,16 +324,11 @@ pub async fn run_now(config_arg: Option<&PathBuf>, chat: &str) -> anyhow::Result
     {
         if resp.get("ok").and_then(|v| v.as_bool()) == Some(true) {
             // The daemon acks run-now immediately and runs it in the
-            // background, so there is usually no summary to print.
+            // background, so there is no summary in the ack.
             if resp.get("accepted").and_then(|v| v.as_bool()) == Some(true) {
                 println!(
                     "run-now {chat}: accepted by the daemon; running in the background \
                      (see the Jobs tab or the service log for the result)"
-                );
-            } else if let Some(s) = resp.get("summary") {
-                println!(
-                    "run-now {chat}: deleted {}, failed {}, skipped {} ({} scanned, complete={})",
-                    s["deleted"], s["failed"], s["skipped"], s["scanned"], s["complete"]
                 );
             }
             return Ok(());
@@ -331,22 +341,10 @@ pub async fn run_now(config_arg: Option<&PathBuf>, chat: &str) -> anyhow::Result
         }
     }
     let (cfg, _path) = crate::load_config(config_arg)?;
-    let key = ChatKey::parse(chat)?;
-    let mut client = Client::new(cfg.token()?)?;
-    if client.get_current_user().await?.is_none() {
-        anyhow::bail!("invalid token or authentication failed");
-    }
+    let client = crate::api::authed_client(&cfg).await?;
     let registry = crate::progress::new_registry();
-    let settings = match &key {
-        ChatKey::Dm(user) => cfg
-            .dm_chat_settings(user)
-            .ok_or_else(|| anyhow::anyhow!("dm user {user} is not in scope under the dm policy"))?,
-        ChatKey::GuildChannel { .. } => cfg
-            .chat
-            .get(&key.to_string())
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("chat {key} has no [chat] entry in the config"))?,
-    };
+    let key = ChatKey::parse(chat)?;
+    let settings = resolve_chat_settings(&cfg, &key)?;
     let job = ChatJob { key, settings };
     let summary = run_chat_job(&client, &cfg, &job, &registry).await?;
     println!(
@@ -364,10 +362,7 @@ pub async fn run_now(config_arg: Option<&PathBuf>, chat: &str) -> anyhow::Result
 /// The service loop: resolve jobs, sleep until each chat's next fire time,
 /// run due jobs one at a time, and recompute. Runs forever.
 pub async fn run_loop(cfg: &Config, config_path: &std::path::Path) -> anyhow::Result<()> {
-    let mut client = Client::new(cfg.token()?)?;
-    if client.get_current_user().await?.is_none() {
-        anyhow::bail!("invalid token or authentication failed");
-    }
+    let client = crate::api::authed_client(cfg).await?;
     let registry = crate::progress::new_registry();
     tokio::spawn(crate::ipc::serve(
         std::sync::Arc::new(cfg.clone()),

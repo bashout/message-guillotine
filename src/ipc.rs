@@ -9,7 +9,6 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::api::Client;
 use crate::config::ChatKey;
 use crate::config::{self, Config};
 use crate::scheduler::{self, ChatJob};
@@ -23,26 +22,7 @@ pub fn secret_file() -> PathBuf {
     config::data_dir().join("ipc.secret")
 }
 
-fn write_private(path: &std::path::Path, contents: &str) -> anyhow::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?
-            .write_all(contents.as_bytes())?;
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, contents)?;
-    }
-    Ok(())
-}
-
-use std::io::{Read as _, Write as _};
+use std::io::Read as _;
 
 /// 32 random bytes hex-encoded; /dev/urandom on unix, time+pid hash elsewhere.
 fn random_secret() -> String {
@@ -82,7 +62,7 @@ fn load_or_create_secret() -> anyhow::Result<String> {
     }
     config::ensure_data_dir()?;
     let secret = random_secret();
-    write_private(&path, &format!("{secret}\n"))?;
+    config::write_file_private(&path, &format!("{secret}\n"))?;
     Ok(secret)
 }
 
@@ -138,7 +118,7 @@ pub async fn serve(
         }
     };
     let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
-    if let Err(e) = config::ensure_data_dir().and_then(|_| write_private(&port_file(), &format!("{port}\n")).map_err(std::io::Error::other)) {
+    if let Err(e) = config::ensure_data_dir().and_then(|_| config::write_file_private(&port_file(), &format!("{port}\n"))) {
         tracing::warn!(error = %e, "ipc: cannot write port file");
     }
     let secret = match load_or_create_secret() {
@@ -227,9 +207,10 @@ async fn handle(
                 tokio::spawn(async move {
                     let channel = channel_job;
                     let _guard = crate::deletion::deletion_lock().lock().await;
-                    let client = match crate::api::Client::new(cfg.token().unwrap_or("")) {
-                        Ok(mut c) => { let _ = c.get_current_user().await; c }
-                        Err(e) => { tracing::warn!(error = %e, "archive: client"); return; }
+                    // Auth failure must stop the archive, not run it unauthenticated.
+                    let client = match crate::api::authed_client(&cfg).await {
+                        Ok(c) => c,
+                        Err(e) => { tracing::warn!(error = %e, "archive: authentication failed"); return; }
                     };
                     let dir = cfg.resolve_archive_dir(None);
                     if let Err(e) = crate::archiver::archive_chat(&client, &channel, &channel, &dir).await {
@@ -300,17 +281,7 @@ fn read_last_runs() -> Value {
 /// Validate and build the job for a run-now request (no API calls).
 fn prepare_run_now(cfg: &Config, chat: &str, delete_all: bool) -> anyhow::Result<ChatJob> {
     let key = ChatKey::parse(chat)?;
-    let settings = match &key {
-        ChatKey::Dm(user) => cfg
-            .dm_chat_settings(user)
-            .ok_or_else(|| anyhow::anyhow!("dm user {user} is not in scope"))?,
-        ChatKey::GuildChannel { .. } => cfg
-            .chat
-            .get(&key.to_string())
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("chat {key} has no [chat] entry"))?,
-    };
-    let mut settings = settings;
+    let mut settings = scheduler::resolve_chat_settings(cfg, &key)?;
     if delete_all {
         settings.retention_days = 0; // cutoff = now: everything is deleted
     }
@@ -318,10 +289,7 @@ fn prepare_run_now(cfg: &Config, chat: &str, delete_all: bool) -> anyhow::Result
 }
 
 async fn run_now_via_daemon(cfg: &Config, job: ChatJob, registry: &crate::progress::SharedRegistry) -> anyhow::Result<crate::deletion::Summary> {
-    let mut client = Client::new(cfg.token()?)?;
-    if client.get_current_user().await?.is_none() {
-        anyhow::bail!("invalid token or authentication failed");
-    }
+    let client = crate::api::authed_client(cfg).await?;
     scheduler::run_chat_job(&client, cfg, &job, registry).await
 }
 

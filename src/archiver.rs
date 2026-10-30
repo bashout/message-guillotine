@@ -320,10 +320,7 @@ pub async fn archive(config_arg: Option<&std::path::PathBuf>, channel: &str) -> 
         anyhow::bail!("channel id must be numeric");
     }
     let (cfg, _path) = crate::load_config(config_arg)?;
-    let mut client = Client::new(cfg.token()?)?;
-    if client.get_current_user().await?.is_none() {
-        anyhow::bail!("invalid token or authentication failed");
-    }
+    let client = api::authed_client(&cfg).await?;
     let archive_dir = cfg.resolve_archive_dir(None);
     // Same single-run lock as deletions: two concurrent archives of one chat
     // would both append the same messages (duplicate records).

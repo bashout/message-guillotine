@@ -183,6 +183,30 @@ fn persist_session(channel_id: &str, state: &Session, aborted: bool, dry_run: bo
     }
 }
 
+/// Periodically persist the session mid-run (every 25 scanned messages) so
+/// a killed run can resume; never during a dry run.
+fn maybe_save_session(channel_id: &str, state: &Session, dry_run: bool, root: Option<&Path>) {
+    if !dry_run && state.scanned.is_multiple_of(25) {
+        save_session(channel_id, state, root);
+    }
+}
+
+/// Mirror the run counters into the live job registry, if one is attached.
+fn update_registry(
+    registry: Option<&crate::progress::SharedRegistry>,
+    label: &str,
+    state: &Session,
+) {
+    if let Some(reg) = registry {
+        reg.update(label, |p| {
+            p.scanned = state.scanned;
+            p.deleted = state.deleted;
+            p.failed = state.failed;
+            p.skipped = state.skipped;
+        });
+    }
+}
+
 /// Everything a deletion run needs beyond the client and channel.
 pub struct DeletionOptions<'a> {
     pub label: &'a str,
@@ -242,26 +266,15 @@ pub async fn run_deletion(
                 }
                 state.scanned += 1;
                 state.before_cursor = Some(msg.id.clone());
-                if let Some(reg) = registry {
-                    reg.update(label, |p| {
-                        p.scanned = state.scanned;
-                        p.deleted = state.deleted;
-                        p.failed = state.failed;
-                        p.skipped = state.skipped;
-                    });
-                }
+                update_registry(registry, label, &state);
 
                 if Some(&msg.author.id) != me_id.as_ref() {
-                    if !dry_run && state.scanned.is_multiple_of(25) {
-                        save_session(&channel_id, &state, root);
-                    }
+                    maybe_save_session(&channel_id, &state, dry_run, root);
                     continue;
                 }
                 if msg.is_system() {
                     state.skipped += 1;
-                    if !dry_run && state.scanned.is_multiple_of(25) {
-                        save_session(&channel_id, &state, root);
-                    }
+                    maybe_save_session(&channel_id, &state, dry_run, root);
                     continue;
                 }
                 if dry_run {
@@ -281,42 +294,22 @@ pub async fn run_deletion(
                         }
                         pending_pace = std::cmp::max(api::RATE_LIMIT_DELAY, wait);
                         state.deleted += 1;
-                        if let Some(reg) = registry {
-                            reg.update(label, |p| {
-                                p.deleted = state.deleted;
-                                p.failed = state.failed;
-                                p.skipped = state.skipped;
-                            });
-                        }
+                        update_registry(registry, label, &state);
                     }
                     DeleteOutcome::Skipped => {
                         state.skipped += 1;
-                        if let Some(reg) = registry {
-                            reg.update(label, |p| {
-                                p.skipped = state.skipped;
-                                p.deleted = state.deleted;
-                                p.failed = state.failed;
-                            });
-                        }
+                        update_registry(registry, label, &state);
                     }
                     DeleteOutcome::Failed => {
                         state.failed += 1;
-                        if let Some(reg) = registry {
-                            reg.update(label, |p| {
-                                p.failed = state.failed;
-                                p.deleted = state.deleted;
-                                p.skipped = state.skipped;
-                            });
-                        }
+                        update_registry(registry, label, &state);
                     }
                     other => {
                         aborted = Some(format!("{other:?}"));
                         return Ok(());
                     }
                 }
-                if !dry_run && state.scanned.is_multiple_of(25) {
-                    save_session(&channel_id, &state, root);
-                }
+                maybe_save_session(&channel_id, &state, dry_run, root);
             }
             cursor = page.last().map(|m| m.id.clone());
             if page.len() < 100 {
@@ -370,10 +363,7 @@ pub async fn scan(
         anyhow::bail!("channel id must be numeric");
     }
     let (cfg, _path) = crate::load_config(config_arg)?;
-    let mut client = Client::new(cfg.token()?)?;
-    if client.get_current_user().await?.is_none() {
-        anyhow::bail!("invalid token or authentication failed");
-    }
+    let client = api::authed_client(&cfg).await?;
     let cutoff = retention_days.map(|d| {
         let d = d.min(36_500);
         Utc::now() - chrono::Duration::days(d as i64)
