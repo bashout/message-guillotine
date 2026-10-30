@@ -1,99 +1,183 @@
-name: Release
+name: Release (Rust)
 
 on:
   push:
     tags:
-      - "v*"
+      - "v2.*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  test:
-    name: Test
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 0  # full history: setuptools-scm derives the version from tags
-
-      - name: Set up uv
-        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
-        with:
-          enable-cache: true
-
-      - name: Install dependencies
-        run: uv sync --extra dev --locked --python 3.14
-
-      - name: Run tests
-        run: uv run --no-sync pytest
-
   build:
-    name: Build ${{ matrix.os }}
+    name: Build ${{ matrix.artifact }}
     runs-on: ${{ matrix.os }}
-    needs: test
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: windows-latest
-            artifact: message-guillotine-windows.exe
-            rename_ext: .exe
-          - os: macos-latest
-            artifact: message-guillotine-macos-arm64
-            rename_ext: ""
-          - os: macos-15-intel
-            artifact: message-guillotine-macos-x86_64
-            rename_ext: ""
           - os: ubuntu-latest
-            artifact: message-guillotine-linux
-            rename_ext: ""
-
+            target: x86_64-unknown-linux-gnu
+            musl_target: x86_64-unknown-linux-musl
+            arch: x86_64
+            artifact: guillotine-linux-x86_64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            musl_target: aarch64-unknown-linux-musl
+            arch: aarch64
+            artifact: guillotine-linux-aarch64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: guillotine-macos-aarch64
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            artifact: guillotine-macos-x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: guillotine-windows-x86_64
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
-          fetch-depth: 0  # full history: setuptools-scm derives the version from tags
+          targets: ${{ matrix.target }}
 
-      - name: Set up uv
-        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
-        with:
-          enable-cache: true
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
-      - name: Install dependencies
-        run: uv sync --extra build --locked --python 3.14
+      # --- Linux: GUI build (dynamic, packaged as AppImage) + static headless ---
+      - name: Install build deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxdo-dev libayatana-appindicator3-dev pkg-config libgtk-3-dev musl-tools patchelf
 
-      - name: Build executable
-        run: uv run --no-sync python build_exe.py
+      - name: Add musl target (Linux)
+        if: runner.os == 'Linux'
+        run: rustup target add ${{ matrix.musl_target }}
 
-      - name: Rename binary
+      - name: Build GUI binary (Linux)
+        if: runner.os == 'Linux'
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build fully static headless binary (Linux)
+        if: runner.os == 'Linux'
+        run: cargo build --release --no-default-features --target ${{ matrix.musl_target }}
+
+      - name: Verify static binary is not dynamically linked (Linux)
+        if: runner.os == 'Linux'
+        run: file "target/${{ matrix.musl_target }}/release/guillotine" | grep -q 'statically linked'
+
+      - name: Smoke test static headless binary (Linux)
+        if: runner.os == 'Linux'
+        run: "target/${{ matrix.musl_target }}/release/guillotine" --help > /dev/null
+
+      - name: Package static headless CLI as tar.gz (Linux)
+        if: runner.os == 'Linux'
         shell: bash
         run: |
-          cd dist
-          mv message-guillotine${{ matrix.rename_ext }} ${{ matrix.artifact }}
+          mkdir -p dist
+          tar -czf "dist/${{ matrix.artifact }}-cli-static.tar.gz" -C "target/${{ matrix.musl_target }}/release" guillotine
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v7
+      - name: Build AppImage with bundled shared libs (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -e
+          mkdir -p dist AppDir/usr/bin AppDir/usr/lib
+          cp "target/${{ matrix.target }}/release/guillotine" AppDir/usr/bin/
+          # Bundle every shared library the GUI binary needs so the AppImage
+          # runs on a stock distro with no extra packages installed.
+          ldd AppDir/usr/bin/guillotine | awk '/=> \//{print $3} /^\//{print $1}' | sort -u | xargs -r cp -L -t AppDir/usr/lib/
+          patchelf --set-rpath '$ORIGIN/../lib' AppDir/usr/bin/guillotine
+          cat > AppDir/guillotine.desktop <<'EOF'
+          [Desktop Entry]
+          Name=Guillotine
+          Exec=guillotine
+          Icon=guillotine
+          Type=Application
+          Categories=Utility;
+          EOF
+          cp branding/icon-transparent.png AppDir/guillotine.png
+          curl -sSL -o appimagetool "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-${{ matrix.arch }}.AppImage"
+          chmod +x appimagetool
+          ./appimagetool --appimage-extract-and-run AppDir "dist/${{ matrix.artifact }}.AppImage"
+
+      - name: Smoke test AppImage (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: "dist/${{ matrix.artifact }}.AppImage" --appimage-extract-and-run --help > /dev/null
+
+      # --- macOS ---
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          rustup target add ${{ matrix.target }}
+          cargo build --release --target ${{ matrix.target }}
+
+      - name: Smoke test (macOS)
+        if: runner.os == 'macOS'
+        run: "target/${{ matrix.target }}/release/guillotine" --help > /dev/null
+
+      - name: Package zip (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          mkdir -p dist
+          zip -q "dist/${{ matrix.artifact }}.zip" "target/${{ matrix.target }}/release/guillotine"
+
+      # --- Windows: static CRT so no Visual C++ Redistributable is required ---
+      - name: Build with static CRT (Windows)
+        if: runner.os == 'Windows'
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Smoke test (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: "target\${{ matrix.target }}\release\guillotine.exe" --help | Out-Null
+
+      - name: Package zip (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path "target\${{ matrix.target }}\release\guillotine.exe" -DestinationPath "dist\${{ matrix.artifact }}.zip" -Force
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ matrix.artifact }}
-          path: dist/${{ matrix.artifact }}
+          path: dist/*
+          if-no-files-found: error
 
   release:
-    name: Create Release
-    needs: [test, build]
+    name: Create GitHub Release
+    needs: [build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: artifacts
           merge-multiple: true
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
           generate_release_notes: true
           files: artifacts/*

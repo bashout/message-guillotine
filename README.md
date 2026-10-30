@@ -1,63 +1,97 @@
-# Message Guillotine
+# Message Guillotine (V2 — Rust)
 
 ![Message Guillotine](branding/message_guillotine_banner.jpg)
 
-Bulk delete and archive your DM and server messages via the platform's unofficial user API (self-bot — violates the platform ToS, use at your own risk).
+Scheduled, service-style bulk delete and archive of your own chat messages.
+This is the Rust V2 rewrite: configure your chats once, then the tool runs on
+a schedule as a background service instead of driving an interactive menu.
+
+WARNING: self-bots violate the platform's Terms of Service. Use at your own
+risk.
 
 ## Features
 
 | Feature | Description |
 |---------|-------------|
-| DM deletion | Delete your own DM messages, filtered by user and time range; the channel is scanned newest-first and each of your messages is deleted as it is found, with live progress and a remaining-time estimate |
-| Server deletion | Delete your own messages from a server channel, filtered by time range, with the same streaming scan |
-| Rate limiting | 24 messages/minute; the server's rate-limit headers are honored when the bucket is exhausted |
-| System messages | Calls, pins and other system messages are filtered out before any delete is attempted — a stack of them never burns rate-limit budget |
-| Archiving | Save a full chat — both sides, oldest first — as `messages.jsonl` + `attachments/`, streamed page by page |
-| Resume | Interrupted archives and deletion runs pick up where they stopped: archives via per-channel cursors, deletions via a resumable per-channel session (one keypress, no rescanning); partial archive writes are cleaned up automatically |
-| Dry run | `guillotine.py --dry-run` reports what would be deleted (count + message samples) without deleting |
-| Time filters | Absolute dates (`YYYY-MM-DD [HH:MM[:SS]]`) or relative: `7d`, `2w`, `today`, `yesterday` |
-| Merging | Archiving a chat that has no archive of its own can be merged into an existing archive folder; both channels then resume and view as one archive |
-| Attachments | Downloaded with atomic writes and retried on resume; runs that end early are flagged incomplete in `status.json` |
-| Viewer | Local web UI to browse archives: search, date/attachment/link filters, reply threading, media gallery, stats — launched from menu option `[5]`, `archive-viewer`, or the CLI, opens your browser automatically (`archive-viewer --no-browser` to skip) |
-| Config | Archive folder set via `guillotine.py --archive-dir FOLDER`, `DM_ARCHIVE_DIR`, or menu option `[4]`; per-OS default otherwise |
+| Per-chat schedules | Each chat (DM user or guild channel) gets its own `daily` / `weekly` / `monthly` schedule (optional `at HH:MM`) |
+| Retention window | `retention_days` — the most recent N days of your messages are kept; only older messages are deleted |
+| Archive before delete | Optional `archive_before_delete` flag: the chat is archived (appending to its existing archive) before deletion runs |
+| Single-deletion lock | Only one deletion runs at a time, ever — a process-wide lock, enforced across processes via loopback IPC between the tray/CLI and the daemon |
+| Tray GUI | Desktop tray app with status, run-now, settings, and logs |
+| Viewer | `guillotine viewer` serves a local web UI to browse archives (search, filters, threading, media gallery, stats) |
+| Service autostart | Native autostart: systemd `--user` on Linux, launchd LaunchAgent on macOS, registry Run key on Windows |
+| Rate limiting | Paced at ~24 deletes/min; the platform's 429 `Retry-After` is honored |
+| Resume | Interrupted deletion runs resume from per-channel session files; archives resume via per-channel cursors |
+| Dry run | `guillotine scan CHANNEL_ID --retention-days 7` reports what a deletion run would delete, without deleting |
+| DM scope | Nominate or exclude users only — there is no "all DMs" mode; scheduled deletion only touches configured chats |
 
-## Development
+Archives are written in the V1-compatible on-disk format (`meta.json`,
+`messages.jsonl`, `manifest.jsonl`, `attachments/`, `status.json`), so old
+V1 archives remain fully readable.
 
-Requires Python 3.8+. `requests` is the only runtime dependency.
+## Quickstart
+
+Everything lives in the crate at the repo root:
 
 ```bash
 git clone https://github.com/bashout/message-guillotine.git
 cd message-guillotine
+cargo build --release            # add --no-default-features on headless Linux
 
-# Run with uv (pinned deps from uv.lock)
-uv run guillotine.py                # deleter / archiver (--archive-dir FOLDER to set the archival folder)
-uv run archive_viewer.py            # archive viewer (localhost web UI; --host/--port/--no-browser)
+# the binary is target/release/guillotine
+./target/release/guillotine config init      # writes an example config (0600) to the per-OS config dir
+./target/release/guillotine config validate  # check it and print the resolved chats
+# edit the config: token (or GUILLOTINE_TOKEN env var), [dm] policy, [chat.*] entries
 
-# Or install
-pip install .
-message-guillotine
-archive-viewer
+./target/release/guillotine service install  # register native autostart
+./target/release/guillotine service status
+./target/release/guillotine gui              # tray app (desktop builds)
+./target/release/guillotine run-now dm:USER_ID          # manual run for one chat (serialized with scheduled runs)
+./target/release/guillotine scan CHANNEL_ID --retention-days 7   # dry-run report
+./target/release/guillotine archive CHANNEL_ID              # one-shot archive
+./target/release/guillotine viewer [ARCHIVES_DIR] --host 127.0.0.1 --port 8765   # browse archives (--no-browser to skip opening)
 ```
 
-The tool prompts for your user token on start. Archives are written to your
-archive folder (one folder per chat); the viewer serves that folder.
+## Configuration
 
-The package version is derived from git tags via setuptools-scm: tag
-`vX.Y[.Z]` and the release builds that version — no `pyproject.toml` edit
-needed. Commits past a tag build as `X.Y.devN` development versions.
+Config file lives in the per-OS config dir as `config.toml` (override with
+`--config` or the `GUILLOTINE_CONFIG` env var):
 
-Run the tests (config resolution, archive format, archiver resume/retry,
-API paging, deletion streaming/resume, viewer queries, and the HTTP server
-end to end):
+```toml
+token = "..."                    # or GUILLOTINE_TOKEN env var
+[dm]
+policy = "exclude"               # "nominate" | "exclude" — no "all" mode
+users = ["USER_ID"]
+default_schedule = "weekly"
+default_retention_days = 30
+default_archive_before_delete = true
+
+[chat."dm:333"]
+schedule = "monthly"             # delete monthly, retain 7 days
+retention_days = 7
+archive_before_delete = true
+
+[chat."guild:444/channel:555"]
+schedule = "daily"
+retention_days = 30
+archive_before_delete = false
+```
+
+## Development
+
+All development happens in the crate at the repo root:
 
 ```bash
-uv sync --extra dev --locked
-uv run pytest
+cargo test --release             # unit tests — must pass
+cargo clippy --all-targets       # must be 0 warnings
+cargo build --no-default-features  # headless build (no tray deps) must compile
 ```
 
-Build a standalone binary (PyInstaller; includes the viewer):
+See [AGENTS.md](AGENTS.md) for the hard rules (token handling, the
+single-deletion lock, fail-safe deletion, atomic writes, loopback-only IPC,
+the frozen archive format) and code conventions.
 
-```bash
-uv sync --extra build --locked
-uv run python build_exe.py
-```
+## Versioning
+
+The V2 line is cut from git tags `v2.x.y` on `main`; the crate version is set
+from that tag at release time.
