@@ -40,5 +40,9 @@ axum = { version = "0.8", default-features = false, features = ["http1", "tokio"
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = { version = "0.18", optional = true }
 
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+tokio = { version = "1", features = ["test-util"] }
+
 [profile.release]
 opt-level = 2

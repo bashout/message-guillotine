@@ -178,16 +178,35 @@ pub enum DeleteOutcome {
     Network,
 }
 
+/// 2 GiB guard on a single attachment download.
+pub const MAX_ATTACHMENT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
 pub struct Client {
     http: reqwest::Client,
     /// Separate client for CDN attachment downloads: keeps TLS connections
     /// alive across many files and keeps the auth token off the CDN.
     download: reqwest::Client,
+    /// Base of the API (no trailing slash); overridable in tests to point at
+    /// a mock server.
+    base_url: String,
+    max_attachment_bytes: u64,
     pub current_user: Option<User>,
 }
 
 impl Client {
     pub fn new(token: &str) -> anyhow::Result<Self> {
+        Self::build(token, API_BASE, true)
+    }
+
+    /// Test-only seam: build a client against a mock server's base URL, with
+    /// no I/O timeouts (tests that pause tokio time would otherwise trip the
+    /// read timeout spuriously while the mock responds).
+    #[cfg(test)]
+    pub(crate) fn with_base_url(token: &str, base_url: &str) -> anyhow::Result<Self> {
+        Self::build(token, base_url, false)
+    }
+
+    fn build(token: &str, base_url: &str, with_timeouts: bool) -> anyhow::Result<Self> {
         let mut headers = HeaderMap::new();
         headers.insert(
             reqwest::header::AUTHORIZATION,
@@ -204,36 +223,47 @@ impl Client {
         headers.insert("X-Discord-Locale", HeaderValue::from_static("en-US"));
         headers.insert("X-Super-Properties", super_properties_header());
 
-        let http = reqwest::Client::builder()
-            .default_headers(headers)
-            .connect_timeout(CONNECT_TIMEOUT)
-            .read_timeout(READ_TIMEOUT)
-            .build()?;
-
-        let download = reqwest::Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .default_headers({
-                let mut h = HeaderMap::new();
-                h.insert(
-                    reqwest::header::USER_AGENT,
-                    HeaderValue::from_static(BROWSER_USER_AGENT),
-                );
-                h
-            })
-            .read_timeout(READ_TIMEOUT)
-            .build()?;
+        let mut http_builder = reqwest::Client::builder().default_headers(headers);
+        let mut download_builder = reqwest::Client::builder().default_headers({
+            let mut h = HeaderMap::new();
+            h.insert(
+                reqwest::header::USER_AGENT,
+                HeaderValue::from_static(BROWSER_USER_AGENT),
+            );
+            h
+        });
+        if with_timeouts {
+            http_builder = http_builder
+                .connect_timeout(CONNECT_TIMEOUT)
+                .read_timeout(READ_TIMEOUT);
+            download_builder = download_builder
+                .connect_timeout(CONNECT_TIMEOUT)
+                .read_timeout(READ_TIMEOUT);
+        }
+        let http = http_builder.build()?;
+        let download = download_builder.build()?;
 
         Ok(Client {
             http,
             download,
+            base_url: base_url.trim_end_matches('/').to_string(),
+            max_attachment_bytes: MAX_ATTACHMENT_BYTES,
             current_user: None,
         })
+    }
+
+    /// Test-only: shrink the attachment size cap so the 2 GiB guard can be
+    /// exercised without transferring gigabytes.
+    #[cfg(test)]
+    pub(crate) fn with_max_attachment_bytes(mut self, max: u64) -> Self {
+        self.max_attachment_bytes = max;
+        self
     }
 
     pub async fn get_current_user(&mut self) -> anyhow::Result<Option<User>> {
         let resp = self
             .http
-            .get(format!("{API_BASE}/users/@me"))
+            .get(format!("{}/users/@me", self.base_url))
             .send()
             .await?;
         if resp.status() == 200 {
@@ -249,7 +279,7 @@ impl Client {
     pub async fn get_dm_channels(&self) -> anyhow::Result<Vec<DmChannel>> {
         let resp = self
             .http
-            .get(format!("{API_BASE}/users/@me/channels"))
+            .get(format!("{}/users/@me/channels", self.base_url))
             .send()
             .await?;
         Ok(resp.json().await?)
@@ -258,7 +288,7 @@ impl Client {
     pub async fn get_guilds(&self) -> anyhow::Result<Vec<Guild>> {
         let resp = self
             .http
-            .get(format!("{API_BASE}/users/@me/guilds"))
+            .get(format!("{}/users/@me/guilds", self.base_url))
             .send()
             .await?;
         Ok(resp.json().await?)
@@ -268,7 +298,7 @@ impl Client {
     pub async fn get_guild_channels(&self, guild_id: &str) -> anyhow::Result<Vec<GuildChannel>> {
         let resp = self
             .http
-            .get(format!("{API_BASE}/guilds/{guild_id}/channels"))
+            .get(format!("{}/guilds/{guild_id}/channels", self.base_url))
             .send()
             .await?;
         let channels: Vec<GuildChannel> = resp.json().await?;
@@ -324,7 +354,7 @@ impl Client {
         }
         let resp = self
             .fetch_page_with_retries(
-                &format!("{API_BASE}/channels/{channel_id}/messages"),
+                &format!("{}/channels/{channel_id}/messages", self.base_url),
                 &query,
             )
             .await?;
@@ -348,7 +378,7 @@ impl Client {
         ];
         let resp = self
             .fetch_page_with_retries(
-                &format!("{API_BASE}/channels/{channel_id}/messages"),
+                &format!("{}/channels/{channel_id}/messages", self.base_url),
                 &query,
             )
             .await?;
@@ -410,7 +440,7 @@ impl Client {
             let resp = match self
                 .http
                 .delete(format!(
-                    "{API_BASE}/channels/{channel_id}/messages/{message_id}"
+                    "{}/channels/{channel_id}/messages/{message_id}", self.base_url
                 ))
                 .send()
                 .await
@@ -483,34 +513,45 @@ impl Client {
     }
 
     /// Stream an attachment to dest_path via a .part file, renamed on
-    /// completion. Returns bytes written, or None on failure.
+    /// completion. Returns bytes written, or None on failure — in which case
+    /// neither dest nor the .part file is left behind.
     pub async fn download_attachment(&self, url: &str, dest: &Path) -> Option<u64> {
         let tmp = dest.with_extension(format!(
             "{}.part",
             dest.extension().and_then(|e| e.to_str()).unwrap_or("")
         ));
+        match self.stream_attachment(url, &tmp).await {
+            Some(size) => {
+                tokio::fs::rename(&tmp, dest).await.ok()?;
+                Some(size)
+            }
+            None => {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                None
+            }
+        }
+    }
+
+    async fn stream_attachment(&self, url: &str, tmp: &Path) -> Option<u64> {
         let resp = self.download.get(url).send().await.ok()?;
         if resp.status() != 200 {
             return None;
         }
-        let mut file = tokio::fs::File::create(&tmp).await.ok()?;
+        let mut file = tokio::fs::File::create(tmp).await.ok()?;
         use tokio::io::AsyncWriteExt;
         let mut size = 0u64;
         let mut stream = resp.bytes_stream();
         use futures::StreamExt;
-        const MAX_ATTACHMENT_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB guard
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.ok()?;
             size += chunk.len() as u64;
-            if size > MAX_ATTACHMENT_BYTES {
-                let _ = tokio::fs::remove_file(&tmp).await;
-                return None;
+            if size > self.max_attachment_bytes {
+                return None; // over the guard; caller removes the .part
             }
             file.write_all(&chunk).await.ok()?;
         }
         file.flush().await.ok()?;
         drop(file);
-        tokio::fs::rename(&tmp, dest).await.ok()?;
         Some(size)
     }
 }
@@ -641,5 +682,329 @@ mod tests {
         assert!(!msg.is_system());
         msg.r#type = 3; // call
         assert!(msg.is_system());
+    }
+
+    // ------------------------------------------------------------------
+    // Behavioral tests against a loopback mock HTTP server (no real network;
+    // tokio time is paused so retry sleeps are instant).
+    // ------------------------------------------------------------------
+
+    use crate::testutil::{MockAction, MockServer};
+
+    fn mock_client(server: &MockServer) -> Client {
+        let mut client = Client::with_base_url("dummy-token", &server.url()).unwrap();
+        client.current_user = Some(User {
+            id: "7".into(),
+            username: "me".into(),
+            discriminator: "0".into(),
+            global_name: None,
+            bot: false,
+        });
+        client
+    }
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "guillotine-api-test-{}-{tag}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delete_204_is_deleted_with_no_wait() {
+        let server = MockServer::start(vec![MockAction::status(204)]).await;
+        let client = mock_client(&server);
+        assert_eq!(
+            client.delete_message_with_retries("42", "1").await,
+            DeleteOutcome::Deleted(Duration::ZERO)
+        );
+        assert_eq!(server.request_count(), 1);
+        let req = &server.requests()[0];
+        assert_eq!(req.method, "DELETE");
+        assert_eq!(req.path, "/channels/42/messages/1");
+        assert_eq!(req.header("authorization"), Some("dummy-token"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delete_200_with_exhausted_bucket_reports_reset_after_wait() {
+        let server = MockServer::start(vec![MockAction::with_headers(
+            200,
+            &[
+                ("X-RateLimit-Remaining", "0"),
+                ("X-RateLimit-Reset-After", "12"),
+            ],
+        )])
+        .await;
+        let client = mock_client(&server);
+        assert_eq!(
+            client.delete_message_with_retries("42", "1").await,
+            DeleteOutcome::Deleted(Duration::from_secs(12))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delete_429_honors_retry_after_then_succeeds() {
+        let server = MockServer::start(vec![
+            MockAction::with_headers(429, &[("Retry-After", "7")]),
+            MockAction::status(204),
+        ])
+        .await;
+        let client = mock_client(&server);
+        assert_eq!(
+            client.delete_message_with_retries("42", "1").await,
+            DeleteOutcome::Deleted(Duration::ZERO)
+        );
+        // the same message was retried on a second request
+        assert_eq!(server.request_count(), 2);
+        assert!(server
+            .requests()
+            .iter()
+            .all(|r| r.path == "/channels/42/messages/1"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delete_429_exhausts_retries_as_rate_limited() {
+        let server = MockServer::start(vec![
+            MockAction::with_headers(429, &[("Retry-After", "2")]),
+            MockAction::with_headers(429, &[("Retry-After", "2")]),
+            MockAction::with_headers(429, &[("Retry-After", "2")]),
+        ])
+        .await;
+        let client = mock_client(&server);
+        assert_eq!(
+            client.delete_message_with_retries("42", "1").await,
+            DeleteOutcome::RateLimited
+        );
+        assert_eq!(server.request_count(), DELETE_RETRIES as usize);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delete_401_and_403_abort_as_auth() {
+        for (status, body) in [
+            (401, serde_json::json!({"message": "401: Unauthorized"})),
+            (
+                403,
+                serde_json::json!({"message": "Missing Permissions", "code": 50013}),
+            ),
+        ] {
+            let server = MockServer::start(vec![MockAction::with_json_body(
+                status,
+                &[("content-type", "application/json")],
+                body,
+            )])
+            .await;
+            let client = mock_client(&server);
+            assert_eq!(
+                client.delete_message_with_retries("42", "1").await,
+                DeleteOutcome::Auth,
+                "status {status}"
+            );
+            assert_eq!(server.request_count(), 1, "no retry on auth errors");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delete_403_system_message_code_skips() {
+        let server = MockServer::start(vec![MockAction::with_json_body(
+            403,
+            &[("content-type", "application/json")],
+            serde_json::json!({"message": "Cannot execute action on a system message", "code": 50021}),
+        )])
+        .await;
+        let client = mock_client(&server);
+        assert_eq!(
+            client.delete_message_with_retries("42", "1").await,
+            DeleteOutcome::Skipped
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delete_unexpected_status_fails_message() {
+        let server = MockServer::start(vec![MockAction::status(500)]).await;
+        let client = mock_client(&server);
+        assert_eq!(
+            client.delete_message_with_retries("42", "1").await,
+            DeleteOutcome::Failed
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delete_404_without_prior_network_error_is_failed() {
+        let server = MockServer::start(vec![MockAction::status(404)]).await;
+        let client = mock_client(&server);
+        assert_eq!(
+            client.delete_message_with_retries("42", "1").await,
+            DeleteOutcome::Failed
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delete_404_after_network_error_counts_as_deleted() {
+        // The first attempt's delete reached the server; only its reply was
+        // lost. The retry's 404 means the message is already gone.
+        let server = MockServer::start(vec![MockAction::Drop, MockAction::status(404)]).await;
+        let client = mock_client(&server);
+        assert_eq!(
+            client.delete_message_with_retries("42", "1").await,
+            DeleteOutcome::Deleted(Duration::ZERO)
+        );
+        assert_eq!(server.request_count(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delete_persistent_network_errors_abort_as_network() {
+        let server = MockServer::start(vec![MockAction::Drop, MockAction::Drop, MockAction::Drop]).await;
+        let client = mock_client(&server);
+        assert_eq!(
+            client.delete_message_with_retries("42", "1").await,
+            DeleteOutcome::Network
+        );
+        assert_eq!(server.request_count(), DELETE_RETRIES as usize);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fetch_page_fails_fast_on_401_403_404() {
+        for status in [401u16, 403, 404] {
+            let server = MockServer::start(vec![MockAction::status(status)]).await;
+            let client = mock_client(&server);
+            let err = client
+                .history_page_before("42", None)
+                .await
+                .expect_err("must fail");
+            assert!(err.to_string().contains(&format!("HTTP {status}")), "{err}");
+            assert_eq!(server.request_count(), 1, "no retry on {status}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fetch_page_retries_429_then_succeeds() {
+        let server = MockServer::start(vec![
+            MockAction::with_headers(429, &[("Retry-After", "1")]),
+            MockAction::ok_json(serde_json::json!([])),
+        ])
+        .await;
+        let client = mock_client(&server);
+        let page = client.history_page_before("42", None).await.unwrap();
+        assert!(page.is_empty());
+        assert_eq!(server.request_count(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fetch_page_retries_network_error_then_succeeds() {
+        let server = MockServer::start(vec![
+            MockAction::Drop,
+            MockAction::ok_json(serde_json::json!([])),
+        ])
+        .await;
+        let client = mock_client(&server);
+        assert!(client.history_page_before("42", None).await.is_ok());
+        assert_eq!(server.request_count(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fetch_page_budget_exhaustion_is_history_fetch_error() {
+        let server = MockServer::start(vec![
+            MockAction::status(500),
+            MockAction::status(500),
+            MockAction::status(500),
+            MockAction::status(500),
+            MockAction::status(500),
+        ])
+        .await;
+        let client = mock_client(&server);
+        let err = client
+            .history_page_before("42", None)
+            .await
+            .expect_err("must fail after retries");
+        assert!(err.to_string().contains("HTTP 500"), "{err}");
+        assert_eq!(server.request_count(), FETCH_RETRIES as usize);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fetch_page_returns_messages_newest_first() {
+        let page = serde_json::json!([
+            {"id": "3", "timestamp": "2026-01-03T00:00:00+00:00", "author": {"id": "7"}},
+            {"id": "5", "timestamp": "2026-01-05T00:00:00+00:00", "author": {"id": "7"}},
+            {"id": "4", "timestamp": "2026-01-04T00:00:00+00:00", "author": {"id": "7"}}
+        ]);
+        let server = MockServer::start(vec![MockAction::ok_json(page)]).await;
+        let client = mock_client(&server);
+        let msgs = client.history_page_before("42", None).await.unwrap();
+        let ids: Vec<&str> = msgs.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["5", "4", "3"]);
+        assert_eq!(server.requests()[0].path, "/channels/42/messages?limit=100");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn download_attachment_streams_to_part_then_renames() {
+        let dir = temp_dir("dl-ok");
+        let server = MockServer::start(vec![MockAction::bytes(b"abcd")]).await;
+        let client = mock_client(&server);
+        let dest = dir.join("0001_1_pic.png");
+        assert_eq!(
+            client.download_attachment(&format!("{}/cdn/x", server.url()), &dest).await,
+            Some(4)
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), b"abcd");
+        assert!(!dir.join("0001_1_pic.png.part").exists(), "renamed, not left behind");
+        // the CDN request carries no Authorization header
+        let req = &server.requests()[0];
+        assert_eq!(req.header("authorization"), None);
+        assert!(req.header("user-agent").is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn download_attachment_non_200_leaves_no_file() {
+        let dir = temp_dir("dl-404");
+        let server = MockServer::start(vec![MockAction::status(404)]).await;
+        let client = mock_client(&server);
+        let dest = dir.join("0001_1_pic.png");
+        assert_eq!(
+            client.download_attachment(&format!("{}/cdn/x", server.url()), &dest).await,
+            None
+        );
+        assert!(!dest.exists());
+        assert!(!dir.join("0001_1_pic.png.part").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn download_attachment_mid_stream_failure_leaves_no_part() {
+        let dir = temp_dir("dl-mid");
+        let server = MockServer::start(vec![MockAction::PartialThenDrop {
+            status: 200,
+            headers: vec![("content-type".to_string(), "application/octet-stream".to_string())],
+            prefix: b"partial".to_vec(),
+            declared_len: 1024,
+        }])
+        .await;
+        let client = mock_client(&server);
+        let dest = dir.join("0001_1_pic.png");
+        assert_eq!(
+            client.download_attachment(&format!("{}/cdn/x", server.url()), &dest).await,
+            None
+        );
+        assert!(!dest.exists());
+        assert!(!dir.join("0001_1_pic.png.part").exists(), "no .part left after mid-stream failure");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn download_attachment_over_size_cap_leaves_no_file() {
+        let dir = temp_dir("dl-cap");
+        let server = MockServer::start(vec![MockAction::bytes(&[0u8; 32])]).await;
+        let client = mock_client(&server).with_max_attachment_bytes(10);
+        let dest = dir.join("big.bin");
+        assert_eq!(
+            client.download_attachment(&format!("{}/cdn/big", server.url()), &dest).await,
+            None
+        );
+        assert!(!dest.exists());
+        assert!(!dir.join("big.bin.part").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

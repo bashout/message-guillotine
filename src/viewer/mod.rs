@@ -176,6 +176,30 @@ fn open_browser(url: &str) {
     }
 }
 
+/// The viewer's axum router: routes + security headers + host guard. Split
+/// out of `run` so tests can drive it with `tower::ServiceExt::oneshot`.
+pub(crate) fn build_app(library: Arc<Library>) -> Router {
+    Router::new()
+        .route("/", axum::routing::get(index_html))
+        .route("/app.js", axum::routing::get(app_js))
+        .route("/style.css", axum::routing::get(style_css))
+        .route("/api/archives", axum::routing::get(api_archives))
+        .route("/api/select", axum::routing::get(api_select))
+        .route("/api/meta", axum::routing::get(api_meta))
+        .route("/api/messages", axum::routing::get(api_messages))
+        .route("/api/resolve", axum::routing::get(api_resolve))
+        .route("/api/search", axum::routing::get(api_search))
+        .route("/api/attachment-years", axum::routing::get(api_attachment_years))
+        .route("/api/attachments", axum::routing::get(api_attachments))
+        .route("/api/stats", axum::routing::get(api_stats))
+        .route("/media/{*name}", axum::routing::get(media))
+        // security_headers outermost so every response — including the host
+        // guard's 403 — carries the baseline headers.
+        .layer(middleware::from_fn(host_guard))
+        .layer(middleware::from_fn(security_headers))
+        .with_state(library)
+}
+
 /// Run the V2 archive viewer server. `archives_dir` may be the archival
 /// folder or a single archive folder (served with its siblings); when None
 /// the folder is resolved like the archiver does (DM_ARCHIVE_DIR, config,
@@ -234,23 +258,7 @@ pub async fn run(
         }
     }
 
-    let app = Router::new()
-        .route("/", axum::routing::get(index_html))
-        .route("/app.js", axum::routing::get(app_js))
-        .route("/style.css", axum::routing::get(style_css))
-        .route("/api/archives", axum::routing::get(api_archives))
-        .route("/api/select", axum::routing::get(api_select))
-        .route("/api/meta", axum::routing::get(api_meta))
-        .route("/api/messages", axum::routing::get(api_messages))
-        .route("/api/resolve", axum::routing::get(api_resolve))
-        .route("/api/search", axum::routing::get(api_search))
-        .route("/api/attachment-years", axum::routing::get(api_attachment_years))
-        .route("/api/attachments", axum::routing::get(api_attachments))
-        .route("/api/stats", axum::routing::get(api_stats))
-        .route("/media/{*name}", axum::routing::get(media))
-        .layer(middleware::from_fn(security_headers))
-        .layer(middleware::from_fn(host_guard))
-        .with_state(library.clone());
+    let app = build_app(library.clone());
 
     if !host.is_empty() && host != "127.0.0.1" && host != "localhost" && host != "::1" && host != "[::1]" {
         eprintln!(
@@ -761,4 +769,178 @@ mod tests {
         assert_eq!(m["last_timestamp"], json!("2024-06-20T08:00:00.000000+00:00"));
     }
 
+    // ------------------------------------------------------------------
+    // HTTP handler tests: the real router driven via tower oneshot.
+    // ------------------------------------------------------------------
+
+    fn http_fixture() -> (PathBuf, Router) {
+        let root = std::env::temp_dir().join(format!(
+            "guillotine-viewer-http-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let archive_dir = root.join("chat-one");
+        std::fs::create_dir_all(archive_dir.join("attachments")).unwrap();
+        std::fs::write(
+            archive_dir.join("meta.json"),
+            r#"{"chat": "Chat One", "channel_id": "111"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            archive_dir.join("messages.jsonl"),
+            format!("{}\n", serde_json::to_string(&mk_msg("100", "alice", "2024-01-01T10:00:00.000000+00:00", "hi")).unwrap()),
+        )
+        .unwrap();
+        std::fs::write(archive_dir.join("manifest.jsonl"), "").unwrap();
+        // 8-byte "png" so range math is easy to assert
+        std::fs::write(archive_dir.join("attachments/0001_100_pic.png"), b"\x89PNGdata").unwrap();
+        std::fs::write(archive_dir.join("attachments/evil.svg"), b"<svg xmlns='http://www.w3.org/2000/svg'><script>1</script></svg>").unwrap();
+        let library = Arc::new(Library::new(root.clone()));
+        library.select("chat-one");
+        let app = build_app(library);
+        (root, app)
+    }
+
+    async fn http_get(app: &Router, uri: &str, extra: &[(&str, &str)]) -> axum::response::Response {
+        use tower::ServiceExt;
+        let mut builder = axum::http::Request::builder().uri(uri);
+        // Builder::header appends, so only set the default Host when the
+        // caller did not provide one.
+        if !extra.iter().any(|(k, _)| k.eq_ignore_ascii_case("host")) {
+            builder = builder.header(axum::http::header::HOST, "127.0.0.1");
+        }
+        for (k, v) in extra {
+            builder = builder.header(*k, *v);
+        }
+        app.clone()
+            .oneshot(builder.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    async fn body_of(resp: axum::response::Response) -> axum::body::Bytes {
+        axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
+            .await
+            .unwrap()
+    }
+
+    fn assert_security_headers(resp: &axum::response::Response) {
+        let h = resp.headers();
+        assert_eq!(h.get("x-content-type-options").unwrap(), "nosniff");
+        assert_eq!(h.get("x-frame-options").unwrap(), "DENY");
+        assert!(h.get("content-security-policy").unwrap().to_str().unwrap().contains("default-src 'self'"));
+    }
+
+    #[tokio::test]
+    async fn http_media_full_response_is_inline_with_security_headers() {
+        let (root, app) = http_fixture();
+        let resp = http_get(&app, "/media/0001_100_pic.png", &[]).await;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers().get("content-type").unwrap(), "image/png");
+        assert_eq!(resp.headers().get("content-disposition").unwrap(), "inline");
+        assert_eq!(resp.headers().get("accept-ranges").unwrap(), "bytes");
+        assert_eq!(&body_of(resp).await[..], b"\x89PNGdata");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn http_media_range_requests_return_206_with_content_range() {
+        let (root, app) = http_fixture();
+        let resp = http_get(&app, "/media/0001_100_pic.png", &[("range", "bytes=2-5")]).await;
+        assert_eq!(resp.status(), 206);
+        assert_eq!(resp.headers().get("content-range").unwrap(), "bytes 2-5/8");
+        assert_eq!(&body_of(resp).await[..], b"NGda");
+
+        // suffix range: last 3 bytes
+        let resp = http_get(&app, "/media/0001_100_pic.png", &[("range", "bytes=-3")]).await;
+        assert_eq!(resp.status(), 206);
+        assert_eq!(resp.headers().get("content-range").unwrap(), "bytes 5-7/8");
+        assert_eq!(&body_of(resp).await[..], b"ata");
+
+        // unsatisfiable range
+        let resp = http_get(&app, "/media/0001_100_pic.png", &[("range", "bytes=100-200")]).await;
+        assert_eq!(resp.status(), 416);
+        assert_eq!(resp.headers().get("content-range").unwrap(), "bytes */8");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn http_svg_is_served_as_attachment_not_inline() {
+        let (root, app) = http_fixture();
+        let resp = http_get(&app, "/media/evil.svg", &[]).await;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers().get("content-type").unwrap(), "image/svg+xml");
+        let disp = resp.headers().get("content-disposition").unwrap().to_str().unwrap();
+        assert!(disp.starts_with("attachment"), "{disp}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn http_download_param_forces_attachment_disposition() {
+        let (root, app) = http_fixture();
+        let resp = http_get(&app, "/media/0001_100_pic.png?download=1", &[]).await;
+        assert_eq!(resp.status(), 200);
+        let disp = resp.headers().get("content-disposition").unwrap().to_str().unwrap();
+        assert!(disp.starts_with("attachment"), "{disp}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn http_media_traversal_and_missing_are_404() {
+        let (root, app) = http_fixture();
+        for uri in [
+            "/media/..%2Fmeta.json",
+            "/media/..%2F..%2Fmessages.jsonl",
+            "/media/missing.png",
+            "/media/%2E%2E",
+        ] {
+            let resp = http_get(&app, uri, &[]).await;
+            assert_eq!(resp.status(), 404, "{uri}");
+            assert_security_headers(&resp);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn http_host_guard_rejects_non_local_host() {
+        let (root, app) = http_fixture();
+        let resp = http_get(&app, "/api/meta", &[("host", "evil.example.com")]).await;
+        assert_eq!(resp.status(), 403);
+        assert_security_headers(&resp);
+        let body = body_of(resp).await;
+        assert!(serde_json::from_slice::<Value>(&body).unwrap()["error"] == "forbidden host");
+        // an IP literal host is fine
+        let resp = http_get(&app, "/api/meta", &[("host", "127.0.0.1:8765")]).await;
+        assert_eq!(resp.status(), 200);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn http_security_headers_on_every_response() {
+        let (root, app) = http_fixture();
+        for uri in ["/", "/api/archives", "/api/messages?count=1", "/media/0001_100_pic.png", "/nope"] {
+            let resp = http_get(&app, uri, &[]).await;
+            assert_security_headers(&resp);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn http_api_messages_and_unknown_archive() {
+        let (root, app) = http_fixture();
+        let resp = http_get(&app, "/api/messages?count=10", &[]).await;
+        assert_eq!(resp.status(), 200);
+        let body = body_of(resp).await;
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["total"], 1);
+        assert_eq!(payload["messages"][0]["id"], "100");
+        // bad count is a 400, unknown pinned archive a 404
+        assert_eq!(http_get(&app, "/api/messages?count=abc", &[]).await.status(), 400);
+        assert_eq!(http_get(&app, "/api/messages?archive=nope", &[]).await.status(), 404);
+        assert_eq!(http_get(&app, "/api/select?archive=..", &[]).await.status(), 404);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

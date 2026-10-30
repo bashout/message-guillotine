@@ -16,6 +16,8 @@ mod ipc;
 mod progress;
 mod scheduler;
 mod service;
+#[cfg(test)]
+mod testutil;
 mod viewer;
 
 use std::path::PathBuf;

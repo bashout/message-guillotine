@@ -534,4 +534,243 @@ mod tests {
         assert_eq!((loaded.scanned, loaded.deleted, loaded.failed, loaded.skipped), (8, 5, 1, 2));
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    // ------------------------------------------------------------------
+    // run_deletion end-to-end against a loopback mock API (no real network;
+    // tokio time paused so pacing sleeps are instant).
+    // ------------------------------------------------------------------
+
+    use crate::api::User;
+    use crate::testutil::{MockAction, MockServer};
+
+    fn msg(id: &str, author: &str, day: u8, content: &str, t: u64) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "author": {"id": author, "username": "u"},
+            "timestamp": format!("2026-01-{day:02}T00:00:00+00:00"),
+            "content": content,
+            "type": t,
+        })
+    }
+
+    fn page(msgs: Vec<serde_json::Value>) -> MockAction {
+        MockAction::ok_json(serde_json::Value::Array(msgs))
+    }
+
+    fn mock_client(server: &MockServer) -> Client {
+        let mut client = Client::with_base_url("dummy-token", &server.url()).unwrap();
+        client.current_user = Some(User {
+            id: "7".into(),
+            username: "me".into(),
+            discriminator: "0".into(),
+            global_name: None,
+            bot: false,
+        });
+        client
+    }
+
+    fn delete_requests(server: &MockServer) -> Vec<String> {
+        server
+            .requests()
+            .iter()
+            .filter(|r| r.method == "DELETE")
+            .map(|r| r.path.clone())
+            .collect()
+    }
+
+    fn run_opts<'a>(root: &'a Path, dry_run: bool, resume: Option<Session>) -> DeletionOptions<'a> {
+        DeletionOptions {
+            label: "chat",
+            cutoff: None,
+            resume,
+            dry_run,
+            root: Some(root),
+            registry: None,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_deletes_only_own_messages_and_skips_system_locally() {
+        let root = temp_root("run-own");
+        let server = MockServer::start(vec![
+            page(vec![
+                msg("5", "7", 5, "mine newest", 0),
+                msg("4", "999", 4, "not mine", 0),
+                msg("3", "7", 3, "system call", 3),
+                msg("2", "7", 2, "mine older", 0),
+            ]),
+            MockAction::status(204),
+            MockAction::status(204),
+        ])
+        .await;
+        let client = mock_client(&server);
+        let summary = run_deletion(&client, "42", run_opts(&root, false, None)).await;
+        assert_eq!(summary.scanned, 4);
+        assert_eq!(summary.deleted, 2);
+        assert_eq!(summary.skipped, 1);
+        assert!(summary.complete);
+        assert_eq!(summary.aborted, None);
+        // only the two tangible own messages cost a DELETE request
+        assert_eq!(
+            delete_requests(&server),
+            vec!["/channels/42/messages/5", "/channels/42/messages/2"]
+        );
+        // a complete run leaves no session file
+        assert!(load_session("42", Some(&root)).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_others_system_messages_never_reach_delete() {
+        let root = temp_root("run-other-sys");
+        let server = MockServer::start(vec![
+            page(vec![msg("9", "999", 9, "other system", 3), msg("5", "7", 5, "mine", 0)]),
+            MockAction::status(204),
+        ])
+        .await;
+        let client = mock_client(&server);
+        let summary = run_deletion(&client, "42", run_opts(&root, false, None)).await;
+        assert_eq!(delete_requests(&server), vec!["/channels/42/messages/5"]);
+        assert_eq!(summary.scanned, 2);
+        assert_eq!(summary.skipped, 0, "dropped by the mine-only check before the system check");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_dry_run_deletes_nothing_and_writes_no_session() {
+        let root = temp_root("run-dry");
+        let server = MockServer::start(vec![page(vec![
+            msg("5", "7", 5, "hello world", 0),
+            msg("4", "999", 4, "not mine", 0),
+            msg("3", "7", 3, "system pin", 6),
+        ])])
+        .await;
+        let client = mock_client(&server);
+        let summary = run_deletion(&client, "42", run_opts(&root, true, None)).await;
+        assert_eq!(server.request_count(), 1, "dry run issues no DELETEs");
+        assert!(delete_requests(&server).is_empty());
+        assert_eq!(summary.deleted, 1, "counted as would-delete");
+        assert_eq!(summary.skipped, 1);
+        assert_eq!(summary.samples, vec!["u: hello world".to_string()]);
+        assert!(summary.complete);
+        assert!(load_session("42", Some(&root)).is_none(), "dry run writes no session");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_resume_continues_past_cursor_with_counters_carried() {
+        let root = temp_root("run-resume");
+        let server = MockServer::start(vec![
+            page(vec![msg("3", "7", 3, "m3", 0), msg("2", "7", 2, "m2", 0)]),
+            MockAction::status(204),
+            MockAction::status(204),
+        ])
+        .await;
+        let client = mock_client(&server);
+        let resume = session("42", 10, 4, 0, 1, Some("4"), false);
+        let summary = run_deletion(&client, "42", run_opts(&root, false, Some(resume))).await;
+        // the first fetch continues after the saved cursor, no rescan
+        assert!(server.requests()[0].path.contains("before=4"), "{}", server.requests()[0].path);
+        assert_eq!(summary.scanned, 12);
+        assert_eq!(summary.deleted, 6);
+        assert_eq!(summary.skipped, 1);
+        assert!(summary.complete);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_auth_abort_persists_resumable_session() {
+        let root = temp_root("run-auth");
+        let server = MockServer::start(vec![page(vec![msg("5", "7", 5, "m5", 0)]), MockAction::status(401)]).await;
+        let client = mock_client(&server);
+        let summary = run_deletion(&client, "42", run_opts(&root, false, None)).await;
+        assert!(!summary.complete);
+        assert_eq!(summary.aborted.as_deref(), Some("Auth"));
+        let saved = load_session("42", Some(&root)).expect("aborted run saves a session");
+        assert_eq!(saved.before_cursor.as_deref(), Some("5"));
+        assert_eq!(saved.scanned, 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_rate_limited_abort_persists_resumable_session() {
+        let root = temp_root("run-rl");
+        let server = MockServer::start(vec![
+            page(vec![msg("5", "7", 5, "m5", 0)]),
+            MockAction::with_headers(429, &[("Retry-After", "1")]),
+            MockAction::with_headers(429, &[("Retry-After", "1")]),
+            MockAction::with_headers(429, &[("Retry-After", "1")]),
+        ])
+        .await;
+        let client = mock_client(&server);
+        let summary = run_deletion(&client, "42", run_opts(&root, false, None)).await;
+        assert!(!summary.complete);
+        assert_eq!(summary.aborted.as_deref(), Some("RateLimited"));
+        let saved = load_session("42", Some(&root)).expect("aborted run saves a session");
+        assert_eq!(saved.before_cursor.as_deref(), Some("5"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_network_abort_persists_resumable_session() {
+        let root = temp_root("run-net");
+        let server = MockServer::start(vec![
+            page(vec![msg("5", "7", 5, "m5", 0)]),
+            MockAction::Drop,
+            MockAction::Drop,
+            MockAction::Drop,
+        ])
+        .await;
+        let client = mock_client(&server);
+        let summary = run_deletion(&client, "42", run_opts(&root, false, None)).await;
+        assert!(!summary.complete);
+        assert_eq!(summary.aborted.as_deref(), Some("Network"));
+        assert!(load_session("42", Some(&root)).is_some());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_fetch_failure_aborts_and_persists_session() {
+        let root = temp_root("run-fetch");
+        let server = MockServer::start(vec![
+            MockAction::status(500),
+            MockAction::status(500),
+            MockAction::status(500),
+            MockAction::status(500),
+            MockAction::status(500),
+        ])
+        .await;
+        let client = mock_client(&server);
+        let summary = run_deletion(&client, "42", run_opts(&root, false, None)).await;
+        assert!(!summary.complete);
+        assert!(
+            summary.aborted.as_deref().is_some_and(|a| a.starts_with("fetch failed:")),
+            "{:?}",
+            summary.aborted
+        );
+        assert_eq!(server.request_count(), 5);
+        assert!(load_session("42", Some(&root)).is_some());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_failed_message_is_counted_and_run_continues() {
+        let root = temp_root("run-failed");
+        let server = MockServer::start(vec![
+            page(vec![msg("5", "7", 5, "m5", 0), msg("4", "7", 4, "m4", 0)]),
+            MockAction::status(500),
+            MockAction::status(204),
+        ])
+        .await;
+        let client = mock_client(&server);
+        let summary = run_deletion(&client, "42", run_opts(&root, false, None)).await;
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.deleted, 1);
+        assert!(summary.complete);
+        assert_eq!(
+            delete_requests(&server),
+            vec!["/channels/42/messages/5", "/channels/42/messages/4"]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
