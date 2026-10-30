@@ -277,7 +277,8 @@ pub struct Config {
     #[serde(default)]
     pub dm: DmPolicy,
     /// Raw chat table keyed by strings like "dm:123"; parsed into ChatKey by
-    /// `chats()` so a bad key is a load error, not a silent skip.
+    /// `chats()` (bad keys are skipped there; `load()` validates them as
+    /// errors).
     #[serde(default)]
     pub chat: BTreeMap<String, ChatConfig>,
 }
@@ -329,11 +330,13 @@ impl Config {
     }
 
     /// The configured chats as parsed keys. DM chats listed here are
-    /// intersected with the dm policy when resolving the run scope.
+    /// intersected with the dm policy when resolving the run scope. Keys that
+    /// fail to parse are skipped (never panic): `Config::load` rejects them
+    /// up front via `validate`.
     pub fn chats(&self) -> impl Iterator<Item = (ChatKey, &ChatConfig)> {
         self.chat
             .iter()
-            .map(|(k, v)| (ChatKey::parse(k).unwrap(), v))
+            .filter_map(|(k, v)| ChatKey::parse(k).ok().map(|key| (key, v)))
     }
 
     /// The token, from the environment override or the file.

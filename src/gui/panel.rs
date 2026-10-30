@@ -203,11 +203,8 @@ impl PanelApp {
                     let chat = chat.to_string();
                     self.rt.spawn(async move {
                         match crate::ipc::send(serde_json::json!({ "cmd": "run_now", "chat": chat })).await {
-                            Ok(resp) if resp["ok"] == true && resp["accepted"] == true => {
-                                tracing::info!(chat = %chat, "run-now accepted by daemon, running in background");
-                            }
                             Ok(resp) if resp["ok"] == true => {
-                                tracing::info!(chat = %chat, "run-now done: {}", &resp["summary"]);
+                                tracing::info!(chat = %chat, "run-now accepted by daemon, running in background");
                             }
                             Ok(resp) => tracing::warn!(chat = %chat, "run-now failed: {}", &resp["error"]),
                             Err(e) => tracing::warn!(chat = %chat, "daemon unreachable ({e}); start it with `guillotine service install`"),
@@ -461,11 +458,8 @@ impl PanelApp {
             }
             Message::DeleteAllDone(chat, res) => {
                 match res {
-                    Ok(resp) if resp["ok"] == true && resp["accepted"] == true => {
-                        tracing::info!(chat = %chat, "delete-all accepted by daemon, running in background")
-                    }
                     Ok(resp) if resp["ok"] == true => {
-                        tracing::info!(chat = %chat, "delete-all done: {}", &resp["summary"])
+                        tracing::info!(chat = %chat, "delete-all accepted by daemon, running in background")
                     }
                     Ok(resp) => tracing::warn!(chat = %chat, "delete-all failed: {}", &resp["error"]),
                     Err(e) => tracing::warn!(chat = %chat, "daemon unreachable ({e}); delete-all needs the running service"),

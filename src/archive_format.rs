@@ -107,6 +107,8 @@ pub fn find_existing_archive(channel_id: &str, archive_dir: &Path) -> Option<Pat
 
 /// Load message records from messages.jsonl, truncating any partial tail
 /// line left behind by a hard kill (a partial line is always the last).
+/// The truncation is atomic: the valid prefix is written to a temp file and
+/// renamed over the original, never seek+set_len in place.
 pub fn load_message_records(path: &Path) -> Vec<serde_json::Value> {
     let mut records = Vec::new();
     let Ok(bytes) = std::fs::read(path) else {
@@ -128,14 +130,10 @@ pub fn load_message_records(path: &Path) -> Vec<serde_json::Value> {
     }
     if let Ok(meta) = std::fs::metadata(path) {
         if valid_end < meta.len() as usize {
-            let _ = std::fs::File::options()
-                .write(true)
-                .open(path)
-                .and_then(|mut f| {
-                    use std::io::Seek;
-                    f.seek(std::io::SeekFrom::Start(valid_end as u64))?;
-                    f.set_len(valid_end as u64)
-                });
+            let tmp = path.with_extension("jsonl.part");
+            if std::fs::write(&tmp, &bytes[..valid_end]).is_ok() {
+                let _ = std::fs::rename(&tmp, path);
+            }
         }
     }
     records
