@@ -5,6 +5,13 @@
 //!
 //! WARNING: self-bots violate the platform ToS. Use at your own risk.
 
+// The gui build on Windows is a windowed-subsystem binary so the registry
+// Run-key autostart does not flash a console window.
+#![cfg_attr(
+    all(feature = "gui", target_os = "windows"),
+    windows_subsystem = "windows"
+)]
+
 mod api;
 mod archive_format;
 mod archiver;
