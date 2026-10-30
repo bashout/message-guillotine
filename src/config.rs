@@ -67,32 +67,82 @@ pub fn write_file_private(path: &Path, contents: &str) -> std::io::Result<()> {
     }
 }
 
-/// Create the per-OS data dir with owner-only permissions (0700) and return
-/// it. Safe to call repeatedly.
-pub fn ensure_data_dir() -> std::io::Result<PathBuf> {
-    let dir = data_dir();
+/// Append to a file, creating it with owner-only permissions (0600 on unix)
+/// when it does not exist yet. Used for the append-only archive ledgers.
+pub fn append_file_private(path: &Path, contents: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .mode(0o600)
+            .open(path)?
+            .write_all(contents.as_bytes())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path)?
+            .write_all(contents.as_bytes())
+    }
+}
+
+/// Atomically write a file with owner-only permissions: a `<name>.part` temp
+/// file created with mode 0600 on unix (so there is never a world-readable
+/// window), then renamed over `path`. Used for the config and archive files.
+pub fn write_file_private_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
+    let mut tmp_name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    tmp_name.push(".part");
+    let tmp = path.with_file_name(tmp_name);
+    write_file_private(&tmp, contents)?;
+    // A pre-existing leftover temp file would keep its old mode through the
+    // rename; tighten it explicitly.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    }
+    std::fs::rename(&tmp, path)
+}
+
+/// Create a directory (and its parents) with owner-only permissions (0700 on
+/// unix). An existing dir with any group/other bits is tightened to 0700, so
+/// a user-configured archive folder outside the data dir stays private.
+pub fn ensure_private_dir(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
-            .create(&dir)?;
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::create_dir_all(&dir)?;
-    }
-    // An existing dir is never re-chmodded by DirBuilder; enforce 0700.
-    #[cfg(unix)]
-    {
+            .create(path)?;
+        // An existing dir is never re-chmodded by DirBuilder; enforce 0700.
         use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = std::fs::metadata(&dir) {
+        if let Ok(meta) = std::fs::metadata(path) {
             if meta.permissions().mode() & 0o077 != 0 {
-                let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
             }
         }
     }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(path)?;
+    }
+    Ok(())
+}
+
+/// Create the per-OS data dir with owner-only permissions (0700) and return
+/// it. Safe to call repeatedly.
+pub fn ensure_data_dir() -> std::io::Result<PathBuf> {
+    let dir = data_dir();
+    ensure_private_dir(&dir)?;
     Ok(dir)
 }
 
@@ -286,6 +336,21 @@ impl Config {
     /// Load and validate the config from `path`, applying environment
     /// overrides for the token and archive dir.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
+        // The config holds the token: warn when it is readable by anyone
+        // other than the owner.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = std::fs::metadata(path) {
+                let mode = meta.permissions().mode();
+                if mode & 0o077 != 0 {
+                    tracing::warn!(
+                        "config file {} is mode {mode:o} (group/other bits set); expected 0600 — the token inside is exposed",
+                        path.display()
+                    );
+                }
+            }
+        }
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("cannot read config file {}", path.display()))?;
         let mut cfg: Config = toml::from_str(&raw)
@@ -662,6 +727,46 @@ retention_days = 7
         let path = root.join("config.toml");
         std::fs::write(&path, body).unwrap();
         path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_writers_set_owner_only_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("guillotine-config-test-{}-perms", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        // direct private write: 0600 from creation
+        let p = root.join("a.txt");
+        write_file_private(&p, "x").unwrap();
+        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+
+        // atomic private write: temp is 0600 and the rename keeps 0600
+        let p = root.join("b.txt");
+        write_file_private_atomic(&p, "y").unwrap();
+        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(!root.join("b.txt.part").exists());
+        // overwrite path also ends 0600
+        write_file_private_atomic(&p, "z").unwrap();
+        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+
+        // append creates 0600
+        let p = root.join("c.jsonl");
+        append_file_private(&p, "1\n").unwrap();
+        append_file_private(&p, "2\n").unwrap();
+        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "1\n2\n");
+
+        // private dir: 0700, and an existing loose dir is tightened
+        let d = root.join("sub");
+        ensure_private_dir(&d).unwrap();
+        assert_eq!(std::fs::metadata(&d).unwrap().permissions().mode() & 0o777, 0o700);
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
+        ensure_private_dir(&d).unwrap();
+        assert_eq!(std::fs::metadata(&d).unwrap().permissions().mode() & 0o777, 0o700);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

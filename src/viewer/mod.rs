@@ -27,7 +27,7 @@ use serde_json::Value;
 pub use api::{
     api_archives, api_attachments, api_attachment_years, api_messages, api_meta, api_resolve,
     api_search, api_select, api_stats, app_js, host_guard, index_html, security_headers,
-    style_css,
+    style_css, HostGuard,
 };
 pub use library::{find_archives, Library};
 pub use media::media;
@@ -176,15 +176,29 @@ fn open_browser(url: &str) {
     }
 }
 
+/// Whether `host` names a loopback bind: "localhost" or a loopback IP
+/// literal (any of 127.0.0.0/8, ::1).
+pub fn is_loopback_host(host: &str) -> bool {
+    let h = host.trim().to_lowercase();
+    let name = h
+        .strip_prefix('[')
+        .and_then(|rest| rest.split(']').next())
+        .unwrap_or(&h);
+    name == "localhost" || name.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
 /// Run the V2 archive viewer server. `archives_dir` may be the archival
 /// folder or a single archive folder (served with its siblings); when None
 /// the folder is resolved like the archiver does (DM_ARCHIVE_DIR, config,
-/// per-OS default).
+/// per-OS default). Non-loopback binds are refused unless `expose` is set —
+/// the viewer has no authentication, so an exposed bind makes every archive
+/// readable by anyone who can reach the port.
 pub async fn run(
     archives_dir: Option<PathBuf>,
     host: &str,
     port: u16,
     no_browser: bool,
+    expose: bool,
 ) -> anyhow::Result<()> {
     use anyhow::Context;
     let (root, initial): (PathBuf, Option<String>) = match archives_dir {
@@ -213,7 +227,7 @@ pub async fn run(
                         "note: no archives in {}; falling back to the current directory",
                         root.display()
                     );
-                    return Box::pin(run(Some(cwd), host, port, no_browser)).await;
+                    return Box::pin(run(Some(cwd), host, port, no_browser, expose)).await;
                 }
             }
             (root, None)
@@ -234,6 +248,31 @@ pub async fn run(
         }
     }
 
+    let loopback = is_loopback_host(host);
+    if !loopback && !expose {
+        anyhow::bail!(
+            "refusing to bind the viewer to non-loopback host {host:?}: it has no authentication, \
+             so every archive would be readable by anyone who can reach the port. \
+             Re-run with --expose to override."
+        );
+    }
+    if !loopback {
+        eprintln!(
+            "WARNING: viewer is exposed on {host} (--expose) — all archives are readable by anyone who can reach this port with no authentication."
+        );
+    }
+    let listener = match tokio::net::TcpListener::bind((host, port)).await {
+        Ok(l) => l,
+        Err(e) if port != 0 => {
+            tracing::warn!("could not bind {host}:{port} ({e}); falling back to an ephemeral port");
+            tokio::net::TcpListener::bind((host, 0))
+                .await
+                .context("could not bind the viewer to any port")?
+        }
+        Err(e) => return Err(e).context("could not bind the viewer"),
+    };
+    let local: SocketAddr = listener.local_addr()?;
+    let guard = HostGuard::new(local.ip(), !loopback);
     let app = Router::new()
         .route("/", axum::routing::get(index_html))
         .route("/app.js", axum::routing::get(app_js))
@@ -249,25 +288,8 @@ pub async fn run(
         .route("/api/stats", axum::routing::get(api_stats))
         .route("/media/{*name}", axum::routing::get(media))
         .layer(middleware::from_fn(security_headers))
-        .layer(middleware::from_fn(host_guard))
+        .layer(middleware::from_fn_with_state(guard, host_guard))
         .with_state(library.clone());
-
-    if !host.is_empty() && host != "127.0.0.1" && host != "localhost" && host != "::1" && host != "[::1]" {
-        eprintln!(
-            "WARNING: viewer is bound to {host} — all archives are readable by anyone who can reach this port with no authentication. Use the default 127.0.0.1 unless you know what you're doing."
-        );
-    }
-    let listener = match tokio::net::TcpListener::bind((host, port)).await {
-        Ok(l) => l,
-        Err(e) if port != 0 => {
-            tracing::warn!("could not bind {host}:{port} ({e}); falling back to an ephemeral port");
-            tokio::net::TcpListener::bind((host, 0))
-                .await
-                .context("could not bind the viewer to any port")?
-        }
-        Err(e) => return Err(e).context("could not bind the viewer"),
-    };
-    let local: SocketAddr = listener.local_addr()?;
     let url = format!("http://{}:{}/", local.ip(), local.port());
 
     eprintln!("Archival folder: {}", library.root().display());
@@ -623,8 +645,47 @@ mod tests {
         assert!(host_allowed("127.0.0.1:8765"));
         assert!(host_allowed("[::1]:8765"));
         assert!(host_allowed("127.0.0.1"));
+        assert!(host_allowed("127.0.0.2:8765"), "any loopback bind target");
+        assert!(!host_allowed("192.168.1.10:8765"));
+        assert!(!host_allowed("8.8.8.8:80"));
+        assert!(!host_allowed("0.0.0.0:8765"));
         assert!(!host_allowed("evil.example.com:8765"));
         assert!(!host_allowed(""));
+    }
+
+    #[test]
+    fn loopback_host_detection() {
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("localhost"));
+        assert!(is_loopback_host("LOCALHOST"));
+        assert!(is_loopback_host("::1"));
+        assert!(is_loopback_host("[::1]"));
+        assert!(is_loopback_host("127.0.0.5"));
+        assert!(!is_loopback_host("0.0.0.0"));
+        assert!(!is_loopback_host("192.168.1.10"));
+        assert!(!is_loopback_host("example.com"));
+    }
+
+    #[test]
+    fn host_guard_state_bound_address_and_expose() {
+        use std::net::IpAddr;
+        // default loopback bind: only loopback hosts pass
+        let g = HostGuard::new(IpAddr::from([127, 0, 0, 1]), false);
+        assert!(g.allows("127.0.0.1:8765"));
+        assert!(g.allows("localhost:8765"));
+        assert!(!g.allows("192.168.1.10:8765"));
+        // exposed on a specific LAN address: that address passes
+        let g = HostGuard::new(IpAddr::from([192, 168, 1, 5]), true);
+        assert!(g.allows("192.168.1.5:8765"));
+        assert!(g.allows("localhost:8765"));
+        assert!(!g.allows("evil.com:8765"));
+        // exposed on all interfaces: IP literals pass, hostnames still blocked
+        let g = HostGuard::new(IpAddr::from([0, 0, 0, 0]), true);
+        assert!(g.allows("192.168.1.10:8765"));
+        assert!(!g.allows("evil.com:8765"));
+        // non-exposed wildcard stays strict (run() refuses this bind anyway)
+        let g = HostGuard::new(IpAddr::from([0, 0, 0, 0]), false);
+        assert!(!g.allows("192.168.1.10:8765"));
     }
 
     #[test]
@@ -673,7 +734,10 @@ mod tests {
         assert!(host_allowed("localhost"));
         assert!(host_allowed("LOCALHOST:8765"));
         assert!(host_allowed("[::1]"));
-        assert!(host_allowed("192.168.1.10:8765"));
+        assert!(
+            !host_allowed("192.168.1.10:8765"),
+            "non-loopback IP literals are rejected"
+        );
         assert!(!host_allowed("127.0.0.1:abc"), "non-numeric port is not stripped");
         assert!(!host_allowed("localhost.evil.com"));
         assert!(!host_allowed("[::1"), "unterminated bracket");

@@ -26,6 +26,7 @@ pub fn secret_file() -> PathBuf {
 fn write_private(path: &std::path::Path, contents: &str) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
+        use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt;
         std::fs::OpenOptions::new()
             .write(true)
@@ -42,33 +43,15 @@ fn write_private(path: &std::path::Path, contents: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-use std::io::{Read as _, Write as _};
-
-/// 32 random bytes hex-encoded; /dev/urandom on unix, time+pid hash elsewhere.
-fn random_secret() -> String {
-    #[cfg(unix)]
-    {
-        let mut raw = [0u8; 32];
-        if std::fs::File::open("/dev/urandom")
-            .and_then(|mut f| f.read_exact(&mut raw))
-            .is_ok()
-        {
-            return raw.iter().map(|b| format!("{b:02x}")).collect();
-        }
-    }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let mut h = now ^ ((std::process::id() as u128) << 64);
-    let mut out = String::with_capacity(64);
-    for _ in 0..4 {
-        h ^= h << 13;
-        h ^= h >> 7;
-        h ^= h << 17;
-        out.push_str(&format!("{h:016x}"));
-    }
-    out
+/// 32 random bytes hex-encoded from the platform CSPRNG (getrandom) on every
+/// platform. Never falls back to a predictable value: a weak IPC secret
+/// would let any local process command the daemon.
+fn random_secret() -> anyhow::Result<String> {
+    let mut raw = [0u8; 32];
+    getrandom::fill(&mut raw).map_err(|e| {
+        anyhow::anyhow!("CSPRNG unavailable ({e}); refusing to generate a predictable IPC secret")
+    })?;
+    Ok(raw.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// The daemon's secret: read the existing file, or create a fresh random one.
@@ -81,7 +64,7 @@ fn load_or_create_secret() -> anyhow::Result<String> {
         }
     }
     config::ensure_data_dir()?;
-    let secret = random_secret();
+    let secret = random_secret()?;
     write_private(&path, &format!("{secret}\n"))?;
     Ok(secret)
 }
@@ -356,6 +339,15 @@ mod tests {
 
     fn cfg_with(toml_body: &str) -> Config {
         toml::from_str(toml_body).unwrap()
+    }
+
+    #[test]
+    fn random_secret_is_64_hex_chars_and_unique() {
+        let a = random_secret().unwrap();
+        let b = random_secret().unwrap();
+        assert_eq!(a.len(), 64);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b, "two secrets must never collide");
     }
 
     #[test]

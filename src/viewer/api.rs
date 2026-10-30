@@ -97,30 +97,75 @@ pub fn request_archive(library: &Library, q: &HashMap<String, String>) -> Result
     }
 }
 
-/// Reject non-local Host headers (DNS-rebinding protection). The Host
-/// hostname must be an IP literal or "localhost".
-pub fn host_allowed(host: &str) -> bool {
+/// Extract the hostname from a Host header value: lowercased, brackets
+/// stripped, port removed (only when it is numeric). None when malformed.
+fn host_name(host: &str) -> Option<String> {
     let host = host.trim().to_lowercase();
     if host.is_empty() {
-        return false;
+        return None;
     }
     let name = if host.starts_with('[') {
-        match host.find(']') {
-            Some(end) => &host[1..end],
-            None => return false,
-        }
+        let end = host.find(']')?;
+        host[1..end].to_string()
     } else if host
         .rsplit_once(':')
         .is_some_and(|(_, p)| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
     {
-        host.rsplit_once(':').unwrap().0
+        host.rsplit_once(':').unwrap().0.to_string()
     } else {
-        host.as_str()
+        host
+    };
+    Some(name)
+}
+
+/// Reject non-local Host headers (DNS-rebinding protection). Only
+/// "localhost" and loopback IP literals (127.0.0.0/8, ::1) are allowed —
+/// any other IP literal or hostname is rejected.
+pub fn host_allowed(host: &str) -> bool {
+    let Some(name) = host_name(host) else {
+        return false;
     };
     if name == "localhost" {
         return true;
     }
-    name.parse::<std::net::IpAddr>().is_ok()
+    name.parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// State for the host-guard middleware: the address the viewer is actually
+/// bound to, and whether the user explicitly opted into a non-loopback bind
+/// with --expose.
+#[derive(Clone)]
+pub struct HostGuard {
+    bound: Option<std::net::IpAddr>,
+    exposed: bool,
+}
+
+impl HostGuard {
+    pub fn new(bound: std::net::IpAddr, exposed: bool) -> Self {
+        HostGuard {
+            bound: Some(bound),
+            exposed,
+        }
+    }
+
+    pub fn allows(&self, host: &str) -> bool {
+        if host_allowed(host) {
+            return true;
+        }
+        let Some(name) = host_name(host) else {
+            return false;
+        };
+        let Ok(ip) = name.parse::<std::net::IpAddr>() else {
+            return false;
+        };
+        if self.bound == Some(ip) {
+            return true;
+        }
+        // In --expose mode a browser on the LAN addresses the viewer by its
+        // interface IP; hostname rebinding stays blocked by host_allowed.
+        self.exposed && !ip.is_loopback()
+    }
 }
 
 /// Baseline security headers on every viewer response.
@@ -138,13 +183,17 @@ pub async fn security_headers(req: axum::extract::Request, next: middleware::Nex
     resp
 }
 
-pub async fn host_guard(req: axum::extract::Request, next: middleware::Next) -> Response {
+pub async fn host_guard(
+    State(guard): State<HostGuard>,
+    req: axum::extract::Request,
+    next: middleware::Next,
+) -> Response {
     let host = req
         .headers()
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if host_allowed(host) {
+    if guard.allows(host) {
         next.run(req).await
     } else {
         json_err(StatusCode::FORBIDDEN, "forbidden host").into_response()

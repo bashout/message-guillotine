@@ -64,6 +64,11 @@ enum Commands {
         /// Print the URL instead of opening the browser
         #[arg(long)]
         no_browser: bool,
+        /// Allow binding to a non-loopback interface. The viewer has no
+        /// authentication: without this flag, non-loopback --host values
+        /// are refused because they would expose all archives on the network.
+        #[arg(long)]
+        expose: bool,
     },
     /// One-shot scan of a channel: report what a deletion run would delete
     Scan {
@@ -220,12 +225,9 @@ async fn run_async(
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                std::fs::write(&path, config::EXAMPLE_CONFIG)?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-                }
+                // Atomic private write: temp file created 0600 + rename, so
+                // the example token is never world-readable, even briefly.
+                config::write_file_private_atomic(&path, config::EXAMPLE_CONFIG)?;
                 println!("Wrote example config to {}", path.display());
             }
             ConfigCommands::Validate => {
@@ -263,7 +265,8 @@ async fn run_async(
             host,
             port,
             no_browser,
-        } => viewer::run(archives_dir, &host, port, no_browser).await?,
+            expose,
+        } => viewer::run(archives_dir, &host, port, no_browser, expose).await?,
     }
     Ok(())
 }

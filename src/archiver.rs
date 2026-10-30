@@ -46,14 +46,11 @@ fn compact_manifest(folder: &Path) -> Vec<serde_json::Value> {
         }
     }
     let entries: Vec<serde_json::Value> = latest.values().cloned().collect();
-    let tmp = folder.join("manifest.jsonl.part");
     let body: String = entries
         .iter()
         .map(|e| serde_json::to_string(e).unwrap() + "\n")
         .collect();
-    if std::fs::write(&tmp, body).is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
-    }
+    let _ = crate::config::write_file_private_atomic(&path, &body);
     entries
 }
 
@@ -88,14 +85,11 @@ fn sort_message_records(folder: &Path) {
         })
         .collect();
     paired.sort_by_key(|(id, _)| *id);
-    let tmp = folder.join("messages.jsonl.part");
     let body: String = paired
         .iter()
         .map(|(_, r)| serde_json::to_string(r).unwrap() + "\n")
         .collect();
-    if std::fs::write(&tmp, body).is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
-    }
+    let _ = crate::config::write_file_private_atomic(&path, &body);
 }
 
 /// Advance the channel's resume cursor to last_id.
@@ -171,7 +165,7 @@ pub async fn archive_chat(
                             .join(format!("{label_part}-{channel_id}-archive-{date_part}"));
                     }
                 }
-                std::fs::create_dir_all(&folder)?;
+                crate::config::ensure_private_dir(&folder)?;
                 fmt::write_meta(
                     &folder,
                     &serde_json::json!({ "channel_id": channel_id, "chat": channel_label }),
@@ -233,7 +227,7 @@ pub async fn archive_chat(
                         continue;
                     }
                     seq += 1;
-                    std::fs::create_dir_all(&att_dir)?;
+                    crate::config::ensure_private_dir(&att_dir)?;
                     let safe_name = sanitize_filename(
                         att.filename.as_deref().unwrap_or(""),
                         &format!("att-{}", att.id),
@@ -253,13 +247,10 @@ pub async fn archive_chat(
                         "size": size,
                         "status": if size.is_some() { "ok" } else { "failed" },
                     });
-                    {
-                        let mut mf = std::fs::OpenOptions::new()
-                            .append(true)
-                            .open(folder.join("manifest.jsonl"))?;
-                        use std::io::Write;
-                        mf.write_all((serde_json::to_string(&entry).unwrap() + "\n").as_bytes())?;
-                    }
+                    crate::config::append_file_private(
+                        &folder.join("manifest.jsonl"),
+                        &(serde_json::to_string(&entry).unwrap() + "\n"),
+                    )?;
                     if size.is_some() {
                         saved += 1;
                     } else {
@@ -268,13 +259,10 @@ pub async fn archive_chat(
                     recorded.insert(att.id.clone(), entry);
                     tokio::time::sleep(api::ATTACHMENT_DELAY).await;
                 }
-                {
-                    let mut jf = std::fs::OpenOptions::new()
-                        .append(true)
-                        .open(folder.join("messages.jsonl"))?;
-                    use std::io::Write;
-                    jf.write_all((serde_json::to_string(&fmt::minimal_message(msg)).unwrap() + "\n").as_bytes())?;
-                }
+                crate::config::append_file_private(
+                    &folder.join("messages.jsonl"),
+                    &(serde_json::to_string(&fmt::minimal_message(msg)).unwrap() + "\n"),
+                )?;
                 archived_ids.insert(msg.id.clone());
                 last_id = Some(msg.id.clone());
                 count = archived_ids.len() as u64;

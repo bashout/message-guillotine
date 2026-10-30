@@ -35,13 +35,14 @@ pub fn read_meta(folder: &Path) -> serde_json::Value {
         .unwrap_or(serde_json::json!({}))
 }
 
-/// Atomically rewrite meta.json (temp file + rename), like the manifest.
+/// Atomically rewrite meta.json with owner-only permissions (temp file
+/// created 0600 + rename), like the manifest.
 pub fn write_meta(folder: &Path, meta: &serde_json::Value) {
     let path = folder.join("meta.json");
-    let tmp = folder.join("meta.json.part");
-    if std::fs::write(&tmp, serde_json::to_string(meta).unwrap() + "\n").is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
-    }
+    let _ = crate::config::write_file_private_atomic(
+        &path,
+        &(serde_json::to_string(meta).unwrap() + "\n"),
+    );
 }
 
 /// Per-channel resume cursors of a merged archive: channel id -> id of the
@@ -143,15 +144,10 @@ pub fn load_message_records(path: &Path) -> Vec<serde_json::Value> {
 
 pub fn mark_archive_status(folder: &Path, complete: bool) {
     let path = folder.join("status.json");
-    let tmp = folder.join("status.json.part");
-    if std::fs::write(
-        &tmp,
-        serde_json::to_string(&serde_json::json!({ "complete": complete })).unwrap() + "\n",
-    )
-    .is_ok()
-    {
-        let _ = std::fs::rename(&tmp, &path);
-    }
+    let _ = crate::config::write_file_private_atomic(
+        &path,
+        &(serde_json::to_string(&serde_json::json!({ "complete": complete })).unwrap() + "\n"),
+    );
 }
 
 #[cfg(test)]
