@@ -481,19 +481,11 @@ pub(crate) fn save_config(path: &Path, s: &SettingsState) -> String {
     doc.insert("chat".into(), toml::Value::Table(chats));
 
     let rendered = toml::to_string_pretty(&doc).unwrap_or_default();
-    // Atomic write: temp file + rename, so a crash mid-save can't corrupt
-    // the only config file.
-    let tmp = path.with_extension("toml.part");
-    let write_result = std::fs::write(&tmp, rendered).and_then(|_| std::fs::rename(&tmp, path));
-    match write_result {
-        Ok(()) => {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-            }
-            format!("Saved {}", path.display())
-        }
+    // Atomic private write: temp file created 0600 + rename, so a crash
+    // mid-save can't corrupt the only config file and the token is never
+    // world-readable, even briefly.
+    match config::write_file_private_atomic(path, &rendered) {
+        Ok(()) => format!("Saved {}", path.display()),
         Err(e) => format!("Save failed: {e}"),
     }
 }

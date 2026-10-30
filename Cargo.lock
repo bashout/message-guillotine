@@ -1703,6 +1703,7 @@ dependencies = [
  "clap",
  "dirs 5.0.1",
  "futures",
+ "getrandom 0.3.4",
  "gtk",
  "iced",
  "image",
