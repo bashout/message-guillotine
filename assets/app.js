@@ -2,9 +2,10 @@
 const PAGE = 50, GALLERY_PAGE = 60;
 const state = {
   archive: null,
-  start: 0, total: 0,
+  start: 0, loaded: 0, total: 0,
   mode: 'messages',
   searching: false,
+  loadingTop: false, loadingBottom: false,
   galleryLoaded: 0, galleryTotal: 0, year: null,
   replyCache: new Map(),
 };
@@ -13,6 +14,7 @@ const els = {
   select: $('archive-select'), search: $('search'), searchBtn: $('search-btn'), searchClear: $('search-clear'),
   dateFrom: $('date-from'), dateTo: $('date-to'), fAtt: $('f-att'), fLink: $('f-link'), fPin: $('f-pin'),
   viewInfo: $('view-info'), list: $('message-list'), pagerTop: $('pager-top'), pagerBottom: $('pager-bottom'),
+  sentinelTop: $('sentinel-top'), sentinelBottom: $('sentinel-bottom'),
   gallery: $('gallery'), yearBar: $('year-bar'), galleryMore: $('gallery-more'), stats: $('stats'),
 };
 
@@ -85,21 +87,86 @@ async function selectArchive(name) {
 }
 
 // -- messages ---------------------------------------------------------------
+// The list renders the archive in chronological order (oldest at top, newest
+// at bottom). state.start is the archive index of the first rendered message,
+// state.loaded how many are rendered; paging is bidirectional and global —
+// the backend indexes the whole ordered archive, not just what's in memory.
+function setSentinel(el, on) { el.classList.toggle('loading', on); }
+
+function updateViewInfo() {
+  const filtered = filterQS();
+  let text = `${state.total} message(s)` + (filtered ? ' (filtered)' : '');
+  if (state.loaded) text += ` — showing ${state.start + 1}–${state.start + state.loaded}`;
+  els.viewInfo.textContent = text;
+}
+
+// Jump/replace: used by the pager buttons, filter changes and archive switch.
 async function loadMessages(start) {
   const data = await api(`/api/messages?start=${start}&count=${PAGE}${filterQS()}`);
-  state.start = data.start; state.total = data.total;
+  state.start = data.start; state.total = data.total; state.loaded = data.messages.length;
   renderMessages(data.messages, null);
   renderPagers();
-  els.viewInfo.textContent = `${data.total} message(s)` + (filterQS() ? ' (filtered)' : '');
+  updateViewInfo();
+  window.scrollTo(0, 0);
+}
+
+// Initial load: land on the newest page (negative start counts back from the
+// end of the whole archive) and scroll to the bottom, chat-style.
+async function loadInitial() {
+  const data = await api(`/api/messages?start=${-PAGE}&count=${PAGE}${filterQS()}`);
+  state.start = data.start; state.total = data.total; state.loaded = data.messages.length;
+  renderMessages(data.messages, null);
+  renderPagers();
+  updateViewInfo();
+  window.scrollTo(0, document.body.scrollHeight);
 }
 
 async function jumpTo(id) {
   const data = await api(`/api/messages?anchor=${encodeURIComponent(id)}&count=${PAGE}${filterQS()}`);
-  state.start = data.start; state.total = data.total;
+  state.searching = false;
+  els.searchClear.classList.add('hidden');
+  state.start = data.start; state.total = data.total; state.loaded = data.messages.length;
   renderMessages(data.messages, id);
   renderPagers();
+  updateViewInfo();
   const el = els.list.querySelector('.msg.anchor');
   if (el) el.scrollIntoView({ block: 'center' });
+}
+
+// Infinite scroll: scrolling up prepends the previous page, scrolling down
+// appends the next one. Prepending keeps the viewport stable.
+async function loadOlder() {
+  if (state.searching || state.loadingTop || state.start <= 0) return;
+  state.loadingTop = true; setSentinel(els.sentinelTop, true);
+  try {
+    const from = Math.max(0, state.start - PAGE);
+    const data = await api(`/api/messages?start=${from}&count=${state.start - from}${filterQS()}`);
+    if (data.messages.length) {
+      const prevHeight = document.body.scrollHeight;
+      const frag = document.createDocumentFragment();
+      for (const msg of data.messages) frag.appendChild(renderMessage(msg, false));
+      els.list.prepend(frag);
+      state.start = data.start; state.loaded += data.messages.length; state.total = data.total;
+      window.scrollTo(0, window.scrollY + (document.body.scrollHeight - prevHeight));
+    }
+    renderPagers(); updateViewInfo();
+  } finally { state.loadingTop = false; setSentinel(els.sentinelTop, false); }
+}
+
+async function loadNewer() {
+  if (state.searching || state.loadingBottom || state.start + state.loaded >= state.total) return;
+  state.loadingBottom = true; setSentinel(els.sentinelBottom, true);
+  try {
+    const from = state.start + state.loaded;
+    const data = await api(`/api/messages?start=${from}&count=${PAGE}${filterQS()}`);
+    if (data.messages.length) {
+      const frag = document.createDocumentFragment();
+      for (const msg of data.messages) frag.appendChild(renderMessage(msg, false));
+      els.list.appendChild(frag);
+      state.loaded += data.messages.length; state.total = data.total;
+    }
+    renderPagers(); updateViewInfo();
+  } finally { state.loadingBottom = false; setSentinel(els.sentinelBottom, false); }
 }
 
 function renderMessages(messages, anchorId) {
@@ -172,12 +239,12 @@ function renderPagers() {
     const frag = document.createDocumentFragment();
     const newer = document.createElement('button');
     newer.textContent = 'Newer';
-    newer.disabled = state.start <= 0;
-    newer.addEventListener('click', () => loadMessages(Math.max(0, state.start - PAGE)));
+    newer.disabled = state.start + state.loaded >= state.total;
+    newer.addEventListener('click', () => loadMessages(Math.min(state.total - 1, state.start + state.loaded)));
     const older = document.createElement('button');
     older.textContent = 'Older';
-    older.disabled = state.start + PAGE >= state.total;
-    older.addEventListener('click', () => loadMessages(state.start + PAGE));
+    older.disabled = state.start <= 0;
+    older.addEventListener('click', () => loadMessages(Math.max(0, state.start - PAGE)));
     frag.appendChild(newer); frag.appendChild(older);
     return frag;
   };
@@ -212,7 +279,7 @@ function clearSearch() {
   state.searching = false;
   els.search.value = '';
   els.searchClear.classList.add('hidden');
-  loadMessages(0);
+  loadInitial();
 }
 
 // -- gallery ----------------------------------------------------------------
@@ -303,7 +370,7 @@ function showPane(mode) {
 
 async function refresh() {
   if (state.searching && els.search.value.trim()) return doSearch();
-  if (state.mode === 'messages') await loadMessages(state.start || 0);
+  if (state.mode === 'messages') await loadInitial();
   else if (state.mode === 'gallery') await refreshGallery();
   else await loadStats();
 }
@@ -319,6 +386,17 @@ $('view-messages').addEventListener('click', () => showPane('messages'));
 $('view-gallery').addEventListener('click', () => showPane('gallery'));
 $('view-stats').addEventListener('click', () => showPane('stats'));
 els.galleryMore.addEventListener('click', loadMoreGallery);
+
+// Infinite scroll: preload a page before the sentinels reach the viewport edge.
+const scrollObserver = new IntersectionObserver((entries) => {
+  for (const e of entries) {
+    if (!e.isIntersecting) continue;
+    if (e.target === els.sentinelTop) loadOlder();
+    else if (e.target === els.sentinelBottom) loadNewer();
+  }
+}, { rootMargin: '600px' });
+scrollObserver.observe(els.sentinelTop);
+scrollObserver.observe(els.sentinelBottom);
 
 // -- boot -------------------------------------------------------------------
 loadArchives().catch((e) => {

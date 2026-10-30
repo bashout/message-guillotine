@@ -22,6 +22,8 @@ button:hover { border-color: var(--accent); }
 main { padding: 12px; max-width: 960px; margin: 0 auto; }
 .hidden { display: none !important; }
 .pager { display: flex; gap: 8px; justify-content: center; padding: 10px 0; color: var(--fg-dim); }
+.sentinel { height: 1px; color: var(--fg-dim); text-align: center; font-size: 12px; }
+.sentinel.loading::after { content: 'Loading\2026'; }
 .msg { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
   padding: 8px 12px; margin-bottom: 8px; }
 .msg.anchor { border-color: var(--accent); }
