@@ -196,7 +196,9 @@ impl PanelApp {
             }
             "quit" => {
                 // Quit is the only way to shut the app down; the Iced daemon
-                // intentionally keeps running with zero windows.
+                // intentionally keeps running with zero windows. Stop any
+                // detached archive viewers this GUI spawned.
+                super::shutdown_viewers();
                 std::process::exit(0);
             }
             other => {

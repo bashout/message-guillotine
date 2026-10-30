@@ -261,19 +261,64 @@ fn rust_viewer_available() -> bool {
     })
 }
 
+/// Viewer subprocesses spawned from the tray, so Quit can stop them.
+static VIEWER_CHILDREN: std::sync::Mutex<Vec<std::process::Child>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Stop any archive-viewer subprocesses this GUI spawned. Called on Quit.
+pub(crate) fn shutdown_viewers() {
+    if let Ok(mut children) = VIEWER_CHILDREN.lock() {
+        for mut child in children.drain(..) {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Spawn a child fully detached from this process: null stdio and its own
+/// process group/session, so signals meant for the GUI (Ctrl-C, terminal
+/// hangup, Quit) never reach the child and closing the viewer can never take
+/// the tray app down with it.
+fn spawn_detached(
+    program: &Path,
+    args: &[&std::ffi::OsStr],
+) -> std::io::Result<std::process::Child> {
+    use std::process::Stdio;
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+    }
+    cmd.spawn()
+}
+
 /// Open an archive folder in the best available viewer: the Rust `viewer`
 /// subcommand of this same binary when present, else the configured Python
 /// viewer (config `archive_viewer` / GUILLOTINE_VIEWER), else the OS file
-/// manager.
+/// manager. The viewer is spawned detached (see `spawn_detached`) so its
+/// lifecycle is independent of the tray app: closing the viewer never kills
+/// the GUI, and Quit stops the viewer via `shutdown_viewers`.
 fn open_archive(folder: &Path) {
     if rust_viewer_available() {
         if let Ok(exe) = std::env::current_exe() {
-            if std::process::Command::new(exe)
-                .arg("viewer")
-                .arg(folder)
-                .spawn()
-                .is_ok()
-            {
+            let args: Vec<&std::ffi::OsStr> =
+                vec![std::ffi::OsStr::new("viewer"), folder.as_os_str()];
+            if let Ok(child) = spawn_detached(&exe, &args) {
+                if let Ok(mut children) = VIEWER_CHILDREN.lock() {
+                    children.push(child);
+                }
                 return;
             }
         }
