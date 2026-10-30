@@ -134,10 +134,21 @@ async function jumpTo(id) {
 }
 
 // Infinite scroll: scrolling up prepends the previous page, scrolling down
-// appends the next one. Prepending keeps the viewport stable.
+// appends the next one. Prepending keeps the viewport stable. A sentinel is
+// unobserved while its load runs and re-armed on the next scroll gesture, so
+// one scroll-up loads a single page instead of chain-loading the archive.
+function rearmOnScroll(sentinel) {
+  const rearm = () => {
+    scrollObserver.observe(sentinel);
+    window.removeEventListener('scroll', rearm);
+  };
+  window.addEventListener('scroll', rearm, { passive: true });
+}
+
 async function loadOlder() {
   if (state.searching || state.loadingTop || state.start <= 0) return;
   state.loadingTop = true; setSentinel(els.sentinelTop, true);
+  scrollObserver.unobserve(els.sentinelTop);
   try {
     const from = Math.max(0, state.start - PAGE);
     const data = await api(`/api/messages?start=${from}&count=${state.start - from}${filterQS()}`);
@@ -150,12 +161,16 @@ async function loadOlder() {
       window.scrollTo(0, window.scrollY + (document.body.scrollHeight - prevHeight));
     }
     renderPagers(); updateViewInfo();
-  } finally { state.loadingTop = false; setSentinel(els.sentinelTop, false); }
+  } finally {
+    state.loadingTop = false; setSentinel(els.sentinelTop, false);
+    rearmOnScroll(els.sentinelTop);
+  }
 }
 
 async function loadNewer() {
   if (state.searching || state.loadingBottom || state.start + state.loaded >= state.total) return;
   state.loadingBottom = true; setSentinel(els.sentinelBottom, true);
+  scrollObserver.unobserve(els.sentinelBottom);
   try {
     const from = state.start + state.loaded;
     const data = await api(`/api/messages?start=${from}&count=${PAGE}${filterQS()}`);
@@ -166,13 +181,19 @@ async function loadNewer() {
       state.loaded += data.messages.length; state.total = data.total;
     }
     renderPagers(); updateViewInfo();
-  } finally { state.loadingBottom = false; setSentinel(els.sentinelBottom, false); }
+  } finally {
+    state.loadingBottom = false; setSentinel(els.sentinelBottom, false);
+    rearmOnScroll(els.sentinelBottom);
+  }
 }
 
 function renderMessages(messages, anchorId) {
   els.list.innerHTML = '';
   for (const msg of messages) els.list.appendChild(renderMessage(msg, anchorId === msg.id));
   if (!messages.length) els.list.innerHTML = '<p style="color:var(--fg-dim)">No messages.</p>';
+  // A replace (jump/pager/filter) resets the scroll window: re-arm both sentinels.
+  scrollObserver.observe(els.sentinelTop);
+  scrollObserver.observe(els.sentinelBottom);
 }
 
 function renderMessage(msg, isAnchor) {

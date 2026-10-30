@@ -5,6 +5,7 @@
 }
 body { margin: 0; background: var(--bg); color: var(--fg);
   font: 14px/1.45 -apple-system, "Segoe UI", Roboto, sans-serif; }
+#sticky-head { position: sticky; top: 0; z-index: 20; background: var(--bg); }
 #topbar { display: flex; gap: 8px; align-items: center; padding: 8px 12px;
   background: var(--panel); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
 #topbar select, #topbar input, #filter-bar input { background: var(--bg); color: var(--fg);
@@ -16,7 +17,8 @@ button:hover { border-color: var(--accent); }
 .tab.active { border-color: var(--accent); color: var(--accent); }
 .spacer { flex: 1; }
 #filter-bar { display: flex; gap: 14px; align-items: center; padding: 6px 12px;
-  border-bottom: 1px solid var(--line); color: var(--fg-dim); flex-wrap: wrap; }
+  border-bottom: 1px solid var(--line); color: var(--fg-dim); flex-wrap: wrap;
+  background: var(--bg); }
 #filter-bar label { display: flex; gap: 5px; align-items: center; }
 #view-info { margin-left: auto; color: var(--fg-dim); }
 main { padding: 12px; max-width: 960px; margin: 0 auto; }
