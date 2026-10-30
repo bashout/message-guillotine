@@ -44,14 +44,15 @@ jobs:
       - name: cargo build --release --no-default-features (headless)
         run: cargo build --release --no-default-features
 
-      - name: cargo check --target aarch64-unknown-linux-gnu (gui)
+      # Headless-only for the cross target: the gui feature pulls in gtk/glib-sys,
+      # whose build scripts need an aarch64 sysroot + cross pkg-config that an
+      # x86_64 runner does not have. Real arm64 gui builds run natively on the
+      # ubuntu-24.04-arm runner in release.yml.
+      - name: cargo check --target aarch64-unknown-linux-gnu --no-default-features (headless)
         run: |
           sudo apt-get install -y gcc-aarch64-linux-gnu
           rustup target add aarch64-unknown-linux-gnu
-          cargo check --target aarch64-unknown-linux-gnu
-
-      - name: cargo check --target aarch64-unknown-linux-gnu --no-default-features (headless)
-        run: cargo check --target aarch64-unknown-linux-gnu --no-default-features
+          cargo check --target aarch64-unknown-linux-gnu --no-default-features
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0

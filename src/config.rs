@@ -70,9 +70,9 @@ pub fn write_file_private(path: &Path, contents: &str) -> std::io::Result<()> {
 /// Append to a file, creating it with owner-only permissions (0600 on unix)
 /// when it does not exist yet. Used for the append-only archive ledgers.
 pub fn append_file_private(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
     #[cfg(unix)]
     {
-        use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt;
         std::fs::OpenOptions::new()
             .append(true)
