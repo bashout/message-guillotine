@@ -444,4 +444,122 @@ mod tests {
         assert!(resp.get("running").is_none());
         assert!(resp["runs"].is_object());
     }
+
+    // ------------------------------------------------------------------
+    // Loopback integration: handle() over a real 127.0.0.1 TCP socket.
+    // ------------------------------------------------------------------
+
+    async fn spawn_ipc(secret: &str, cfg: Config) -> u16 {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let cfg = Arc::new(cfg);
+        let secret = secret.to_string();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = match listener.accept().await {
+                    Ok(x) => x,
+                    Err(_) => return,
+                };
+                let cfg = cfg.clone();
+                let secret = secret.clone();
+                tokio::spawn(async move {
+                    let registry = crate::progress::new_registry();
+                    let _ = handle(stream, cfg, registry, secret).await;
+                });
+            }
+        });
+        port
+    }
+
+    async fn ipc_send(port: u16, line: &str) -> String {
+        use tokio::io::AsyncBufReadExt as _;
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        stream.write_all(line.as_bytes()).await.unwrap();
+        stream.write_all(b"\n").await.unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut resp = String::new();
+        let n = reader.read_line(&mut resp).await.unwrap();
+        if n == 0 {
+            return String::new(); // EOF: no response written
+        }
+        resp.trim().to_string()
+    }
+
+    fn ipc_cfg() -> Config {
+        // The token contains a newline so the run-now background task's
+        // Client::new fails immediately — the test never touches the network.
+        toml::from_str(
+            "token = \"bad\\ntoken\"\n[chat.\"guild:1/channel:2\"]\nschedule = \"daily\"\nretention_days = 7\n",
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn ipc_missing_or_wrong_secret_is_unauthorized() {
+        let port = spawn_ipc("test-secret", ipc_cfg()).await;
+        let resp: Value = serde_json::from_str(&ipc_send(port, r#"{"cmd":"status"}"#).await).unwrap();
+        assert_eq!(resp, json!({"ok": false, "error": "unauthorized"}));
+        let resp: Value =
+            serde_json::from_str(&ipc_send(port, r#"{"cmd":"status","secret":"nope"}"#).await).unwrap();
+        assert_eq!(resp, json!({"ok": false, "error": "unauthorized"}));
+        // empty secret is not the secret
+        let resp: Value =
+            serde_json::from_str(&ipc_send(port, r#"{"cmd":"status","secret":""}"#).await).unwrap();
+        assert_eq!(resp["ok"], false);
+    }
+
+    #[tokio::test]
+    async fn ipc_status_with_correct_secret() {
+        let port = spawn_ipc("test-secret", ipc_cfg()).await;
+        let resp: Value =
+            serde_json::from_str(&ipc_send(port, r#"{"cmd":"status","secret":"test-secret"}"#).await)
+                .unwrap();
+        assert_eq!(resp["ok"], true);
+        assert!(resp["runs"].is_object());
+    }
+
+    #[tokio::test]
+    async fn ipc_unknown_cmd_is_an_error() {
+        let port = spawn_ipc("test-secret", ipc_cfg()).await;
+        let resp: Value = serde_json::from_str(
+            &ipc_send(port, r#"{"cmd":"explode","secret":"test-secret"}"#).await,
+        )
+        .unwrap();
+        assert_eq!(resp["ok"], false);
+        assert!(resp["error"].as_str().unwrap().contains("unknown cmd"));
+    }
+
+    #[tokio::test]
+    async fn ipc_over_64kib_line_gets_no_response() {
+        let port = spawn_ipc("test-secret", ipc_cfg()).await;
+        let mut big = String::from(r#"{"cmd":"status","secret":"test-secret","pad":""#);
+        big.push_str(&"a".repeat(100 * 1024));
+        big.push_str("\"}");
+        // truncated at the 64 KiB cap -> unparseable -> handler errors out and
+        // the connection closes without a response line
+        let resp = ipc_send(port, &big).await;
+        assert!(resp.is_empty(), "over-cap line must not be answered: {resp:?}");
+    }
+
+    #[tokio::test]
+    async fn ipc_run_now_acks_immediately() {
+        let port = spawn_ipc("test-secret", ipc_cfg()).await;
+        // The reply must be the immediate ack, not a deletion result: the
+        // background job cannot even build a client with this config's token.
+        let resp: Value = serde_json::from_str(
+            &ipc_send(port, r#"{"cmd":"run_now","chat":"guild:1/channel:2","secret":"test-secret"}"#)
+                .await,
+        )
+        .unwrap();
+        assert_eq!(
+            resp,
+            json!({"ok": true, "accepted": true, "chat": "guild:1/channel:2"})
+        );
+        // an invalid chat key is rejected synchronously
+        let resp: Value = serde_json::from_str(
+            &ipc_send(port, r#"{"cmd":"run_now","chat":"not-a-key","secret":"test-secret"}"#).await,
+        )
+        .unwrap();
+        assert_eq!(resp["ok"], false);
+    }
 }

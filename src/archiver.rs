@@ -256,6 +256,7 @@ pub async fn archive_chat(
                     {
                         let mut mf = std::fs::OpenOptions::new()
                             .append(true)
+                            .create(true)
                             .open(folder.join("manifest.jsonl"))?;
                         use std::io::Write;
                         mf.write_all((serde_json::to_string(&entry).unwrap() + "\n").as_bytes())?;
@@ -271,6 +272,7 @@ pub async fn archive_chat(
                 {
                     let mut jf = std::fs::OpenOptions::new()
                         .append(true)
+                        .create(true)
                         .open(folder.join("messages.jsonl"))?;
                     use std::io::Write;
                     jf.write_all((serde_json::to_string(&fmt::minimal_message(msg)).unwrap() + "\n").as_bytes())?;
@@ -427,5 +429,231 @@ mod tests {
         assert!(!root2.join("messages.jsonl").exists());
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&root2);
+    }
+
+    // ------------------------------------------------------------------
+    // archive_chat end-to-end against a loopback mock API (no real network).
+    // ------------------------------------------------------------------
+
+    use crate::api::User;
+    use crate::testutil::{MockAction, MockServer};
+
+    fn archive_msg(id: &str, day: u8, content: &str, attachments: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "author": {"id": "7", "username": "alice", "global_name": "Alice"},
+            "timestamp": format!("2026-01-{day:02}T00:00:00+00:00"),
+            "content": content,
+            "type": 0,
+            "attachments": attachments,
+        })
+    }
+
+    fn mock_client(server: &MockServer) -> Client {
+        let mut client = Client::with_base_url("dummy-token", &server.url()).unwrap();
+        client.current_user = Some(User {
+            id: "7".into(),
+            username: "alice".into(),
+            discriminator: "0".into(),
+            global_name: Some("Alice".into()),
+            bot: false,
+        });
+        client
+    }
+
+    fn att(id: &str, filename: &str, url: &str) -> serde_json::Value {
+        serde_json::json!({"id": id, "filename": filename, "url": url})
+    }
+
+    fn read_jsonl(path: &Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn archive_chat_round_trip_is_v1_compatible_and_viewable() {
+        let root = temp_root("roundtrip");
+        let archive_dir = root.join("archives");
+        std::fs::create_dir_all(&archive_dir).unwrap();
+
+        let server = MockServer::start(vec![MockAction::ok_json(serde_json::json!([
+            archive_msg("2", 2, "second", serde_json::json!([])),
+            archive_msg("1", 1, "first", serde_json::json!([])),
+        ]))])
+        .await;
+        // second action queue entry is unused if the page is short; keep the
+        // server simple: one page ends the run (page < 100 messages).
+        let client = mock_client(&server);
+        let folder = archive_chat(&client, "42", "My Chat", &archive_dir)
+            .await
+            .unwrap()
+            .expect("archive folder");
+
+        // meta.json: V1 payload
+        let meta: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(folder.join("meta.json")).unwrap()).unwrap();
+        assert_eq!(meta, serde_json::json!({"channel_id": "42", "chat": "My Chat"}));
+        // status.json: completed
+        let status: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(folder.join("status.json")).unwrap()).unwrap();
+        assert_eq!(status, serde_json::json!({"complete": true}));
+        // messages.jsonl: oldest first, minimal V1 record keys
+        let records = read_jsonl(&folder.join("messages.jsonl"));
+        let ids: Vec<&str> = records.iter().map(|r| r["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["1", "2"]);
+        let keys: Vec<&str> = records[0].as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            ["attachment_ids", "author", "author_id", "content", "edited_timestamp", "id", "pinned", "reply_to", "timestamp", "type"]
+        );
+        assert_eq!(records[0]["author"], "Alice");
+
+        // the viewer loads the archive and serves its payloads
+        let archive = crate::viewer::library::Archive::load(&folder);
+        let meta_payload = archive.meta_payload();
+        assert_eq!(meta_payload["chat"], "My Chat");
+        assert_eq!(meta_payload["channel_id"], "42");
+        assert_eq!(meta_payload["total_messages"], 2);
+        assert!(archive.resolve("missing.png").is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn archive_chat_downloads_attachments_and_writes_manifest() {
+        let root = temp_root("atts");
+        let archive_dir = root.join("archives");
+        std::fs::create_dir_all(&archive_dir).unwrap();
+
+        let server = MockServer::start(vec![]).await;
+        let cdn_url = format!("{}/cdn/1", server.url());
+        // request order: GET messages (after=0), then GET /cdn/1; the short
+        // page ends the run, so no second history fetch.
+        server.push(MockAction::ok_json(serde_json::json!([archive_msg(
+            "1",
+            1,
+            "with pic",
+            serde_json::json!([att("a1", "pic.png", &cdn_url)]),
+        )])));
+        server.push(MockAction::bytes(b"data"));
+
+        let client = mock_client(&server);
+        let folder = archive_chat(&client, "42", "chat", &archive_dir)
+            .await
+            .unwrap()
+            .expect("archive folder");
+
+        // manifest.jsonl: one ok entry pointing at the downloaded file
+        let entries = read_jsonl(&folder.join("manifest.jsonl"));
+        assert_eq!(entries.len(), 1);
+        let e = &entries[0];
+        assert_eq!(e["seq"], 1);
+        assert_eq!(e["message_id"], "1");
+        assert_eq!(e["attachment_id"], "a1");
+        assert_eq!(e["filename"], "pic.png");
+        assert_eq!(e["local_path"], "attachments/0001_1_pic.png");
+        assert_eq!(e["size"], 4);
+        assert_eq!(e["status"], "ok");
+        assert_eq!(std::fs::read(folder.join("attachments/0001_1_pic.png")).unwrap(), b"data");
+        // the CDN request carried no Authorization header
+        let requests = server.requests();
+        let cdn_req = requests
+            .iter()
+            .find(|r| r.path == "/cdn/1")
+            .expect("cdn request recorded");
+        assert_eq!(cdn_req.header("authorization"), None);
+        // the viewer resolves the file and exposes its /media URL
+        let archive = crate::viewer::library::Archive::load(&folder);
+        assert_eq!(archive.meta_payload()["total_attachments"], 1);
+        let page = archive.page_payload(0, 10, None, false);
+        assert_eq!(page["messages"][0]["attachments"][0]["url"], "/media/0001_1_pic.png");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn archive_chat_resume_appends_without_duplicates() {
+        let root = temp_root("resume");
+        let archive_dir = root.join("archives");
+        std::fs::create_dir_all(&archive_dir).unwrap();
+
+        let server = MockServer::start(vec![
+            MockAction::ok_json(serde_json::json!([
+                archive_msg("1", 1, "m1", serde_json::json!([])),
+                archive_msg("2", 2, "m2", serde_json::json!([])),
+            ])),
+        ])
+        .await;
+        let client = mock_client(&server);
+        let first = archive_chat(&client, "42", "chat", &archive_dir)
+            .await
+            .unwrap()
+            .expect("archive folder");
+
+        // second run: same channel, only the new message is served
+        let server2 = MockServer::start(vec![MockAction::ok_json(serde_json::json!([
+            archive_msg("3", 3, "m3", serde_json::json!([])),
+        ]))])
+        .await;
+        let client2 = mock_client(&server2);
+        let second = archive_chat(&client2, "42", "chat", &archive_dir)
+            .await
+            .unwrap()
+            .expect("same folder resumed");
+        assert_eq!(second, first, "resume appends to the existing archive");
+        // the resume starts after the stored cursor (last archived id)
+        assert!(
+            server2.requests()[0].path.contains("after=2"),
+            "{}",
+            server2.requests()[0].path
+        );
+        let records = read_jsonl(&second.join("messages.jsonl"));
+        let ids: Vec<&str> = records.iter().map(|r| r["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["1", "2", "3"], "appended once, sorted, no duplicates");
+        let status: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(second.join("status.json")).unwrap()).unwrap();
+        assert_eq!(status, serde_json::json!({"complete": true}));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn archive_chat_failed_attachment_is_recorded_failed_without_file() {
+        let root = temp_root("att-fail");
+        let archive_dir = root.join("archives");
+        std::fs::create_dir_all(&archive_dir).unwrap();
+
+        let server = MockServer::start(vec![]).await;
+        let cdn_url = format!("{}/cdn/1", server.url());
+        server.push(MockAction::ok_json(serde_json::json!([archive_msg(
+            "1",
+            1,
+            "with pic",
+            serde_json::json!([att("a1", "pic.png", &cdn_url)]),
+        )])));
+        // mid-stream failure on the CDN download
+        server.push(MockAction::PartialThenDrop {
+            status: 200,
+            headers: vec![],
+            prefix: b"partial".to_vec(),
+            declared_len: 4096,
+        });
+
+        let client = mock_client(&server);
+        let folder = archive_chat(&client, "42", "chat", &archive_dir)
+            .await
+            .unwrap()
+            .expect("archive folder");
+        let entries = read_jsonl(&folder.join("manifest.jsonl"));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["status"], "failed");
+        assert!(entries[0]["local_path"].is_null());
+        assert!(entries[0]["size"].is_null());
+        assert!(!folder.join("attachments/0001_1_pic.png").exists());
+        assert!(!folder.join("attachments/0001_1_pic.png.part").exists(), "no .part left");
+        // the message itself is still archived
+        let records = read_jsonl(&folder.join("messages.jsonl"));
+        assert_eq!(records.len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

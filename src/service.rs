@@ -155,8 +155,9 @@ pub fn status(_config_arg: Option<&Path>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// launchd LaunchAgent (macOS).
-#[cfg(target_os = "macos")]
+/// launchd LaunchAgent (macOS). Compiled on every OS so the escaping rules
+/// are unit-testable everywhere.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
@@ -289,4 +290,36 @@ pub fn status(_config_arg: Option<&Path>) -> anyhow::Result<()> {
         }
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn systemd_quote_escapes_specials_and_wraps_in_quotes() {
+        // plain path: just quoted
+        assert_eq!(systemd_quote(Path::new("/usr/bin/guillotine")), "\"/usr/bin/guillotine\"");
+        // backslash, quote, dollar, backtick, percent are escaped
+        let tricky = Path::new("/tmp/a\\b\"c$d`e%f");
+        assert_eq!(
+            systemd_quote(tricky),
+            "\"/tmp/a\\\\b\\\"c\\$d\\`e%%f\""
+        );
+        // spaces need no escaping inside the quotes
+        assert_eq!(systemd_quote(Path::new("/tmp/my dir/x")), "\"/tmp/my dir/x\"");
+    }
+
+    #[test]
+    fn xml_escape_escapes_markup_chars() {
+        assert_eq!(xml_escape("plain"), "plain");
+        assert_eq!(xml_escape("a<b>&\"c\""), "a&lt;b&gt;&amp;\"c\"");
+        assert_eq!(
+            xml_escape("/tmp/<weird> & \"path\""),
+            "/tmp/&lt;weird&gt; &amp; \"path\""
+        );
+        assert_eq!(xml_escape(""), "");
+    }
 }
