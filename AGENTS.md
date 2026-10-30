@@ -20,6 +20,7 @@ Bulk delete/archive of your own Discord messages (self-bot; violates the platfor
 - Paths in generated service units (systemd/launchd) must be escaped; per-OS code stays behind `cfg`.
 - The tray is persistent; the egui panel is transient (X hides it — winit allows one EventLoop per process — Quit exits).
 - Tests for pure logic (snowflakes, schedules, filters, paging, traversal rejection); run `cargo test --release` before committing.
+- CI: GitHub Actions in `.github/workflows/` are SHA-pinned to commit hashes (never floating tags) with a top-level `permissions: contents: read`; only the release job gets `contents: write`. Keep `cargo fmt --check`, clippy, tests, and the headless build green.
 
 ## Layout
 

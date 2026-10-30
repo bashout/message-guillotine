@@ -20,6 +20,31 @@ fn config_path(config_arg: Option<&Path>) -> PathBuf {
         .unwrap_or_else(config::default_config_path)
 }
 
+/// Resolves when the process should shut down: SIGINT (Ctrl-C) on every
+/// platform, plus SIGTERM on unix so `systemctl stop` flushes cleanly.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = sigterm.recv() => {}
+                }
+            }
+            Err(e) => {
+                tracing::warn!("could not register SIGTERM handler ({e}); SIGINT only");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
 /// Run the daemon in the foreground, logging to the per-OS data dir.
 pub async fn run(config_arg: Option<&Path>) -> anyhow::Result<()> {
     let path = config_path(config_arg);
@@ -67,10 +92,11 @@ pub async fn run(config_arg: Option<&Path>) -> anyhow::Result<()> {
     });
 
     tracing::info!(config = %path.display(), "guillotine service starting");
-    // Graceful shutdown: flush logs and exit cleanly on SIGINT/SIGTERM.
+    // Graceful shutdown: flush logs and exit cleanly on SIGINT (Ctrl-C) and,
+    // on unix, SIGTERM (e.g. `systemctl stop`).
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
+        shutdown_signal().await;
         tracing::info!("shutdown signal received; flushing logs");
         let _ = shutdown_tx.send(());
     });

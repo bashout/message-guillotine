@@ -5,6 +5,13 @@ on:
     tags:
       - "v2.*"
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     name: Build ${{ matrix.artifact }}
@@ -17,25 +24,38 @@ jobs:
             target: x86_64-unknown-linux-gnu
             bin: guillotine
             artifact: guillotine-linux-x86_64
+            archive: tar.gz
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            bin: guillotine
+            artifact: guillotine-linux-aarch64
+            archive: tar.gz
           - os: macos-latest
             target: aarch64-apple-darwin
             bin: guillotine
             artifact: guillotine-macos-aarch64
+            archive: tar.gz
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            bin: guillotine
+            artifact: guillotine-macos-x86_64
+            archive: tar.gz
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             bin: guillotine.exe
-            artifact: guillotine-windows-x86_64.exe
+            artifact: guillotine-windows-x86_64
+            archive: zip
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: ${{ matrix.target }}
 
       - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Install system deps (tray/GUI libs, Linux only)
         if: runner.os == 'Linux'
@@ -44,7 +64,6 @@ jobs:
           sudo apt-get install -y libxdo-dev libayatana-appindicator3-dev pkg-config libgtk-3-dev
 
       - name: cargo build --release
-        working-directory: .
         run: cargo build --release --target ${{ matrix.target }}
 
       # cargo names the binary after [[bin]] ("guillotine"), not after the
@@ -52,14 +71,31 @@ jobs:
       - name: Stage artifact
         shell: bash
         run: |
-          mkdir -p dist
-          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${{ matrix.artifact }}"
+          mkdir -p dist/pkg
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/pkg/${{ matrix.bin }}"
+          cp "dist/pkg/${{ matrix.bin }}" "dist/${{ matrix.artifact }}"
+
+      - name: Smoke test (--help)
+        shell: bash
+        run: "dist/pkg/${{ matrix.bin }} --help"
+
+      - name: Package archive (tar.gz)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: tar -czf "dist/${{ matrix.artifact }}.${{ matrix.archive }}" -C dist/pkg "${{ matrix.bin }}"
+
+      - name: Package archive (zip)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path "dist/pkg/${{ matrix.bin }}" -DestinationPath "dist/${{ matrix.artifact }}.zip" -Force
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ matrix.artifact }}
-          path: dist/${{ matrix.artifact }}
+          path: |
+            dist/${{ matrix.artifact }}
+            dist/${{ matrix.artifact }}.${{ matrix.archive }}
           if-no-files-found: error
 
   release:
@@ -70,16 +106,16 @@ jobs:
       contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: artifacts
           merge-multiple: true
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}

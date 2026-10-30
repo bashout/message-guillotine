@@ -2,40 +2,74 @@ name: Rust CI
 
 on:
   push:
-    branches: [main, v2/rust-service]
+    branches: [main]
   pull_request:
     branches: [main, v2/rust-service]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
-    name: Test + clippy (ubuntu-latest)
+    name: fmt + test + clippy + coverage (ubuntu-latest)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
       - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Install system deps (tray/GUI libs)
         run: |
           sudo apt-get update
           sudo apt-get install -y libxdo-dev libayatana-appindicator3-dev pkg-config libgtk-3-dev
 
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
       - name: cargo test --release
-        working-directory: .
         run: cargo test --release
 
       - name: cargo clippy --all-targets -- -D warnings
-        working-directory: .
         run: cargo clippy --all-targets -- -D warnings
 
       - name: cargo build --release --no-default-features (headless)
-        working-directory: .
         run: cargo build --release --no-default-features
+
+      - name: cargo check --target aarch64-unknown-linux-gnu (gui)
+        run: |
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          rustup target add aarch64-unknown-linux-gnu
+          cargo check --target aarch64-unknown-linux-gnu
+
+      - name: cargo check --target aarch64-unknown-linux-gnu --no-default-features (headless)
+        run: cargo check --target aarch64-unknown-linux-gnu --no-default-features
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Install llvm-tools component
+        run: rustup component add llvm-tools-preview
+
+      - name: Coverage (lcov, no ratchet yet)
+        run: cargo llvm-cov --lcov --output-path lcov.info
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-lcov
+          path: lcov.info
+          if-no-files-found: error
 
   build:
     name: Build ${{ matrix.artifact }}
@@ -58,15 +92,15 @@ jobs:
             artifact: guillotine-windows-x86_64.exe
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: ${{ matrix.target }}
 
       - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Install system deps (tray/GUI libs, Linux only)
         if: runner.os == 'Linux'
@@ -75,7 +109,6 @@ jobs:
           sudo apt-get install -y libxdo-dev libayatana-appindicator3-dev pkg-config libgtk-3-dev
 
       - name: cargo build --release
-        working-directory: .
         run: cargo build --release --target ${{ matrix.target }}
 
       # cargo names the binary after [[bin]] ("guillotine"), not after the
@@ -87,7 +120,7 @@ jobs:
           cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${{ matrix.artifact }}"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ matrix.artifact }}
           path: dist/${{ matrix.artifact }}
