@@ -152,11 +152,19 @@ fn init_tracing() {
     // Ring-buffer layer so the gui can show its own output in the Logs tab.
     struct RingBuf;
     impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RingBuf {
-        fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
             use tracing::field::Visit;
             struct V(String);
             impl Visit for V {
-                fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
                     self.0.push_str(&format!(" {}={value:?}", field.name()));
                 }
             }
@@ -196,15 +204,14 @@ fn main() -> anyhow::Result<()> {
         #[cfg(feature = "gui")]
         return gui::run_sync(config_arg);
         #[cfg(not(feature = "gui"))]
-        anyhow::bail!("built without the gui feature; use `guillotine service run` and the CLI subcommands");
+        anyhow::bail!(
+            "built without the gui feature; use `guillotine service run` and the CLI subcommands"
+        );
     }
     tokio::runtime::Runtime::new()?.block_on(run_async(config_arg, command))
 }
 
-async fn run_async(
-    config_arg: Option<PathBuf>,
-    command: Commands,
-) -> anyhow::Result<()> {
+async fn run_async(config_arg: Option<PathBuf>, command: Commands) -> anyhow::Result<()> {
     // The service path installs its own file-logging subscriber; everything
     // else logs to stderr.
     if !matches!(

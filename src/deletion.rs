@@ -175,7 +175,13 @@ fn cutoff_check(epoch: &anyhow::Result<f64>, cutoff: Option<f64>) -> CutoffCheck
 /// Persist or drop the session file at the end of a run. A dry run never
 /// writes and never clears; an aborted run saves (resume); a complete run
 /// clears.
-fn persist_session(channel_id: &str, state: &Session, aborted: bool, dry_run: bool, root: Option<&Path>) {
+fn persist_session(
+    channel_id: &str,
+    state: &Session,
+    aborted: bool,
+    dry_run: bool,
+    root: Option<&Path>,
+) {
     if aborted && !dry_run {
         save_session(channel_id, state, root);
     } else if !aborted && !dry_run {
@@ -217,12 +223,15 @@ pub struct DeletionOptions<'a> {
     pub registry: Option<&'a crate::progress::SharedRegistry>,
 }
 
-pub async fn run_deletion(
-    client: &Client,
-    channel_id: &str,
-    opts: DeletionOptions<'_>,
-) -> Summary {
-    let DeletionOptions { label, cutoff, resume, dry_run, root, registry } = opts;
+pub async fn run_deletion(client: &Client, channel_id: &str, opts: DeletionOptions<'_>) -> Summary {
+    let DeletionOptions {
+        label,
+        cutoff,
+        resume,
+        dry_run,
+        root,
+        registry,
+    } = opts;
     let channel_id = channel_id.to_string();
     let cutoff_ts = cutoff.map(|c| c.timestamp() as f64);
 
@@ -372,7 +381,14 @@ pub async fn scan(
     let summary = run_deletion(
         &client,
         channel,
-        DeletionOptions { label: channel, cutoff, resume: None, dry_run: true, root: None, registry: None },
+        DeletionOptions {
+            label: channel,
+            cutoff,
+            resume: None,
+            dry_run: true,
+            root: None,
+            registry: None,
+        },
     )
     .await;
     println!(
@@ -400,7 +416,15 @@ mod tests {
         root
     }
 
-    fn session(channel: &str, scanned: u64, deleted: u64, failed: u64, skipped: u64, cursor: Option<&str>, complete: bool) -> Session {
+    fn session(
+        channel: &str,
+        scanned: u64,
+        deleted: u64,
+        failed: u64,
+        skipped: u64,
+        cursor: Option<&str>,
+        complete: bool,
+    ) -> Session {
         Session {
             channel_id: channel.to_string(),
             label: "label".to_string(),
@@ -429,7 +453,9 @@ mod tests {
         assert_eq!(loaded.before_cursor.as_deref(), Some("999"));
         assert!(!loaded.complete);
         // no .part file left behind (atomic rename)
-        assert!(!session_path("123", Some(&root)).with_extension("json.part").exists());
+        assert!(!session_path("123", Some(&root))
+            .with_extension("json.part")
+            .exists());
         clear_session("123", Some(&root));
         assert!(load_session("123", Some(&root)).is_none());
         let _ = std::fs::remove_dir_all(&root);
@@ -496,7 +522,10 @@ mod tests {
         let cut = 1_700_000_000.0;
         assert_eq!(cutoff_check(&Ok(cut + 0.5), Some(cut)), CutoffCheck::Newer);
         assert_eq!(cutoff_check(&Ok(cut), Some(cut)), CutoffCheck::InRange);
-        assert_eq!(cutoff_check(&Ok(cut - 1.0), Some(cut)), CutoffCheck::InRange);
+        assert_eq!(
+            cutoff_check(&Ok(cut - 1.0), Some(cut)),
+            CutoffCheck::InRange
+        );
         let undatable: anyhow::Result<f64> = Err(anyhow::anyhow!("bad timestamp"));
         assert_eq!(cutoff_check(&undatable, Some(cut)), CutoffCheck::Undatable);
         // no cutoff: everything in range, even undatable
@@ -513,7 +542,10 @@ mod tests {
         // dry run, complete: still no clear of a pre-existing file
         save_session("5", &s, Some(&root));
         persist_session("5", &s, false, true, Some(&root));
-        assert!(session_path("5", Some(&root)).exists(), "dry run must not clear");
+        assert!(
+            session_path("5", Some(&root)).exists(),
+            "dry run must not clear"
+        );
         // real run, complete: clears
         persist_session("5", &s, false, false, Some(&root));
         assert!(!session_path("5", Some(&root)).exists());
@@ -521,7 +553,15 @@ mod tests {
         let s2 = session("6", 8, 5, 1, 2, Some("222"), false);
         persist_session("6", &s2, true, false, Some(&root));
         let loaded = load_session("6", Some(&root)).unwrap();
-        assert_eq!((loaded.scanned, loaded.deleted, loaded.failed, loaded.skipped), (8, 5, 1, 2));
+        assert_eq!(
+            (
+                loaded.scanned,
+                loaded.deleted,
+                loaded.failed,
+                loaded.skipped
+            ),
+            (8, 5, 1, 2)
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -614,7 +654,10 @@ mod tests {
     async fn run_others_system_messages_never_reach_delete() {
         let root = temp_root("run-other-sys");
         let server = MockServer::start(vec![
-            page(vec![msg("9", "999", 9, "other system", 3), msg("5", "7", 5, "mine", 0)]),
+            page(vec![
+                msg("9", "999", 9, "other system", 3),
+                msg("5", "7", 5, "mine", 0),
+            ]),
             MockAction::status(204),
         ])
         .await;
@@ -622,7 +665,10 @@ mod tests {
         let summary = run_deletion(&client, "42", run_opts(&root, false, None)).await;
         assert_eq!(delete_requests(&server), vec!["/channels/42/messages/5"]);
         assert_eq!(summary.scanned, 2);
-        assert_eq!(summary.skipped, 0, "dropped by the mine-only check before the system check");
+        assert_eq!(
+            summary.skipped, 0,
+            "dropped by the mine-only check before the system check"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -643,7 +689,10 @@ mod tests {
         assert_eq!(summary.skipped, 1);
         assert_eq!(summary.samples, vec!["u: hello world".to_string()]);
         assert!(summary.complete);
-        assert!(load_session("42", Some(&root)).is_none(), "dry run writes no session");
+        assert!(
+            load_session("42", Some(&root)).is_none(),
+            "dry run writes no session"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -660,7 +709,11 @@ mod tests {
         let resume = session("42", 10, 4, 0, 1, Some("4"), false);
         let summary = run_deletion(&client, "42", run_opts(&root, false, Some(resume))).await;
         // the first fetch continues after the saved cursor, no rescan
-        assert!(server.requests()[0].path.contains("before=4"), "{}", server.requests()[0].path);
+        assert!(
+            server.requests()[0].path.contains("before=4"),
+            "{}",
+            server.requests()[0].path
+        );
         assert_eq!(summary.scanned, 12);
         assert_eq!(summary.deleted, 6);
         assert_eq!(summary.skipped, 1);
@@ -671,7 +724,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn run_auth_abort_persists_resumable_session() {
         let root = temp_root("run-auth");
-        let server = MockServer::start(vec![page(vec![msg("5", "7", 5, "m5", 0)]), MockAction::status(401)]).await;
+        let server = MockServer::start(vec![
+            page(vec![msg("5", "7", 5, "m5", 0)]),
+            MockAction::status(401),
+        ])
+        .await;
         let client = mock_client(&server);
         let summary = run_deletion(&client, "42", run_opts(&root, false, None)).await;
         assert!(!summary.complete);
@@ -734,7 +791,10 @@ mod tests {
         let summary = run_deletion(&client, "42", run_opts(&root, false, None)).await;
         assert!(!summary.complete);
         assert!(
-            summary.aborted.as_deref().is_some_and(|a| a.starts_with("fetch failed:")),
+            summary
+                .aborted
+                .as_deref()
+                .is_some_and(|a| a.starts_with("fetch failed:")),
             "{:?}",
             summary.aborted
         );

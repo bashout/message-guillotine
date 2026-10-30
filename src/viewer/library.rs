@@ -62,7 +62,11 @@ impl Archive {
         let index_by_id: HashMap<String, usize> = messages
             .iter()
             .enumerate()
-            .filter_map(|(i, m)| m.get("id").and_then(Value::as_str).map(|id| (id.to_string(), i)))
+            .filter_map(|(i, m)| {
+                m.get("id")
+                    .and_then(Value::as_str)
+                    .map(|id| (id.to_string(), i))
+            })
             .collect();
         let mut attachments_by_id = HashMap::new();
         for entry in load_jsonl_readonly(&folder.join("manifest.jsonl")) {
@@ -82,8 +86,7 @@ impl Archive {
             .iter()
             .enumerate()
             .filter_map(|(i, m)| {
-                if m
-                    .get("attachment_ids")
+                if m.get("attachment_ids")
                     .and_then(Value::as_array)
                     .is_some_and(|a| !a.is_empty())
                 {
@@ -258,7 +261,10 @@ impl Archive {
         }
         let mut view = Vec::new();
         for (i, message) in self.messages.iter().enumerate() {
-            let timestamp = message.get("timestamp").and_then(Value::as_str).unwrap_or("");
+            let timestamp = message
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .unwrap_or("");
             if let Some(from) = &filters.date_from {
                 if timestamp < from.as_str() {
                     continue;
@@ -461,7 +467,11 @@ impl Archive {
 
     pub fn attachments_payload(&self, start: usize, count: usize, year: Option<&str>) -> Value {
         let records: Vec<&AttachmentRecord> = match year {
-            Some(y) => self.attachment_records.iter().filter(|r| r.year == y).collect(),
+            Some(y) => self
+                .attachment_records
+                .iter()
+                .filter(|r| r.year == y)
+                .collect(),
             None => self.attachment_records.iter().collect(),
         };
         let total = records.len();
@@ -508,8 +518,15 @@ impl Archive {
                         .to_string(),
                 )
                 .or_insert(0) += 1;
-            let ts = message.get("timestamp").and_then(Value::as_str).unwrap_or("");
-            let month = if ts.len() >= 7 { ts[..7].to_string() } else { String::new() };
+            let ts = message
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let month = if ts.len() >= 7 {
+                ts[..7].to_string()
+            } else {
+                String::new()
+            };
             *months.entry(month).or_insert(0) += 1;
             if message
                 .get("edited_timestamp")
@@ -525,7 +542,11 @@ impl Archive {
             {
                 replies += 1;
             }
-            if message.get("pinned").and_then(Value::as_bool).unwrap_or(false) {
+            if message
+                .get("pinned")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
                 pinned += 1;
             }
             if message
@@ -676,7 +697,12 @@ impl Library {
         // Only bare child names are accepted: this rejects traversal ("..",
         // embedded separators) without resolving, so symlinked archive
         // folders work.
-        if name.is_empty() || name.contains('/') || name.contains('\\') || name == "." || name == ".." {
+        if name.is_empty()
+            || name.contains('/')
+            || name.contains('\\')
+            || name == "."
+            || name == ".."
+        {
             return None;
         }
         let folder = self.root.join(name);

@@ -375,11 +375,17 @@ impl Config {
         }
         for (key, chat) in &self.chat {
             if chat.retention_days > 36_500 {
-                bail!("retention_days for chat {key} is {}; max 36500 (100 years)", chat.retention_days);
+                bail!(
+                    "retention_days for chat {key} is {}; max 36500 (100 years)",
+                    chat.retention_days
+                );
             }
         }
         if self.dm.default_retention_days > 36_500 {
-            bail!("dm.default_retention_days is {}; max 36500", self.dm.default_retention_days);
+            bail!(
+                "dm.default_retention_days is {}; max 36500",
+                self.dm.default_retention_days
+            );
         }
         for key in self.chat.keys() {
             ChatKey::parse(key)
@@ -598,9 +604,15 @@ archive_before_delete = true
         assert_eq!(s.kind, ScheduleKind::Weekly);
         assert_eq!(s.at, NaiveTime::from_hms_opt(9, 15, 0).unwrap());
         // default 04:00 when no "at" clause
-        assert_eq!(Schedule::from_str("weekly").unwrap().at, NaiveTime::from_hms_opt(4, 0, 0).unwrap());
+        assert_eq!(
+            Schedule::from_str("weekly").unwrap().at,
+            NaiveTime::from_hms_opt(4, 0, 0).unwrap()
+        );
         // case-insensitive kind
-        assert_eq!(Schedule::from_str("MONTHLY").unwrap().kind, ScheduleKind::Monthly);
+        assert_eq!(
+            Schedule::from_str("MONTHLY").unwrap().kind,
+            ScheduleKind::Monthly
+        );
         // invalid forms
         assert!(Schedule::from_str("daily at 25:00").is_err());
         assert!(Schedule::from_str("daily at 12:60").is_err());
@@ -650,7 +662,10 @@ retention_days = 7
         assert!(cfg.dm_user_in_scope("1"));
         assert!(!cfg.dm_user_in_scope("2"));
         assert_eq!(cfg.dm_chat_settings("1").unwrap().retention_days, 7);
-        assert!(cfg.dm_chat_settings("2").is_none(), "nominate: unlisted user not in scope at all");
+        assert!(
+            cfg.dm_chat_settings("2").is_none(),
+            "nominate: unlisted user not in scope at all"
+        );
 
         // exclude: everyone except listed; unlisted users get dm defaults
         let cfg: Config = toml::from_str(
@@ -736,38 +751,59 @@ retention_days = 7
     #[test]
     fn private_writers_set_owner_only_modes() {
         use std::os::unix::fs::PermissionsExt;
-        let root = std::env::temp_dir().join(format!("guillotine-config-test-{}-perms", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "guillotine-config-test-{}-perms",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
 
         // direct private write: 0600 from creation
         let p = root.join("a.txt");
         write_file_private(&p, "x").unwrap();
-        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
 
         // atomic private write: temp is 0600 and the rename keeps 0600
         let p = root.join("b.txt");
         write_file_private_atomic(&p, "y").unwrap();
-        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         assert!(!root.join("b.txt.part").exists());
         // overwrite path also ends 0600
         write_file_private_atomic(&p, "z").unwrap();
-        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
 
         // append creates 0600
         let p = root.join("c.jsonl");
         append_file_private(&p, "1\n").unwrap();
         append_file_private(&p, "2\n").unwrap();
-        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "1\n2\n");
 
         // private dir: 0700, and an existing loose dir is tightened
         let d = root.join("sub");
         ensure_private_dir(&d).unwrap();
-        assert_eq!(std::fs::metadata(&d).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(
+            std::fs::metadata(&d).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
         std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
         ensure_private_dir(&d).unwrap();
-        assert_eq!(std::fs::metadata(&d).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(
+            std::fs::metadata(&d).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -775,22 +811,34 @@ retention_days = 7
     #[test]
     fn retention_clamp_validation() {
         // over the clamp: rejected for a chat entry
-        let path = temp_config("clamp1", "token = \"t\"\n[chat.\"dm:1\"]\nschedule = \"daily\"\nretention_days = 36501\n");
+        let path = temp_config(
+            "clamp1",
+            "token = \"t\"\n[chat.\"dm:1\"]\nschedule = \"daily\"\nretention_days = 36501\n",
+        );
         assert!(Config::load(&path).is_err());
         // over the clamp: rejected for the dm default
-        let path = temp_config("clamp2", "token = \"t\"\n[dm]\npolicy = \"exclude\"\ndefault_retention_days = 40000\n");
+        let path = temp_config(
+            "clamp2",
+            "token = \"t\"\n[dm]\npolicy = \"exclude\"\ndefault_retention_days = 40000\n",
+        );
         assert!(Config::load(&path).is_err());
         // exactly at the clamp: accepted
         let path = temp_config("clamp3", "token = \"t\"\n[dm]\npolicy = \"exclude\"\ndefault_retention_days = 36500\n[chat.\"dm:1\"]\nschedule = \"daily\"\nretention_days = 36500\n");
         assert!(Config::load(&path).is_ok());
         // invalid chat key in [chat] table is a load error
-        let path = temp_config("clamp4", "token = \"t\"\n[chat.\"dm:../evil\"]\nschedule = \"daily\"\nretention_days = 1\n");
+        let path = temp_config(
+            "clamp4",
+            "token = \"t\"\n[chat.\"dm:../evil\"]\nschedule = \"daily\"\nretention_days = 1\n",
+        );
         assert!(Config::load(&path).is_err());
         // missing token entirely is a load error
         let path = temp_config("clamp5", "[dm]\npolicy = \"exclude\"\n");
         assert!(Config::load(&path).is_err());
         for tag in ["clamp1", "clamp2", "clamp3", "clamp4", "clamp5"] {
-            let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!("guillotine-config-test-{}-{tag}", std::process::id())));
+            let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!(
+                "guillotine-config-test-{}-{tag}",
+                std::process::id()
+            )));
         }
     }
 
@@ -800,7 +848,10 @@ retention_days = 7
         static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-        let path = temp_config("prio", "token = \"file-token\"\narchive_dir = \"/config/dir\"\n");
+        let path = temp_config(
+            "prio",
+            "token = \"file-token\"\narchive_dir = \"/config/dir\"\n",
+        );
         let cfg = Config::load(&path).unwrap();
         // config file value
         std::env::remove_var(ENV_ARCHIVE_DIR);
@@ -832,7 +883,13 @@ retention_days = 7
         assert!(dbg.contains("<redacted>"));
         assert!(!dbg.contains("file-token"));
 
-        let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!("guillotine-config-test-{}-prio", std::process::id())));
-        let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!("guillotine-config-test-{}-prio2", std::process::id())));
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!(
+            "guillotine-config-test-{}-prio",
+            std::process::id()
+        )));
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!(
+            "guillotine-config-test-{}-prio2",
+            std::process::id()
+        )));
     }
 }

@@ -81,7 +81,12 @@ pub fn record_last_run(chat: &str, summary: &crate::deletion::Summary) {
         let _ = std::fs::create_dir_all(parent);
     }
     let tmp = file.with_extension("json.part");
-    if crate::config::write_file_private(&tmp, &(serde_json::to_string_pretty(&runs).unwrap() + "\n")).is_ok() {
+    if crate::config::write_file_private(
+        &tmp,
+        &(serde_json::to_string_pretty(&runs).unwrap() + "\n"),
+    )
+    .is_ok()
+    {
         let _ = std::fs::rename(&tmp, &file);
     }
 }
@@ -100,7 +105,9 @@ pub async fn serve(
         }
     };
     let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
-    if let Err(e) = config::ensure_data_dir().and_then(|_| config::write_file_private(&port_file(), &format!("{port}\n"))) {
+    if let Err(e) = config::ensure_data_dir()
+        .and_then(|_| config::write_file_private(&port_file(), &format!("{port}\n")))
+    {
         tracing::warn!(error = %e, "ipc: cannot write port file");
     }
     let secret = match load_or_create_secret() {
@@ -171,16 +178,25 @@ async fn handle(
     // neither exhaust memory nor hold a task/fd forever.
     let line = read_request_line(BufReader::new(reader)).await?;
     let req: Value = serde_json::from_str(line.trim())?;
-    if !secret_eq(req.get("secret").and_then(|s| s.as_str()).unwrap_or(""), &secret) {
+    if !secret_eq(
+        req.get("secret").and_then(|s| s.as_str()).unwrap_or(""),
+        &secret,
+    ) {
         let resp = json!({ "ok": false, "error": "unauthorized" });
-        writer.write_all((serde_json::to_string(&resp)? + "\n").as_bytes()).await?;
+        writer
+            .write_all((serde_json::to_string(&resp)? + "\n").as_bytes())
+            .await?;
         return Ok(());
     }
     let resp = match req.get("cmd").and_then(|c| c.as_str()) {
         Some("status") => status_response(),
         Some("jobs") => jobs_response(&registry),
         Some("archive") => {
-            let channel = req.get("channel").and_then(|c| c.as_str()).unwrap_or("").to_string();
+            let channel = req
+                .get("channel")
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .to_string();
             if !crate::config::valid_id(&channel) {
                 json!({ "ok": false, "error": "channel id must be numeric" })
             } else {
@@ -192,10 +208,15 @@ async fn handle(
                     // Auth failure must stop the archive, not run it unauthenticated.
                     let client = match crate::api::authed_client(&cfg).await {
                         Ok(c) => c,
-                        Err(e) => { tracing::warn!(error = %e, "archive: authentication failed"); return; }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "archive: authentication failed");
+                            return;
+                        }
                     };
                     let dir = cfg.resolve_archive_dir(None);
-                    if let Err(e) = crate::archiver::archive_chat(&client, &channel, &channel, &dir).await {
+                    if let Err(e) =
+                        crate::archiver::archive_chat(&client, &channel, &channel, &dir).await
+                    {
                         tracing::warn!(channel = %channel, error = %e, "archive failed");
                     }
                 });
@@ -203,7 +224,11 @@ async fn handle(
             }
         }
         Some("run_now") => {
-            let chat = req.get("chat").and_then(|c| c.as_str()).unwrap_or("").to_string();
+            let chat = req
+                .get("chat")
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .to_string();
             let all = req.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
             // Ack immediately and run in the background: a deletion can take
             // many minutes at the 24/min pace, and the client must not time
@@ -220,7 +245,9 @@ async fn handle(
                                 tracing::info!(chat = %chat_log, deleted = summary.deleted, "run-now finished");
                                 record_last_run(&chat_log, &summary);
                             }
-                            Err(e) => tracing::warn!(chat = %chat_log, error = %e, "run-now failed"),
+                            Err(e) => {
+                                tracing::warn!(chat = %chat_log, error = %e, "run-now failed")
+                            }
                         }
                     });
                     json!({ "ok": true, "accepted": true, "chat": chat })
@@ -270,14 +297,19 @@ fn prepare_run_now(cfg: &Config, chat: &str, delete_all: bool) -> anyhow::Result
     Ok(ChatJob { key, settings })
 }
 
-async fn run_now_via_daemon(cfg: &Config, job: ChatJob, registry: &crate::progress::SharedRegistry) -> anyhow::Result<crate::deletion::Summary> {
+async fn run_now_via_daemon(
+    cfg: &Config,
+    job: ChatJob,
+    registry: &crate::progress::SharedRegistry,
+) -> anyhow::Result<crate::deletion::Summary> {
     let client = crate::api::authed_client(cfg).await?;
     scheduler::run_chat_job(&client, cfg, &job, registry).await
 }
 
 /// Client side: send one command to the running daemon.
 pub async fn send(mut cmd: Value) -> anyhow::Result<Value> {
-    let secret = std::fs::read_to_string(secret_file()).context("no ipc secret — is the service running?")?;
+    let secret = std::fs::read_to_string(secret_file())
+        .context("no ipc secret — is the service running?")?;
     cmd["secret"] = Value::String(secret.trim().to_string());
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         let port: u16 = std::fs::read_to_string(port_file())?
@@ -363,7 +395,10 @@ mod tests {
         // nominated user with own entry
         let job = prepare_run_now(&cfg, "dm:1", false).unwrap();
         assert_eq!(job.settings.retention_days, 7);
-        assert_eq!(job.settings.schedule.kind, crate::config::ScheduleKind::Weekly);
+        assert_eq!(
+            job.settings.schedule.kind,
+            crate::config::ScheduleKind::Weekly
+        );
         // all=true forces retention 0 (delete everything)
         let job = prepare_run_now(&cfg, "dm:1", true).unwrap();
         assert_eq!(job.settings.retention_days, 0);
@@ -456,10 +491,12 @@ mod tests {
     #[tokio::test]
     async fn ipc_missing_or_wrong_secret_is_unauthorized() {
         let port = spawn_ipc("test-secret", ipc_cfg()).await;
-        let resp: Value = serde_json::from_str(&ipc_send(port, r#"{"cmd":"status"}"#).await).unwrap();
+        let resp: Value =
+            serde_json::from_str(&ipc_send(port, r#"{"cmd":"status"}"#).await).unwrap();
         assert_eq!(resp, json!({"ok": false, "error": "unauthorized"}));
         let resp: Value =
-            serde_json::from_str(&ipc_send(port, r#"{"cmd":"status","secret":"nope"}"#).await).unwrap();
+            serde_json::from_str(&ipc_send(port, r#"{"cmd":"status","secret":"nope"}"#).await)
+                .unwrap();
         assert_eq!(resp, json!({"ok": false, "error": "unauthorized"}));
         // empty secret is not the secret
         let resp: Value =
@@ -470,9 +507,10 @@ mod tests {
     #[tokio::test]
     async fn ipc_status_with_correct_secret() {
         let port = spawn_ipc("test-secret", ipc_cfg()).await;
-        let resp: Value =
-            serde_json::from_str(&ipc_send(port, r#"{"cmd":"status","secret":"test-secret"}"#).await)
-                .unwrap();
+        let resp: Value = serde_json::from_str(
+            &ipc_send(port, r#"{"cmd":"status","secret":"test-secret"}"#).await,
+        )
+        .unwrap();
         assert_eq!(resp["ok"], true);
         assert!(resp["runs"].is_object());
     }
@@ -497,7 +535,10 @@ mod tests {
         // truncated at the 64 KiB cap -> unparseable -> handler errors out and
         // the connection closes without a response line
         let resp = ipc_send(port, &big).await;
-        assert!(resp.is_empty(), "over-cap line must not be answered: {resp:?}");
+        assert!(
+            resp.is_empty(),
+            "over-cap line must not be answered: {resp:?}"
+        );
     }
 
     #[tokio::test]
@@ -506,8 +547,11 @@ mod tests {
         // The reply must be the immediate ack, not a deletion result: the
         // background job cannot even build a client with this config's token.
         let resp: Value = serde_json::from_str(
-            &ipc_send(port, r#"{"cmd":"run_now","chat":"guild:1/channel:2","secret":"test-secret"}"#)
-                .await,
+            &ipc_send(
+                port,
+                r#"{"cmd":"run_now","chat":"guild:1/channel:2","secret":"test-secret"}"#,
+            )
+            .await,
         )
         .unwrap();
         assert_eq!(
@@ -516,7 +560,11 @@ mod tests {
         );
         // an invalid chat key is rejected synchronously
         let resp: Value = serde_json::from_str(
-            &ipc_send(port, r#"{"cmd":"run_now","chat":"not-a-key","secret":"test-secret"}"#).await,
+            &ipc_send(
+                port,
+                r#"{"cmd":"run_now","chat":"not-a-key","secret":"test-secret"}"#,
+            )
+            .await,
         )
         .unwrap();
         assert_eq!(resp["ok"], false);

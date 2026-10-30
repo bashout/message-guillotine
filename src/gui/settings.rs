@@ -117,7 +117,10 @@ impl SettingsState {
             archive_dir,
             archive_viewer,
             dm_policy: format!("{:?}", dm.policy).to_lowercase(),
-            dm_policy_options: combo_box::State::new(vec!["nominate".to_string(), "exclude".to_string()]),
+            dm_policy_options: combo_box::State::new(vec![
+                "nominate".to_string(),
+                "exclude".to_string(),
+            ]),
             dm_users: dm.users.join(", "),
             default_schedule: dm.default_schedule.to_string(),
             default_schedule_options: schedule_state(),
@@ -170,7 +173,10 @@ impl PanelApp {
         );
 
         // -- Archives --
-        col = col.push(Self::heading(format!("Archives ({} detected)", s.archives.len())));
+        col = col.push(Self::heading(format!(
+            "Archives ({} detected)",
+            s.archives.len()
+        )));
         col = col.push(
             row![
                 text("Archive folder:").width(Length::Fixed(110.0)),
@@ -247,7 +253,10 @@ impl PanelApp {
         );
 
         // -- DM chats --
-        col = col.push(Self::heading(format!("DM chats ({} available)", s.dm_rows.len())));
+        col = col.push(Self::heading(format!(
+            "DM chats ({} available)",
+            s.dm_rows.len()
+        )));
         if s.dm_pending {
             col = col.push(text("fetching your DMs…").color(muted()));
         }
@@ -267,7 +276,10 @@ impl PanelApp {
         );
 
         // -- Guild channels --
-        col = col.push(Self::heading(format!("Guild channels ({})", s.manual_chats.len())));
+        col = col.push(Self::heading(format!(
+            "Guild channels ({})",
+            s.manual_chats.len()
+        )));
         if s.guild_pending {
             col = col.push(text("fetching your guilds…").color(muted()));
         }
@@ -283,16 +295,28 @@ impl PanelApp {
         col = col.push(
             row![
                 text("guild:").width(Length::Fixed(60.0)),
-                combo_box(&s.guild_options, "select…", selected_guild, Message::GuildSelected),
+                combo_box(
+                    &s.guild_options,
+                    "select…",
+                    selected_guild,
+                    Message::GuildSelected
+                ),
                 text("channel:").width(Length::Fixed(60.0)),
                 combo_box(
                     &s.channel_options,
-                    if s.channels_pending { "fetching…" } else { "select…" },
+                    if s.channels_pending {
+                        "fetching…"
+                    } else {
+                        "select…"
+                    },
                     selected_channel,
                     Message::ChannelSelected,
                 ),
-                button(text("add channel"))
-                    .on_press_maybe(if can_add { Some(Message::AddChannel) } else { None }),
+                button(text("add channel")).on_press_maybe(if can_add {
+                    Some(Message::AddChannel)
+                } else {
+                    None
+                }),
             ]
             .spacing(8)
             .align_y(iced::Alignment::Center),
@@ -332,7 +356,10 @@ impl PanelApp {
             row![
                 checkbox(r.enabled).on_toggle(move |v| Message::DmRowToggled(i, v)),
                 text(r.name.clone()).size(15),
-                text(r.user_id.clone()).font(Font::MONOSPACE).size(11).color(muted()),
+                text(r.user_id.clone())
+                    .font(Font::MONOSPACE)
+                    .size(11)
+                    .color(muted()),
             ]
             .spacing(8)
             .align_y(iced::Alignment::Center),
@@ -342,9 +369,12 @@ impl PanelApp {
             col = col.push(
                 row![
                     Space::new().width(Length::Fixed(24.0)),
-                    combo_box(&r.schedule_options, "schedule", Some(&r.schedule), move |v| {
-                        Message::DmRowSchedule(i, v)
-                    }),
+                    combo_box(
+                        &r.schedule_options,
+                        "schedule",
+                        Some(&r.schedule),
+                        move |v| { Message::DmRowSchedule(i, v) }
+                    ),
                     text("retain days:"),
                     text_input("days", &r.retention)
                         .on_input(move |v| Message::DmRowRetention(i, v))
@@ -365,14 +395,21 @@ impl PanelApp {
             .into()
     }
 
-    pub(crate) fn manual_chat_view<'a>(&'a self, i: usize, r: &'a ManualChat) -> Element<'a, Message> {
+    pub(crate) fn manual_chat_view<'a>(
+        &'a self,
+        i: usize,
+        r: &'a ManualChat,
+    ) -> Element<'a, Message> {
         row![
             text_input("guild:<id>/channel:<id>", &r.key)
                 .on_input(move |v| Message::ManualKeyChanged(i, v))
                 .width(Length::Fixed(300.0)),
-            combo_box(&r.schedule_options, "schedule", Some(&r.schedule), move |v| {
-                Message::ManualSchedule(i, v)
-            }),
+            combo_box(
+                &r.schedule_options,
+                "schedule",
+                Some(&r.schedule),
+                move |v| { Message::ManualSchedule(i, v) }
+            ),
             text_input("days", &r.retention)
                 .on_input(move |v| Message::ManualRetention(i, v))
                 .width(Length::Fixed(60.0)),
@@ -403,7 +440,6 @@ impl PanelApp {
             b.into()
         }
     }
-
 }
 
 /// Returns the status line to show in the UI.
@@ -428,7 +464,10 @@ pub(crate) fn save_config(path: &Path, s: &SettingsState) -> String {
     }
     // round-trip the viewer path so saving from the GUI doesn't drop it
     if let Some(v) = &s.archive_viewer {
-        doc.insert("archive_viewer".into(), toml::Value::String(v.display().to_string()));
+        doc.insert(
+            "archive_viewer".into(),
+            toml::Value::String(v.display().to_string()),
+        );
     }
     if !s.archive_dir.is_empty() {
         doc.insert(
@@ -451,7 +490,10 @@ pub(crate) fn save_config(path: &Path, s: &SettingsState) -> String {
         toml::Value::String(s.default_schedule.clone()),
     );
     if let Ok(n) = s.default_retention.parse::<u32>() {
-        dm.insert("default_retention_days".into(), toml::Value::Integer(n as i64));
+        dm.insert(
+            "default_retention_days".into(),
+            toml::Value::Integer(n as i64),
+        );
     }
     dm.insert(
         "default_archive_before_delete".into(),
@@ -466,7 +508,10 @@ pub(crate) fn save_config(path: &Path, s: &SettingsState) -> String {
         if let Ok(n) = row.retention.parse::<u32>() {
             t.insert("retention_days".into(), toml::Value::Integer(n as i64));
         }
-        t.insert("archive_before_delete".into(), toml::Value::Boolean(row.archive));
+        t.insert(
+            "archive_before_delete".into(),
+            toml::Value::Boolean(row.archive),
+        );
         chats.insert(format!("dm:{}", row.user_id), toml::Value::Table(t));
     }
     for row in &s.manual_chats {
@@ -475,7 +520,10 @@ pub(crate) fn save_config(path: &Path, s: &SettingsState) -> String {
         if let Ok(n) = row.retention.parse::<u32>() {
             t.insert("retention_days".into(), toml::Value::Integer(n as i64));
         }
-        t.insert("archive_before_delete".into(), toml::Value::Boolean(row.archive));
+        t.insert(
+            "archive_before_delete".into(),
+            toml::Value::Boolean(row.archive),
+        );
         chats.insert(row.key.clone(), toml::Value::Table(t));
     }
     doc.insert("chat".into(), toml::Value::Table(chats));
@@ -507,7 +555,9 @@ pub(crate) fn detect_archives(dir: &Path) -> Vec<(String, PathBuf)> {
         .collect()
 }
 /// Fetch the user's DM partners from the API: (user id, "Display (@username)").
-pub(crate) async fn fetch_dm_users(client: Option<Arc<crate::api::Client>>) -> Vec<(String, String)> {
+pub(crate) async fn fetch_dm_users(
+    client: Option<Arc<crate::api::Client>>,
+) -> Vec<(String, String)> {
     let mut out = Vec::new();
     if let Some(c) = client {
         if let Ok(channels) = c.get_dm_channels().await {
@@ -537,7 +587,10 @@ pub(crate) async fn fetch_guilds(client: Option<Arc<crate::api::Client>>) -> Vec
 }
 
 /// Fetch a guild's text channels from the API: (channel id, "#name").
-pub(crate) async fn fetch_guild_channels(client: &crate::api::Client, guild_id: &str) -> Vec<(String, String)> {
+pub(crate) async fn fetch_guild_channels(
+    client: &crate::api::Client,
+    guild_id: &str,
+) -> Vec<(String, String)> {
     let mut out = Vec::new();
     if let Ok(channels) = client.get_guild_channels(guild_id).await {
         for c in channels {
@@ -560,7 +613,9 @@ pub(crate) async fn fetch_guild_channels_owned(
 fn validate_row(schedule: &str, retention: &str) -> Result<(), String> {
     use std::str::FromStr;
     if crate::config::Schedule::from_str(schedule).is_err() {
-        Err(format!("invalid schedule {schedule:?} (use daily/weekly/monthly)"))
+        Err(format!(
+            "invalid schedule {schedule:?} (use daily/weekly/monthly)"
+        ))
     } else if retention.parse::<u32>().is_err() {
         Err(format!("invalid retention {retention:?} (days)"))
     } else {

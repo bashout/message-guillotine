@@ -82,10 +82,16 @@ pub fn q_int(q: &HashMap<String, String>, name: &str, default: i64) -> Result<i6
 
 /// The archive for a request: the ?archive= pin when given, else the shared
 /// selection.
-pub fn request_archive(library: &Library, q: &HashMap<String, String>) -> Result<Arc<Archive>, ApiError> {
+pub fn request_archive(
+    library: &Library,
+    q: &HashMap<String, String>,
+) -> Result<Arc<Archive>, ApiError> {
     if let Some(name) = q.get("archive") {
         if name.is_empty() {
-            return Err(json_err(StatusCode::BAD_REQUEST, "archive parameter required"));
+            return Err(json_err(
+                StatusCode::BAD_REQUEST,
+                "archive parameter required",
+            ));
         }
         library
             .load(name)
@@ -205,19 +211,30 @@ pub async fn host_guard(
 // ---------------------------------------------------------------------------
 
 pub async fn index_html() -> Response {
-    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], INDEX_HTML).into_response()
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        INDEX_HTML,
+    )
+        .into_response()
 }
 
 pub async fn app_js() -> Response {
     (
-        [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
         APP_JS,
     )
         .into_response()
 }
 
 pub async fn style_css() -> Response {
-    ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], STYLE_CSS).into_response()
+    (
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        STYLE_CSS,
+    )
+        .into_response()
 }
 
 pub async fn api_archives(State(library): State<Arc<Library>>) -> Json<Value> {
@@ -254,7 +271,10 @@ pub async fn api_meta(State(library): State<Arc<Library>>, RawQuery(raw): RawQue
     Ok(Json(archive.meta_payload()))
 }
 
-pub async fn api_messages(State(library): State<Arc<Library>>, RawQuery(raw): RawQuery) -> ApiResult {
+pub async fn api_messages(
+    State(library): State<Arc<Library>>,
+    RawQuery(raw): RawQuery,
+) -> ApiResult {
     let q = query_map(raw.as_deref());
     let archive = request_archive(&library, &q)?;
     let count = q_int(&q, "count", PAGE_DEFAULT as i64)?.clamp(1, PAGE_MAX as i64) as usize;
@@ -267,10 +287,18 @@ pub async fn api_messages(State(library): State<Arc<Library>>, RawQuery(raw): Ra
         return Ok(Json(payload));
     }
     let start = q_int(&q, "start", 0)?;
-    Ok(Json(archive.page_payload(start, count, filters.as_ref(), reverse)))
+    Ok(Json(archive.page_payload(
+        start,
+        count,
+        filters.as_ref(),
+        reverse,
+    )))
 }
 
-pub async fn api_resolve(State(library): State<Arc<Library>>, RawQuery(raw): RawQuery) -> ApiResult {
+pub async fn api_resolve(
+    State(library): State<Arc<Library>>,
+    RawQuery(raw): RawQuery,
+) -> ApiResult {
     let q = query_map(raw.as_deref());
     let archive = request_archive(&library, &q)?;
     let ids: Vec<String> = q
@@ -285,11 +313,18 @@ pub async fn api_search(State(library): State<Arc<Library>>, RawQuery(raw): RawQ
     let archive = request_archive(&library, &q)?;
     let query = q.get("q").map(|s| s.trim().to_string()).unwrap_or_default();
     if query.is_empty() {
-        return Ok(Json(json!({ "query": "", "results": [], "truncated": false })));
+        return Ok(Json(
+            json!({ "query": "", "results": [], "truncated": false }),
+        ));
     }
     let author = q.get("author").map(|s| s.as_str());
     let filters = parse_filters(&q);
-    Ok(Json(archive.search_payload(&query, author, filters.as_ref(), SEARCH_MAX)))
+    Ok(Json(archive.search_payload(
+        &query,
+        author,
+        filters.as_ref(),
+        SEARCH_MAX,
+    )))
 }
 
 pub async fn api_attachment_years(
@@ -301,7 +336,10 @@ pub async fn api_attachment_years(
     Ok(Json(json!({ "years": archive.attachment_year_counts() })))
 }
 
-pub async fn api_attachments(State(library): State<Arc<Library>>, RawQuery(raw): RawQuery) -> ApiResult {
+pub async fn api_attachments(
+    State(library): State<Arc<Library>>,
+    RawQuery(raw): RawQuery,
+) -> ApiResult {
     let q = query_map(raw.as_deref());
     let archive = request_archive(&library, &q)?;
     let count = q_int(&q, "count", GALLERY_DEFAULT as i64)?.clamp(1, PAGE_MAX as i64) as usize;

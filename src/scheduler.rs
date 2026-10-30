@@ -114,7 +114,11 @@ async fn chat_label(client: &Client, key: &ChatKey) -> String {
         ChatKey::Dm(user) => {
             let mut label = cache_key.clone();
             if let Ok(channels) = client.get_dm_channels().await {
-                if let Some((u, _)) = client.dm_users(&channels).into_iter().find(|(u, _)| &u.id == user) {
+                if let Some((u, _)) = client
+                    .dm_users(&channels)
+                    .into_iter()
+                    .find(|(u, _)| &u.id == user)
+                {
                     let name = u.global_name.clone().unwrap_or_else(|| u.username.clone());
                     label = format!("{name} (@{})", u.username);
                 }
@@ -165,7 +169,11 @@ pub async fn run_chat_job(
     let _guard = deletion::deletion_lock().lock().await;
     if job.settings.archive_before_delete {
         tracing::info!(chat = %label, "archiving before deletion");
-        registry.set_phase(&chat_key, "archiving", "writing archive (appends to existing)");
+        registry.set_phase(
+            &chat_key,
+            "archiving",
+            "writing archive (appends to existing)",
+        );
         if let Err(e) = archiver::archive_chat(client, &channel_id, &label, &archive_dir).await {
             registry.finish(&chat_key, &format!("archive failed: {e:#}"));
             return Err(e);
@@ -175,7 +183,11 @@ pub async fn run_chat_job(
     let cutoff = chrono::Utc::now() - Duration::days(job.settings.retention_days as i64);
     let resume = deletion::load_session(&channel_id, None);
     tracing::info!(chat = %label, retention_days = job.settings.retention_days, "deletion run starting");
-    registry.set_phase(&chat_key, "deleting", &format!("keeping last {} days", job.settings.retention_days));
+    registry.set_phase(
+        &chat_key,
+        "deleting",
+        &format!("keeping last {} days", job.settings.retention_days),
+    );
     let summary = deletion::run_deletion(
         client,
         &channel_id,
@@ -191,7 +203,10 @@ pub async fn run_chat_job(
     .await;
     registry.finish(
         &chat_key,
-        &format!("deleted {} (failed {}, skipped {})", summary.deleted, summary.failed, summary.skipped),
+        &format!(
+            "deleted {} (failed {}, skipped {})",
+            summary.deleted, summary.failed, summary.skipped
+        ),
     );
     Ok(summary)
 }
@@ -273,8 +288,7 @@ pub fn reconcile_schedules(
     jobs: &[ChatJob],
     now: DateTime<Local>,
 ) {
-    let keys: std::collections::HashSet<String> =
-        jobs.iter().map(|j| j.key.to_string()).collect();
+    let keys: std::collections::HashSet<String> = jobs.iter().map(|j| j.key.to_string()).collect();
     state.retain(|k, _| keys.contains(k));
     for job in jobs {
         let key = job.key.to_string();
@@ -412,7 +426,10 @@ pub async fn run_loop(cfg: &Config, config_path: &std::path::Path) -> anyhow::Re
             Ok(fresh_jobs) => {
                 let fresh_keys: std::collections::HashSet<String> =
                     fresh_jobs.iter().map(|j| j.key.to_string()).collect();
-                for gone in jobs.iter().filter(|j| !fresh_keys.contains(&j.key.to_string())) {
+                for gone in jobs
+                    .iter()
+                    .filter(|j| !fresh_keys.contains(&j.key.to_string()))
+                {
                     tracing::info!(chat = %gone.key, "chat removed from config; no longer scheduled");
                 }
                 jobs = fresh_jobs;
@@ -632,7 +649,14 @@ retention_days = 30
         // dm:2 is configured but out of scope under nominate -> dropped;
         // guild channels always in scope
         assert_eq!(job_keys(&jobs), vec!["dm:1", "guild:10/channel:20"]);
-        assert_eq!(jobs.iter().find(|j| j.key.to_string() == "dm:1").unwrap().settings.retention_days, 7);
+        assert_eq!(
+            jobs.iter()
+                .find(|j| j.key.to_string() == "dm:1")
+                .unwrap()
+                .settings
+                .retention_days,
+            7
+        );
 
         let cfg: Config = toml::from_str(
             r#"token = "t"
@@ -706,11 +730,17 @@ default_retention_days = 14
     }
 
     fn weekly() -> Schedule {
-        Schedule { kind: ScheduleKind::Weekly, at: at(4, 0) }
+        Schedule {
+            kind: ScheduleKind::Weekly,
+            at: at(4, 0),
+        }
     }
 
     fn daily() -> Schedule {
-        Schedule { kind: ScheduleKind::Daily, at: at(4, 0) }
+        Schedule {
+            kind: ScheduleKind::Daily,
+            at: at(4, 0),
+        }
     }
 
     #[test]
@@ -718,7 +748,11 @@ default_retention_days = 14
         // First seen Monday 10:00 -> next Monday 04:00.
         let mut state = HashMap::new();
         let j = job("dm:1", weekly());
-        reconcile_schedules(&mut state, std::slice::from_ref(&j), local(2024, 3, 11, 10, 0));
+        reconcile_schedules(
+            &mut state,
+            std::slice::from_ref(&j),
+            local(2024, 3, 11, 10, 0),
+        );
         assert_eq!(state["dm:1"].next, local(2024, 3, 18, 4, 0));
         assert_eq!(state["dm:1"].anchor, Some(chrono::Weekday::Mon));
         // Reconciled again on Tuesday: the pinned anchor keeps it on Monday
@@ -727,7 +761,11 @@ default_retention_days = 14
         assert_eq!(state["dm:1"].next, local(2024, 3, 18, 4, 0));
         // ...and on every other day of the week.
         for day in 13..=17 {
-            reconcile_schedules(&mut state, &[job("dm:1", weekly())], local(2024, 3, day, 0, 0));
+            reconcile_schedules(
+                &mut state,
+                &[job("dm:1", weekly())],
+                local(2024, 3, day, 0, 0),
+            );
             assert_eq!(
                 state["dm:1"].next,
                 local(2024, 3, 18, 4, 0),
@@ -742,7 +780,11 @@ default_retention_days = 14
         // suspend) must stay due and fire late, not be skipped for a period.
         let mut state = HashMap::new();
         let j = job("dm:1", daily());
-        reconcile_schedules(&mut state, std::slice::from_ref(&j), local(2024, 3, 11, 3, 0));
+        reconcile_schedules(
+            &mut state,
+            std::slice::from_ref(&j),
+            local(2024, 3, 11, 3, 0),
+        );
         let due = state["dm:1"].next;
         assert_eq!(due, local(2024, 3, 11, 4, 0));
         reconcile_schedules(&mut state, &[j], local(2024, 3, 11, 9, 0));
@@ -759,10 +801,18 @@ default_retention_days = 14
         );
         assert_eq!(state.len(), 2);
         // dm:2 disappears from the config
-        reconcile_schedules(&mut state, &[job("dm:1", weekly())], local(2024, 3, 12, 0, 0));
+        reconcile_schedules(
+            &mut state,
+            &[job("dm:1", weekly())],
+            local(2024, 3, 12, 0, 0),
+        );
         assert!(!state.contains_key("dm:2"), "removed chats are dropped");
         // dm:1 switches to daily: recomputed, anchor cleared
-        reconcile_schedules(&mut state, &[job("dm:1", daily())], local(2024, 3, 12, 0, 0));
+        reconcile_schedules(
+            &mut state,
+            &[job("dm:1", daily())],
+            local(2024, 3, 12, 0, 0),
+        );
         assert_eq!(state["dm:1"].next, local(2024, 3, 12, 4, 0));
         assert_eq!(state["dm:1"].anchor, None);
         // a new chat is picked up

@@ -35,7 +35,9 @@ impl LogsState {
             Some(active)
         } else {
             files.sort_by_key(|f| {
-                std::fs::metadata(f).and_then(|m| m.modified()).unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+                std::fs::metadata(f)
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
             });
             files.last().cloned()
         };
@@ -56,7 +58,9 @@ impl LogsState {
                 self.daemon = tail;
             }
         }
-        let buf = crate::gui_log_buffer().lock().unwrap_or_else(|e| e.into_inner());
+        let buf = crate::gui_log_buffer()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         self.gui = buf.clone();
     }
 }

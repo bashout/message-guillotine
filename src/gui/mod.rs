@@ -31,14 +31,12 @@ use iced::{Color, Task};
 use muda::accelerator::Accelerator;
 use muda::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 
-
 pub(crate) use jobs::JobsState;
 pub(crate) use logs::LogsState;
 pub(crate) use panel::{panel_theme, panel_title, Message, PanelApp};
 pub(crate) use settings::{
     detect_archives, fetch_dm_users, fetch_guild_channels, fetch_guild_channels_owned,
-    fetch_guilds, save_config,
-    DmRow, ManualChat, SettingsState,
+    fetch_guilds, save_config, DmRow, ManualChat, SettingsState,
 };
 
 /// The branding icon as autocropped 64px RGBA pixels — shared by the tray
@@ -53,34 +51,30 @@ fn brand_icon_pixels() -> Option<(Vec<u8>, u32, u32)> {
     // Autocrop transparent margins so the glyph fills the icon and
     // matches the visual weight of other tray icons.
     {
-            let full = img.to_rgba8();
-            let (w, h) = full.dimensions();
-            let px = full.as_raw();
-            let alpha = |x: u32, y: u32| px[((y * w + x) * 4 + 3) as usize];
-            let (mut minx, mut miny, mut maxx, mut maxy) = (w, h, 0u32, 0u32);
-            for y in 0..h {
-                for x in 0..w {
-                    if alpha(x, y) > 10 {
-                        minx = minx.min(x);
-                        maxx = maxx.max(x);
-                        miny = miny.min(y);
-                        maxy = maxy.max(y);
-                    }
+        let full = img.to_rgba8();
+        let (w, h) = full.dimensions();
+        let px = full.as_raw();
+        let alpha = |x: u32, y: u32| px[((y * w + x) * 4 + 3) as usize];
+        let (mut minx, mut miny, mut maxx, mut maxy) = (w, h, 0u32, 0u32);
+        for y in 0..h {
+            for x in 0..w {
+                if alpha(x, y) > 10 {
+                    minx = minx.min(x);
+                    maxx = maxx.max(x);
+                    miny = miny.min(y);
+                    maxy = maxy.max(y);
                 }
             }
-            let cropped = if maxx > minx && maxy > miny {
-                image::imageops::crop_imm(&full, minx, miny, maxx - minx + 1, maxy - miny + 1)
-                    .to_image()
-            } else {
-                full
-            };
-            let glyph = image::imageops::resize(
-                &cropped,
-                size,
-                size,
-                image::imageops::FilterType::Lanczos3,
-            );
-            Some((glyph.into_raw(), size, size))
+        }
+        let cropped = if maxx > minx && maxy > miny {
+            image::imageops::crop_imm(&full, minx, miny, maxx - minx + 1, maxy - miny + 1)
+                .to_image()
+        } else {
+            full
+        };
+        let glyph =
+            image::imageops::resize(&cropped, size, size, image::imageops::FilterType::Lanczos3);
+        Some((glyph.into_raw(), size, size))
     }
 }
 
@@ -116,8 +110,15 @@ fn install_desktop_entry() {
     if std::fs::create_dir_all(&icons).is_ok() {
         if let Some((rgba, w, h)) = brand_icon_pixels() {
             // save a 256px version for the icon theme
-            if let Ok(img) = image::load_from_memory(include_bytes!("../../branding/icon-transparent.png")) {
-                let big = image::imageops::resize(&img.to_rgba8(), 256, 256, image::imageops::FilterType::Lanczos3);
+            if let Ok(img) =
+                image::load_from_memory(include_bytes!("../../branding/icon-transparent.png"))
+            {
+                let big = image::imageops::resize(
+                    &img.to_rgba8(),
+                    256,
+                    256,
+                    image::imageops::FilterType::Lanczos3,
+                );
                 let _ = big.save(icons.join("guillotine.png"));
             }
             let _ = (rgba, w, h);
@@ -312,7 +313,10 @@ fn open_in_file_manager(folder: &Path) {
 /// ("Display (@username)", "GuildName #channel") via the API. Keys that
 /// can't be resolved are simply absent from the map (callers fall back to
 /// the raw key).
-pub(crate) async fn fetch_chat_labels(client: &crate::api::Client, chats: &[String]) -> HashMap<String, String> {
+pub(crate) async fn fetch_chat_labels(
+    client: &crate::api::Client,
+    chats: &[String],
+) -> HashMap<String, String> {
     use crate::config::ChatKey;
     let mut map = HashMap::new();
     if let Ok(channels) = client.get_dm_channels().await {
@@ -338,9 +342,7 @@ pub(crate) async fn fetch_chat_labels(client: &crate::api::Client, chats: &[Stri
         let Ok(ChatKey::GuildChannel { guild, channel }) = ChatKey::parse(chat) else {
             continue;
         };
-        let channels = channels_by_guild
-            .entry(guild.clone())
-            .or_default();
+        let channels = channels_by_guild.entry(guild.clone()).or_default();
         if channels.is_empty() {
             *channels = fetch_guild_channels(client, &guild).await;
         }
@@ -349,7 +351,10 @@ pub(crate) async fn fetch_chat_labels(client: &crate::api::Client, chats: &[Stri
             .find(|(id, _)| id == &channel)
             .map(|(_, name)| name.clone())
             .unwrap_or_else(|| format!("#{channel}"));
-        let guild_name = guild_names.get(&guild).cloned().unwrap_or_else(|| guild.clone());
+        let guild_name = guild_names
+            .get(&guild)
+            .cloned()
+            .unwrap_or_else(|| guild.clone());
         map.insert(chat.clone(), format!("{guild_name} {channel_name}"));
     }
     map
@@ -433,7 +438,6 @@ impl std::fmt::Display for Opt {
         f.write_str(&self.label)
     }
 }
-
 
 pub(crate) const SCHEDULE_OPTIONS: [&str; 3] = ["daily", "weekly", "monthly"];
 

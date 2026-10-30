@@ -154,10 +154,8 @@ mod tests {
     use crate::api::Message;
 
     fn temp_root(tag: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "guillotine-af-test-{}-{tag}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("guillotine-af-test-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         root
@@ -185,7 +183,10 @@ mod tests {
         assert_eq!(records[1]["id"], "101");
         // the file itself is truncated back to the last valid line
         let after = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(after, "{\"id\": \"100\", \"content\": \"a\"}\n{\"id\": \"101\", \"content\": \"b\"}\n");
+        assert_eq!(
+            after,
+            "{\"id\": \"100\", \"content\": \"a\"}\n{\"id\": \"101\", \"content\": \"b\"}\n"
+        );
         // loading again is a no-op and still yields both records
         assert_eq!(load_message_records(&path).len(), 2);
         // a fully valid file is left untouched
@@ -200,7 +201,11 @@ mod tests {
     #[test]
     fn find_existing_archive_recency_and_merged_matching() {
         let root = temp_root("find");
-        let older = mk_archive(&root, "a-old", serde_json::json!({"channel_id": "111", "chat": "old"}));
+        let older = mk_archive(
+            &root,
+            "a-old",
+            serde_json::json!({"channel_id": "111", "chat": "old"}),
+        );
         std::fs::write(older.join("messages.jsonl"), "{\"id\": \"1\"}\n").unwrap();
         // merged archive listing the channel among channel_ids
         let merged = mk_archive(
@@ -259,7 +264,18 @@ mod tests {
         keys.sort();
         assert_eq!(
             keys,
-            ["attachment_ids", "author", "author_id", "content", "edited_timestamp", "id", "pinned", "reply_to", "timestamp", "type"]
+            [
+                "attachment_ids",
+                "author",
+                "author_id",
+                "content",
+                "edited_timestamp",
+                "id",
+                "pinned",
+                "reply_to",
+                "timestamp",
+                "type"
+            ]
         );
         assert_eq!(m["author"], "Alice A.");
         assert_eq!(m["reply_to"], "100");

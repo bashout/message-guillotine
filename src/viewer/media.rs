@@ -80,10 +80,9 @@ pub async fn media(
     };
     let mime = Archive::attachment_mime(&name);
     let download = q.contains_key("download");
-    let inline = (mime.starts_with("image/")
-        || mime.starts_with("video/")
-        || mime.starts_with("audio/"))
-        && mime != "image/svg+xml";
+    let inline =
+        (mime.starts_with("image/") || mime.starts_with("video/") || mime.starts_with("audio/"))
+            && mime != "image/svg+xml";
     let disposition = if download || !inline {
         format!("attachment; filename=\"{}\"", name.replace('"', ""))
     } else {
@@ -98,26 +97,24 @@ pub async fn media(
         .get(header::RANGE)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
-    let (status, start, length, content_range) = match range_header
-        .as_deref()
-        .map(|h| parse_range(h, size))
-    {
-        Some(ByteRange::Unsatisfiable) => {
-            return Response::builder()
-                .status(StatusCode::RANGE_NOT_SATISFIABLE)
-                .header(header::CONTENT_RANGE, format!("bytes */{size}"))
-                .header(header::CONTENT_LENGTH, "0")
-                .body(Body::empty())
-                .unwrap();
-        }
-        Some(ByteRange::Partial(s, e)) => (
-            StatusCode::PARTIAL_CONTENT,
-            s,
-            e - s + 1,
-            Some(format!("bytes {s}-{e}/{size}")),
-        ),
-        _ => (StatusCode::OK, 0, size, None),
-    };
+    let (status, start, length, content_range) =
+        match range_header.as_deref().map(|h| parse_range(h, size)) {
+            Some(ByteRange::Unsatisfiable) => {
+                return Response::builder()
+                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                    .header(header::CONTENT_RANGE, format!("bytes */{size}"))
+                    .header(header::CONTENT_LENGTH, "0")
+                    .body(Body::empty())
+                    .unwrap();
+            }
+            Some(ByteRange::Partial(s, e)) => (
+                StatusCode::PARTIAL_CONTENT,
+                s,
+                e - s + 1,
+                Some(format!("bytes {s}-{e}/{size}")),
+            ),
+            _ => (StatusCode::OK, 0, size, None),
+        };
 
     let file = match tokio::fs::File::open(&fs_path).await {
         Ok(f) => f,

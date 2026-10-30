@@ -184,7 +184,10 @@ impl PanelApp {
                     match crate::ipc::send(serde_json::json!({ "cmd": "status" })).await {
                         Ok(resp) => {
                             tracing::info!(status = %resp, "status");
-                            println!("guillotine status: {}", serde_json::to_string_pretty(&resp).unwrap_or_default());
+                            println!(
+                                "guillotine status: {}",
+                                serde_json::to_string_pretty(&resp).unwrap_or_default()
+                            );
                         }
                         Err(_) => println!("guillotine daemon is not running"),
                     }
@@ -306,9 +309,7 @@ impl PanelApp {
                         });
                     }
                 }
-                self.settings
-                    .dm_rows
-                    .sort_by_key(|a| a.name.to_lowercase());
+                self.settings.dm_rows.sort_by_key(|a| a.name.to_lowercase());
                 Task::none()
             }
             Message::GuildsFetched(guilds) => {
@@ -448,7 +449,9 @@ impl PanelApp {
                 if self.settings.armed_delete_all.as_deref() == Some(chat.as_str()) {
                     self.settings.armed_delete_all = None;
                     Task::perform(
-                        crate::ipc::send(serde_json::json!({ "cmd": "run_now", "chat": chat.clone(), "all": true })),
+                        crate::ipc::send(
+                            serde_json::json!({ "cmd": "run_now", "chat": chat.clone(), "all": true }),
+                        ),
                         move |res| Message::DeleteAllDone(chat, res.map_err(|e| e.to_string())),
                     )
                 } else {
@@ -461,8 +464,12 @@ impl PanelApp {
                     Ok(resp) if resp["ok"] == true => {
                         tracing::info!(chat = %chat, "delete-all accepted by daemon, running in background")
                     }
-                    Ok(resp) => tracing::warn!(chat = %chat, "delete-all failed: {}", &resp["error"]),
-                    Err(e) => tracing::warn!(chat = %chat, "daemon unreachable ({e}); delete-all needs the running service"),
+                    Ok(resp) => {
+                        tracing::warn!(chat = %chat, "delete-all failed: {}", &resp["error"])
+                    }
+                    Err(e) => {
+                        tracing::warn!(chat = %chat, "daemon unreachable ({e}); delete-all needs the running service")
+                    }
                 }
                 Task::none()
             }
@@ -532,13 +539,16 @@ impl PanelApp {
         )
         .height(Length::Fill);
 
-        row![sidebar, rule::vertical(1.0), container(content).width(Length::Fill)]
-            .height(Length::Fill)
-            .into()
+        row![
+            sidebar,
+            rule::vertical(1.0),
+            container(content).width(Length::Fill)
+        ]
+        .height(Length::Fill)
+        .into()
     }
 
     pub(crate) fn heading<'a>(label: impl Into<String>) -> Element<'a, Message> {
         text(label.into()).size(19).into()
     }
-
 }

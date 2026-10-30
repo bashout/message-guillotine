@@ -185,15 +185,27 @@ pub fn status(_config_arg: Option<&Path>) -> anyhow::Result<()> {
 /// are unit-testable everywhere.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 #[cfg(target_os = "macos")]
 fn launchd_plist(exe: &Path, config: &Path) -> String {
     let exe = xml_escape(&exe.display().to_string());
     let config = xml_escape(&config.display().to_string());
-    let out = xml_escape(&config::data_dir().join("logs/stdout.log").display().to_string());
-    let err = xml_escape(&config::data_dir().join("logs/stderr.log").display().to_string());
+    let out = xml_escape(
+        &config::data_dir()
+            .join("logs/stdout.log")
+            .display()
+            .to_string(),
+    );
+    let err = xml_escape(
+        &config::data_dir()
+            .join("logs/stderr.log")
+            .display()
+            .to_string(),
+    );
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
          <plist version=\"1.0\"><dict>\n\
@@ -327,15 +339,18 @@ mod tests {
     #[test]
     fn systemd_quote_escapes_specials_and_wraps_in_quotes() {
         // plain path: just quoted
-        assert_eq!(systemd_quote(Path::new("/usr/bin/guillotine")), "\"/usr/bin/guillotine\"");
+        assert_eq!(
+            systemd_quote(Path::new("/usr/bin/guillotine")),
+            "\"/usr/bin/guillotine\""
+        );
         // backslash, quote, dollar, backtick, percent are escaped
         let tricky = Path::new("/tmp/a\\b\"c$d`e%f");
-        assert_eq!(
-            systemd_quote(tricky),
-            "\"/tmp/a\\\\b\\\"c\\$d\\`e%%f\""
-        );
+        assert_eq!(systemd_quote(tricky), "\"/tmp/a\\\\b\\\"c\\$d\\`e%%f\"");
         // spaces need no escaping inside the quotes
-        assert_eq!(systemd_quote(Path::new("/tmp/my dir/x")), "\"/tmp/my dir/x\"");
+        assert_eq!(
+            systemd_quote(Path::new("/tmp/my dir/x")),
+            "\"/tmp/my dir/x\""
+        );
     }
 
     #[test]

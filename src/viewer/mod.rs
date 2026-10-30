@@ -25,9 +25,9 @@ use axum::{middleware, Router};
 use serde_json::Value;
 
 pub use api::{
-    api_archives, api_attachments, api_attachment_years, api_messages, api_meta, api_resolve,
-    api_search, api_select, api_stats, app_js, host_guard, index_html, security_headers,
-    style_css, HostGuard,
+    api_archives, api_attachment_years, api_attachments, api_messages, api_meta, api_resolve,
+    api_search, api_select, api_stats, app_js, host_guard, index_html, security_headers, style_css,
+    HostGuard,
 };
 pub use library::{find_archives, Library};
 pub use media::media;
@@ -108,12 +108,16 @@ pub fn utc_iso(value: &str) -> String {
         .or_else(|| {
             chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f")
                 .ok()
-                .map(|ndt| chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(ndt, chrono::Utc))
+                .map(|ndt| {
+                    chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(ndt, chrono::Utc)
+                })
         })
         .or_else(|| {
             chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f")
                 .ok()
-                .map(|ndt| chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(ndt, chrono::Utc))
+                .map(|ndt| {
+                    chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(ndt, chrono::Utc)
+                })
         });
     match parsed {
         Some(dt) => {
@@ -161,7 +165,9 @@ fn open_browser(url: &str) {
         }
         #[cfg(target_os = "windows")]
         {
-            std::process::Command::new("cmd").args(["/C", "start", url]).spawn()
+            std::process::Command::new("cmd")
+                .args(["/C", "start", url])
+                .spawn()
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
         {
@@ -189,7 +195,10 @@ pub(crate) fn build_app(library: Arc<Library>, guard: HostGuard) -> Router {
         .route("/api/messages", axum::routing::get(api_messages))
         .route("/api/resolve", axum::routing::get(api_resolve))
         .route("/api/search", axum::routing::get(api_search))
-        .route("/api/attachment-years", axum::routing::get(api_attachment_years))
+        .route(
+            "/api/attachment-years",
+            axum::routing::get(api_attachment_years),
+        )
         .route("/api/attachments", axum::routing::get(api_attachments))
         .route("/api/stats", axum::routing::get(api_stats))
         .route("/media/{*name}", axum::routing::get(media))
@@ -208,7 +217,10 @@ pub fn is_loopback_host(host: &str) -> bool {
         .strip_prefix('[')
         .and_then(|rest| rest.split(']').next())
         .unwrap_or(&h);
-    name == "localhost" || name.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+    name == "localhost"
+        || name
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Run the V2 archive viewer server. `archives_dir` may be the archival
@@ -262,12 +274,18 @@ pub async fn run(
 
     let archives = find_archives(library.root());
     if let Some(name) = &initial {
-        if archives.iter().any(|a| a.get("name").and_then(Value::as_str) == Some(name)) {
+        if archives
+            .iter()
+            .any(|a| a.get("name").and_then(Value::as_str) == Some(name))
+        {
             library.select(name);
         }
     }
     if library.selected_name().is_none() {
-        if let Some(first) = archives.first().and_then(|a| a.get("name").and_then(Value::as_str)) {
+        if let Some(first) = archives
+            .first()
+            .and_then(|a| a.get("name").and_then(Value::as_str))
+        {
             library.select(first);
         }
     }
@@ -306,8 +324,12 @@ pub async fn run(
         let meta = archive.meta_payload();
         eprintln!(
             "  {} messages, {} attachments",
-            meta.get("total_messages").and_then(Value::as_u64).unwrap_or(0),
-            meta.get("total_attachments").and_then(Value::as_u64).unwrap_or(0),
+            meta.get("total_messages")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            meta.get("total_attachments")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
         );
     } else {
         eprintln!("  nothing to serve yet; archive a chat first");
@@ -368,17 +390,37 @@ mod tests {
         )
         .unwrap();
         let messages = vec![
-            mk_msg("100", "alice", "2023-05-01T10:00:00.000000+00:00", "hello world"),
-            mk_msg("101", "bob", "2023-05-02T10:00:00.000000+00:00", "see https://example.com now"),
+            mk_msg(
+                "100",
+                "alice",
+                "2023-05-01T10:00:00.000000+00:00",
+                "hello world",
+            ),
+            mk_msg(
+                "101",
+                "bob",
+                "2023-05-02T10:00:00.000000+00:00",
+                "see https://example.com now",
+            ),
             {
-                let mut m = mk_msg("102", "alice", "2024-01-15T12:30:00.000000+00:00", "a reply to 100");
+                let mut m = mk_msg(
+                    "102",
+                    "alice",
+                    "2024-01-15T12:30:00.000000+00:00",
+                    "a reply to 100",
+                );
                 m["reply_to"] = json!("100");
                 m["pinned"] = json!(true);
                 m["edited_timestamp"] = json!("2024-01-15T13:00:00.000000+00:00");
                 m["attachment_ids"] = json!(["a1"]);
                 m
             },
-            mk_msg("103", "carol", "2024-06-20T08:00:00.000000+00:00", "HELLO again"),
+            mk_msg(
+                "103",
+                "carol",
+                "2024-06-20T08:00:00.000000+00:00",
+                "HELLO again",
+            ),
         ];
         let mut jsonl = String::new();
         for m in &messages {
@@ -416,13 +458,7 @@ mod tests {
             .collect()
     }
 
-    fn filters(
-        from: Option<&str>,
-        to: Option<&str>,
-        att: bool,
-        link: bool,
-        pin: bool,
-    ) -> Filters {
+    fn filters(from: Option<&str>, to: Option<&str>, att: bool, link: bool, pin: bool) -> Filters {
         Filters {
             date_from: from.map(|s| s.to_string()),
             date_to: to.map(|s| s.to_string()),
@@ -455,7 +491,11 @@ mod tests {
             Some("2024-01-15T23:59:59.999999+00:00")
         );
         assert!(parse_filters(&params(&[])).is_none());
-        assert!(parse_filters(&params(&[("has_link", "true")])).unwrap().has_link);
+        assert!(
+            parse_filters(&params(&[("has_link", "true")]))
+                .unwrap()
+                .has_link
+        );
     }
 
     #[test]
@@ -541,7 +581,9 @@ mod tests {
         assert!(archive.anchor_payload("999", 3, None, false).is_none());
         // anchor excluded by filters -> None
         let att = filters(None, None, true, false, false);
-        assert!(archive.anchor_payload("100", 3, Some(&att), false).is_none());
+        assert!(archive
+            .anchor_payload("100", 3, Some(&att), false)
+            .is_none());
     }
 
     #[test]
@@ -620,7 +662,10 @@ mod tests {
         assert!(archive.resolve("sub/dir.png").is_none());
         assert!(archive.resolve("missing.png").is_none());
         assert_eq!(Archive::attachment_mime("x.PNG"), "image/png");
-        assert_eq!(Archive::attachment_mime("x.bin"), "application/octet-stream");
+        assert_eq!(
+            Archive::attachment_mime("x.bin"),
+            "application/octet-stream"
+        );
     }
 
     #[test]
@@ -698,10 +743,22 @@ mod tests {
 
     #[test]
     fn range_parsing() {
-        assert!(matches!(parse_range("bytes=0-99", 1000), ByteRange::Partial(0, 99)));
-        assert!(matches!(parse_range("bytes=500-", 1000), ByteRange::Partial(500, 999)));
-        assert!(matches!(parse_range("bytes=-100", 1000), ByteRange::Partial(900, 999)));
-        assert!(matches!(parse_range("bytes=2000-", 1000), ByteRange::Unsatisfiable));
+        assert!(matches!(
+            parse_range("bytes=0-99", 1000),
+            ByteRange::Partial(0, 99)
+        ));
+        assert!(matches!(
+            parse_range("bytes=500-", 1000),
+            ByteRange::Partial(500, 999)
+        ));
+        assert!(matches!(
+            parse_range("bytes=-100", 1000),
+            ByteRange::Partial(900, 999)
+        ));
+        assert!(matches!(
+            parse_range("bytes=2000-", 1000),
+            ByteRange::Unsatisfiable
+        ));
         assert!(matches!(parse_range("bytes=", 1000), ByteRange::Full));
         assert!(matches!(parse_range("garbage", 1000), ByteRange::Full));
     }
@@ -723,18 +780,36 @@ mod tests {
             ByteRange::Partial(0, 99)
         ));
         // end beyond size is clamped to the last byte
-        assert!(matches!(parse_range("bytes=10-9999", 100), ByteRange::Partial(10, 99)));
+        assert!(matches!(
+            parse_range("bytes=10-9999", 100),
+            ByteRange::Partial(10, 99)
+        ));
         // reversed range is unsatisfiable
-        assert!(matches!(parse_range("bytes=50-10", 100), ByteRange::Unsatisfiable));
+        assert!(matches!(
+            parse_range("bytes=50-10", 100),
+            ByteRange::Unsatisfiable
+        ));
         // suffix larger than the file -> whole file
-        assert!(matches!(parse_range("bytes=-9999", 100), ByteRange::Partial(0, 99)));
+        assert!(matches!(
+            parse_range("bytes=-9999", 100),
+            ByteRange::Partial(0, 99)
+        ));
         // suffix of zero -> unsatisfiable
-        assert!(matches!(parse_range("bytes=-0", 100), ByteRange::Unsatisfiable));
+        assert!(matches!(
+            parse_range("bytes=-0", 100),
+            ByteRange::Unsatisfiable
+        ));
         // non-numeric -> full body
         assert!(matches!(parse_range("bytes=abc-def", 100), ByteRange::Full));
         // empty size -> always unsatisfiable
-        assert!(matches!(parse_range("bytes=0-", 0), ByteRange::Unsatisfiable));
-        assert!(matches!(parse_range("bytes=-5", 0), ByteRange::Unsatisfiable));
+        assert!(matches!(
+            parse_range("bytes=0-", 0),
+            ByteRange::Unsatisfiable
+        ));
+        assert!(matches!(
+            parse_range("bytes=-5", 0),
+            ByteRange::Unsatisfiable
+        ));
     }
 
     #[test]
@@ -746,7 +821,10 @@ mod tests {
             !host_allowed("192.168.1.10:8765"),
             "non-loopback IP literals are rejected"
         );
-        assert!(!host_allowed("127.0.0.1:abc"), "non-numeric port is not stripped");
+        assert!(
+            !host_allowed("127.0.0.1:abc"),
+            "non-numeric port is not stripped"
+        );
         assert!(!host_allowed("localhost.evil.com"));
         assert!(!host_allowed("[::1"), "unterminated bracket");
         assert!(!host_allowed("0.0.0.0.evil.com:80"));
@@ -773,7 +851,11 @@ mod tests {
         // second archive
         let other = fx.root.join("chat-two");
         std::fs::create_dir_all(&other).unwrap();
-        std::fs::write(other.join("meta.json"), r#"{"chat": "Two", "channel_id": "222"}"#).unwrap();
+        std::fs::write(
+            other.join("meta.json"),
+            r#"{"chat": "Two", "channel_id": "222"}"#,
+        )
+        .unwrap();
         std::fs::write(other.join("messages.jsonl"), "").unwrap();
         let library = Library::new(fx.root.clone());
         let a = library.load("chat-one").unwrap();
@@ -781,7 +863,11 @@ mod tests {
         // cache holds LIBRARY_CACHE_MAX (2): loading a third evicts chat-one
         let third = fx.root.join("chat-three");
         std::fs::create_dir_all(&third).unwrap();
-        std::fs::write(third.join("meta.json"), r#"{"chat": "Three", "channel_id": "333"}"#).unwrap();
+        std::fs::write(
+            third.join("meta.json"),
+            r#"{"chat": "Three", "channel_id": "333"}"#,
+        )
+        .unwrap();
         std::fs::write(third.join("messages.jsonl"), "").unwrap();
         let _c = library.load("chat-three").unwrap();
         // chat-one was evicted: its Arc is only held by our local variable
@@ -815,7 +901,12 @@ mod tests {
         // desc view: positions count from the newest; anchor 101 is position 2 of 4
         let p = archive.anchor_payload("101", 2, None, true).unwrap();
         assert_eq!(p["anchor_index"], json!(2));
-        let ids: Vec<&str> = p["messages"].as_array().unwrap().iter().map(|m| m["id"].as_str().unwrap()).collect();
+        let ids: Vec<&str> = p["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
         // window centered on position 2: start = 2 - 1 = 1 -> [102, 101] in desc order
         assert_eq!(ids, vec!["102", "101"]);
     }
@@ -829,8 +920,14 @@ mod tests {
         assert_eq!(m["channel_id"], json!("111"));
         assert_eq!(m["total_messages"], json!(4));
         assert_eq!(m["total_attachments"], json!(1));
-        assert_eq!(m["first_timestamp"], json!("2023-05-01T10:00:00.000000+00:00"));
-        assert_eq!(m["last_timestamp"], json!("2024-06-20T08:00:00.000000+00:00"));
+        assert_eq!(
+            m["first_timestamp"],
+            json!("2023-05-01T10:00:00.000000+00:00")
+        );
+        assert_eq!(
+            m["last_timestamp"],
+            json!("2024-06-20T08:00:00.000000+00:00")
+        );
     }
 
     // ------------------------------------------------------------------
@@ -855,13 +952,30 @@ mod tests {
         .unwrap();
         std::fs::write(
             archive_dir.join("messages.jsonl"),
-            format!("{}\n", serde_json::to_string(&mk_msg("100", "alice", "2024-01-01T10:00:00.000000+00:00", "hi")).unwrap()),
+            format!(
+                "{}\n",
+                serde_json::to_string(&mk_msg(
+                    "100",
+                    "alice",
+                    "2024-01-01T10:00:00.000000+00:00",
+                    "hi"
+                ))
+                .unwrap()
+            ),
         )
         .unwrap();
         std::fs::write(archive_dir.join("manifest.jsonl"), "").unwrap();
         // 8-byte "png" so range math is easy to assert
-        std::fs::write(archive_dir.join("attachments/0001_100_pic.png"), b"\x89PNGdata").unwrap();
-        std::fs::write(archive_dir.join("attachments/evil.svg"), b"<svg xmlns='http://www.w3.org/2000/svg'><script>1</script></svg>").unwrap();
+        std::fs::write(
+            archive_dir.join("attachments/0001_100_pic.png"),
+            b"\x89PNGdata",
+        )
+        .unwrap();
+        std::fs::write(
+            archive_dir.join("attachments/evil.svg"),
+            b"<svg xmlns='http://www.w3.org/2000/svg'><script>1</script></svg>",
+        )
+        .unwrap();
         let library = Arc::new(Library::new(root.clone()));
         library.select("chat-one");
         let app = build_app(
@@ -898,7 +1012,12 @@ mod tests {
         let h = resp.headers();
         assert_eq!(h.get("x-content-type-options").unwrap(), "nosniff");
         assert_eq!(h.get("x-frame-options").unwrap(), "DENY");
-        assert!(h.get("content-security-policy").unwrap().to_str().unwrap().contains("default-src 'self'"));
+        assert!(h
+            .get("content-security-policy")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("default-src 'self'"));
     }
 
     #[tokio::test]
@@ -928,7 +1047,12 @@ mod tests {
         assert_eq!(&body_of(resp).await[..], b"ata");
 
         // unsatisfiable range
-        let resp = http_get(&app, "/media/0001_100_pic.png", &[("range", "bytes=100-200")]).await;
+        let resp = http_get(
+            &app,
+            "/media/0001_100_pic.png",
+            &[("range", "bytes=100-200")],
+        )
+        .await;
         assert_eq!(resp.status(), 416);
         assert_eq!(resp.headers().get("content-range").unwrap(), "bytes */8");
         let _ = std::fs::remove_dir_all(&root);
@@ -940,7 +1064,12 @@ mod tests {
         let resp = http_get(&app, "/media/evil.svg", &[]).await;
         assert_eq!(resp.status(), 200);
         assert_eq!(resp.headers().get("content-type").unwrap(), "image/svg+xml");
-        let disp = resp.headers().get("content-disposition").unwrap().to_str().unwrap();
+        let disp = resp
+            .headers()
+            .get("content-disposition")
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert!(disp.starts_with("attachment"), "{disp}");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -950,7 +1079,12 @@ mod tests {
         let (root, app) = http_fixture();
         let resp = http_get(&app, "/media/0001_100_pic.png?download=1", &[]).await;
         assert_eq!(resp.status(), 200);
-        let disp = resp.headers().get("content-disposition").unwrap().to_str().unwrap();
+        let disp = resp
+            .headers()
+            .get("content-disposition")
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert!(disp.starts_with("attachment"), "{disp}");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -988,7 +1122,13 @@ mod tests {
     #[tokio::test]
     async fn http_security_headers_on_every_response() {
         let (root, app) = http_fixture();
-        for uri in ["/", "/api/archives", "/api/messages?count=1", "/media/0001_100_pic.png", "/nope"] {
+        for uri in [
+            "/",
+            "/api/archives",
+            "/api/messages?count=1",
+            "/media/0001_100_pic.png",
+            "/nope",
+        ] {
             let resp = http_get(&app, uri, &[]).await;
             assert_security_headers(&resp);
         }
@@ -1005,9 +1145,22 @@ mod tests {
         assert_eq!(payload["total"], 1);
         assert_eq!(payload["messages"][0]["id"], "100");
         // bad count is a 400, unknown pinned archive a 404
-        assert_eq!(http_get(&app, "/api/messages?count=abc", &[]).await.status(), 400);
-        assert_eq!(http_get(&app, "/api/messages?archive=nope", &[]).await.status(), 404);
-        assert_eq!(http_get(&app, "/api/select?archive=..", &[]).await.status(), 404);
+        assert_eq!(
+            http_get(&app, "/api/messages?count=abc", &[])
+                .await
+                .status(),
+            400
+        );
+        assert_eq!(
+            http_get(&app, "/api/messages?archive=nope", &[])
+                .await
+                .status(),
+            404
+        );
+        assert_eq!(
+            http_get(&app, "/api/select?archive=..", &[]).await.status(),
+            404
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

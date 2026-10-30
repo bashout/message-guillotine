@@ -68,7 +68,12 @@ impl JobRegistry {
     }
 
     pub fn snapshot(&self) -> Vec<JobProgress> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).values().cloned().collect()
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect()
     }
 }
 

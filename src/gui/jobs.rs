@@ -66,7 +66,10 @@ impl PanelApp {
                         container(
                             column![
                                 text(label).size(14),
-                                text(chat.clone()).font(Font::MONOSPACE).size(11).color(muted()),
+                                text(chat.clone())
+                                    .font(Font::MONOSPACE)
+                                    .size(11)
+                                    .color(muted()),
                             ]
                             .spacing(2)
                         )
@@ -79,8 +82,11 @@ impl PanelApp {
                         text(r["failed"].to_string())
                             .color(if failed > 0 { err_color() } else { muted() })
                             .width(Length::Fixed(80.0)),
-                        text(r["complete"].to_string())
-                            .color(if complete { ok_color() } else { phase_color("running") }),
+                        text(r["complete"].to_string()).color(if complete {
+                            ok_color()
+                        } else {
+                            phase_color("running")
+                        }),
                     ]
                     .spacing(8)
                     .align_y(iced::Alignment::Center),
@@ -120,12 +126,18 @@ impl PanelApp {
         } else {
             0.0
         };
-        let counts = format!("{} / {} / {}", job["deleted"], job["failed"], job["skipped"]);
+        let counts = format!(
+            "{} / {} / {}",
+            job["deleted"], job["failed"], job["skipped"]
+        );
         row![
             container(
                 column![
                     text(label).size(14),
-                    text(key.to_string()).font(Font::MONOSPACE).size(11).color(muted()),
+                    text(key.to_string())
+                        .font(Font::MONOSPACE)
+                        .size(11)
+                        .color(muted()),
                 ]
                 .spacing(2)
             )
@@ -161,5 +173,4 @@ impl PanelApp {
             .cloned()
             .unwrap_or_else(|| key.to_string())
     }
-
 }

@@ -450,7 +450,8 @@ impl Client {
             let resp = match self
                 .http
                 .delete(format!(
-                    "{}/channels/{channel_id}/messages/{message_id}", self.base_url
+                    "{}/channels/{channel_id}/messages/{message_id}",
+                    self.base_url
                 ))
                 .send()
                 .await
@@ -579,7 +580,9 @@ fn retry_after_secs(header: Option<&str>, fallback: Duration) -> Duration {
 /// malformed. Never below 1s.
 fn retry_after(resp: &reqwest::Response, fallback: Duration) -> Duration {
     retry_after_secs(
-        resp.headers().get("Retry-After").and_then(|v| v.to_str().ok()),
+        resp.headers()
+            .get("Retry-After")
+            .and_then(|v| v.to_str().ok()),
         fallback,
     )
 }
@@ -611,17 +614,30 @@ mod tests {
             assert_eq!((id >> 22) as i64 + DISCORD_EPOCH_MS, ms, "round-trip {ms}");
         }
         // pre-epoch and exactly at the epoch saturate at id 0
-        assert_eq!(snowflake_for(DateTime::from_timestamp_millis(DISCORD_EPOCH_MS).unwrap()), "0");
-        assert_eq!(snowflake_for(DateTime::from_timestamp_millis(DISCORD_EPOCH_MS - 1).unwrap()), "0");
-        assert_eq!(snowflake_for(DateTime::from_timestamp_millis(0).unwrap()), "0");
+        assert_eq!(
+            snowflake_for(DateTime::from_timestamp_millis(DISCORD_EPOCH_MS).unwrap()),
+            "0"
+        );
+        assert_eq!(
+            snowflake_for(DateTime::from_timestamp_millis(DISCORD_EPOCH_MS - 1).unwrap()),
+            "0"
+        );
+        assert_eq!(
+            snowflake_for(DateTime::from_timestamp_millis(0).unwrap()),
+            "0"
+        );
         // one ms after the epoch -> smallest nonzero id
         let id: u64 = snowflake_for(DateTime::from_timestamp_millis(DISCORD_EPOCH_MS + 1).unwrap())
             .parse()
             .unwrap();
         assert_eq!(id, 1 << 22);
         // ids are monotonic in time
-        let a = snowflake_for(DateTime::from_timestamp_millis(1_700_000_000_000).unwrap()).parse::<u64>().unwrap();
-        let b = snowflake_for(DateTime::from_timestamp_millis(1_700_000_000_001).unwrap()).parse::<u64>().unwrap();
+        let a = snowflake_for(DateTime::from_timestamp_millis(1_700_000_000_000).unwrap())
+            .parse::<u64>()
+            .unwrap();
+        let b = snowflake_for(DateTime::from_timestamp_millis(1_700_000_000_001).unwrap())
+            .parse::<u64>()
+            .unwrap();
         assert!(a < b);
     }
 
@@ -630,7 +646,13 @@ mod tests {
         let mk = |ts: &str| Message {
             id: "1".into(),
             timestamp: ts.into(),
-            author: User { id: "u".into(), username: "u".into(), discriminator: String::new(), global_name: None, bot: false },
+            author: User {
+                id: "u".into(),
+                username: "u".into(),
+                discriminator: String::new(),
+                global_name: None,
+                bot: false,
+            },
             content: String::new(),
             r#type: 0,
             attachments: vec![],
@@ -639,10 +661,19 @@ mod tests {
             message_reference: None,
         };
         // 2024-01-01T00:00:00Z = 1704067200.0; millis preserved
-        assert_eq!(mk("2024-01-01T00:00:00.000+00:00").epoch().unwrap(), 1_704_067_200.0);
-        assert_eq!(mk("2024-01-01T00:00:00.500+00:00").epoch().unwrap(), 1_704_067_200.5);
+        assert_eq!(
+            mk("2024-01-01T00:00:00.000+00:00").epoch().unwrap(),
+            1_704_067_200.0
+        );
+        assert_eq!(
+            mk("2024-01-01T00:00:00.500+00:00").epoch().unwrap(),
+            1_704_067_200.5
+        );
         // offset is normalized to the same instant
-        assert_eq!(mk("2024-01-01T02:00:00.000+02:00").epoch().unwrap(), 1_704_067_200.0);
+        assert_eq!(
+            mk("2024-01-01T02:00:00.000+02:00").epoch().unwrap(),
+            1_704_067_200.0
+        );
         // garbage -> Err (the deletion fail-safe relies on this)
         assert!(mk("not a timestamp").epoch().is_err());
         assert!(mk("").epoch().is_err());
@@ -671,7 +702,10 @@ mod tests {
     #[test]
     fn retry_after_header_parsing_and_fallback() {
         let fb = Duration::from_secs(5);
-        assert_eq!(retry_after_secs(Some("2.5"), fb), Duration::from_secs_f64(2.5));
+        assert_eq!(
+            retry_after_secs(Some("2.5"), fb),
+            Duration::from_secs_f64(2.5)
+        );
         assert_eq!(retry_after_secs(Some("3"), fb), Duration::from_secs(3));
         // malformed / absent -> fallback
         assert_eq!(retry_after_secs(Some("soon"), fb), fb);
@@ -714,10 +748,8 @@ mod tests {
     }
 
     fn temp_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "guillotine-api-test-{}-{tag}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("guillotine-api-test-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -866,7 +898,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn delete_persistent_network_errors_abort_as_network() {
-        let server = MockServer::start(vec![MockAction::Drop, MockAction::Drop, MockAction::Drop]).await;
+        let server =
+            MockServer::start(vec![MockAction::Drop, MockAction::Drop, MockAction::Drop]).await;
         let client = mock_client(&server);
         assert_eq!(
             client.delete_message_with_retries("42", "1").await,
@@ -955,11 +988,16 @@ mod tests {
         let client = mock_client(&server);
         let dest = dir.join("0001_1_pic.png");
         assert_eq!(
-            client.download_attachment(&format!("{}/cdn/x", server.url()), &dest).await,
+            client
+                .download_attachment(&format!("{}/cdn/x", server.url()), &dest)
+                .await,
             Some(4)
         );
         assert_eq!(std::fs::read(&dest).unwrap(), b"abcd");
-        assert!(!dir.join("0001_1_pic.png.part").exists(), "renamed, not left behind");
+        assert!(
+            !dir.join("0001_1_pic.png.part").exists(),
+            "renamed, not left behind"
+        );
         // the CDN request carries no Authorization header
         let req = &server.requests()[0];
         assert_eq!(req.header("authorization"), None);
@@ -974,7 +1012,9 @@ mod tests {
         let client = mock_client(&server);
         let dest = dir.join("0001_1_pic.png");
         assert_eq!(
-            client.download_attachment(&format!("{}/cdn/x", server.url()), &dest).await,
+            client
+                .download_attachment(&format!("{}/cdn/x", server.url()), &dest)
+                .await,
             None
         );
         assert!(!dest.exists());
@@ -987,7 +1027,10 @@ mod tests {
         let dir = temp_dir("dl-mid");
         let server = MockServer::start(vec![MockAction::PartialThenDrop {
             status: 200,
-            headers: vec![("content-type".to_string(), "application/octet-stream".to_string())],
+            headers: vec![(
+                "content-type".to_string(),
+                "application/octet-stream".to_string(),
+            )],
             prefix: b"partial".to_vec(),
             declared_len: 1024,
         }])
@@ -995,11 +1038,16 @@ mod tests {
         let client = mock_client(&server);
         let dest = dir.join("0001_1_pic.png");
         assert_eq!(
-            client.download_attachment(&format!("{}/cdn/x", server.url()), &dest).await,
+            client
+                .download_attachment(&format!("{}/cdn/x", server.url()), &dest)
+                .await,
             None
         );
         assert!(!dest.exists());
-        assert!(!dir.join("0001_1_pic.png.part").exists(), "no .part left after mid-stream failure");
+        assert!(
+            !dir.join("0001_1_pic.png.part").exists(),
+            "no .part left after mid-stream failure"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1010,7 +1058,9 @@ mod tests {
         let client = mock_client(&server).with_max_attachment_bytes(10);
         let dest = dir.join("big.bin");
         assert_eq!(
-            client.download_attachment(&format!("{}/cdn/big", server.url()), &dest).await,
+            client
+                .download_attachment(&format!("{}/cdn/big", server.url()), &dest)
+                .await,
             None
         );
         assert!(!dest.exists());

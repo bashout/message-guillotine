@@ -374,7 +374,11 @@ mod tests {
         }
         std::fs::write(&path, body).unwrap();
         let entries = compact_manifest(&root);
-        assert_eq!(entries.len(), 2, "duplicate attachment_id collapses to latest");
+        assert_eq!(
+            entries.len(),
+            2,
+            "duplicate attachment_id collapses to latest"
+        );
         let by_id: std::collections::BTreeMap<&str, &serde_json::Value> = entries
             .iter()
             .map(|e| (e["attachment_id"].as_str().unwrap(), e))
@@ -398,10 +402,17 @@ mod tests {
         let path = root.join("messages.jsonl");
         let mk = |id: &str| serde_json::json!({"id": id}).to_string();
         // unsorted input gets rewritten in id (snowflake) order
-        std::fs::write(&path, format!("{}\n{}\n{}\n", mk("300"), mk("100"), mk("200"))).unwrap();
+        std::fs::write(
+            &path,
+            format!("{}\n{}\n{}\n", mk("300"), mk("100"), mk("200")),
+        )
+        .unwrap();
         sort_message_records(&root);
         let after = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(after, format!("{}\n{}\n{}\n", mk("100"), mk("200"), mk("300")));
+        assert_eq!(
+            after,
+            format!("{}\n{}\n{}\n", mk("100"), mk("200"), mk("300"))
+        );
         assert!(!root.join("messages.jsonl.part").exists());
         // already sorted: file content untouched (no rewrite)
         sort_message_records(&root);
@@ -421,7 +432,12 @@ mod tests {
     use crate::api::User;
     use crate::testutil::{MockAction, MockServer};
 
-    fn archive_msg(id: &str, day: u8, content: &str, attachments: serde_json::Value) -> serde_json::Value {
+    fn archive_msg(
+        id: &str,
+        day: u8,
+        content: &str,
+        attachments: serde_json::Value,
+    ) -> serde_json::Value {
         serde_json::json!({
             "id": id,
             "author": {"id": "7", "username": "alice", "global_name": "Alice"},
@@ -477,20 +493,41 @@ mod tests {
 
         // meta.json: V1 payload
         let meta: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(folder.join("meta.json")).unwrap()).unwrap();
-        assert_eq!(meta, serde_json::json!({"channel_id": "42", "chat": "My Chat"}));
+            serde_json::from_str(&std::fs::read_to_string(folder.join("meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            meta,
+            serde_json::json!({"channel_id": "42", "chat": "My Chat"})
+        );
         // status.json: completed
         let status: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(folder.join("status.json")).unwrap()).unwrap();
+            serde_json::from_str(&std::fs::read_to_string(folder.join("status.json")).unwrap())
+                .unwrap();
         assert_eq!(status, serde_json::json!({"complete": true}));
         // messages.jsonl: oldest first, minimal V1 record keys
         let records = read_jsonl(&folder.join("messages.jsonl"));
         let ids: Vec<&str> = records.iter().map(|r| r["id"].as_str().unwrap()).collect();
         assert_eq!(ids, ["1", "2"]);
-        let keys: Vec<&str> = records[0].as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        let keys: Vec<&str> = records[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
         assert_eq!(
             keys,
-            ["attachment_ids", "author", "author_id", "content", "edited_timestamp", "id", "pinned", "reply_to", "timestamp", "type"]
+            [
+                "attachment_ids",
+                "author",
+                "author_id",
+                "content",
+                "edited_timestamp",
+                "id",
+                "pinned",
+                "reply_to",
+                "timestamp",
+                "type"
+            ]
         );
         assert_eq!(records[0]["author"], "Alice");
 
@@ -539,7 +576,10 @@ mod tests {
         assert_eq!(e["local_path"], "attachments/0001_1_pic.png");
         assert_eq!(e["size"], 4);
         assert_eq!(e["status"], "ok");
-        assert_eq!(std::fs::read(folder.join("attachments/0001_1_pic.png")).unwrap(), b"data");
+        assert_eq!(
+            std::fs::read(folder.join("attachments/0001_1_pic.png")).unwrap(),
+            b"data"
+        );
         // the CDN request carried no Authorization header
         let requests = server.requests();
         let cdn_req = requests
@@ -551,7 +591,10 @@ mod tests {
         let archive = crate::viewer::library::Archive::load(&folder);
         assert_eq!(archive.meta_payload()["total_attachments"], 1);
         let page = archive.page_payload(0, 10, None, false);
-        assert_eq!(page["messages"][0]["attachments"][0]["url"], "/media/0001_1_pic.png");
+        assert_eq!(
+            page["messages"][0]["attachments"][0]["url"],
+            "/media/0001_1_pic.png"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -561,12 +604,10 @@ mod tests {
         let archive_dir = root.join("archives");
         std::fs::create_dir_all(&archive_dir).unwrap();
 
-        let server = MockServer::start(vec![
-            MockAction::ok_json(serde_json::json!([
-                archive_msg("1", 1, "m1", serde_json::json!([])),
-                archive_msg("2", 2, "m2", serde_json::json!([])),
-            ])),
-        ])
+        let server = MockServer::start(vec![MockAction::ok_json(serde_json::json!([
+            archive_msg("1", 1, "m1", serde_json::json!([])),
+            archive_msg("2", 2, "m2", serde_json::json!([])),
+        ]))])
         .await;
         let client = mock_client(&server);
         let first = archive_chat(&client, "42", "chat", &archive_dir)
@@ -575,10 +616,14 @@ mod tests {
             .expect("archive folder");
 
         // second run: same channel, only the new message is served
-        let server2 = MockServer::start(vec![MockAction::ok_json(serde_json::json!([
-            archive_msg("3", 3, "m3", serde_json::json!([])),
-        ]))])
-        .await;
+        let server2 =
+            MockServer::start(vec![MockAction::ok_json(serde_json::json!([archive_msg(
+                "3",
+                3,
+                "m3",
+                serde_json::json!([])
+            ),]))])
+            .await;
         let client2 = mock_client(&server2);
         let second = archive_chat(&client2, "42", "chat", &archive_dir)
             .await
@@ -595,7 +640,8 @@ mod tests {
         let ids: Vec<&str> = records.iter().map(|r| r["id"].as_str().unwrap()).collect();
         assert_eq!(ids, ["1", "2", "3"], "appended once, sorted, no duplicates");
         let status: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(second.join("status.json")).unwrap()).unwrap();
+            serde_json::from_str(&std::fs::read_to_string(second.join("status.json")).unwrap())
+                .unwrap();
         assert_eq!(status, serde_json::json!({"complete": true}));
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -633,7 +679,10 @@ mod tests {
         assert!(entries[0]["local_path"].is_null());
         assert!(entries[0]["size"].is_null());
         assert!(!folder.join("attachments/0001_1_pic.png").exists());
-        assert!(!folder.join("attachments/0001_1_pic.png.part").exists(), "no .part left");
+        assert!(
+            !folder.join("attachments/0001_1_pic.png.part").exists(),
+            "no .part left"
+        );
         // the message itself is still archived
         let records = read_jsonl(&folder.join("messages.jsonl"));
         assert_eq!(records.len(), 1);
