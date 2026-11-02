@@ -263,6 +263,26 @@ fn rust_viewer_available() -> bool {
     })
 }
 
+/// Stop the service daemon cleanly over its IPC and wait (bounded, ~3 s)
+/// until the process is actually gone, so a follow-up action — Quit
+/// exiting, deleting the exe — finds no remnants. The IPC ack returns
+/// before the daemon has exited, so the wait is what makes "stopped" true.
+/// Returns the daemon's ack, if one was received.
+pub(crate) async fn stop_service() -> Result<serde_json::Value, crate::ipc::SendError> {
+    let ack = crate::ipc::send_typed(serde_json::json!({ "cmd": "shutdown" })).await;
+    for _ in 0..30 {
+        let gone = tokio::task::spawn_blocking(crate::ipc::daemon_alive)
+            .await
+            .map(|alive| !alive)
+            .unwrap_or(true);
+        if gone {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    ack
+}
+
 /// Viewer subprocesses spawned from the tray, so Quit can stop them.
 static VIEWER_CHILDREN: std::sync::Mutex<Vec<std::process::Child>> =
     std::sync::Mutex::new(Vec::new());

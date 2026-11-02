@@ -220,10 +220,20 @@ impl PanelApp {
             }
             "stop-service" => {
                 // Clean shutdown of the daemon over its IPC; the tray stays
-                // up and the outcome is visible in the Jobs tab.
+                // up and the outcome is visible in the Jobs tab. Waits for
+                // the daemon to be gone before reporting it stopped.
                 Task::perform(
-                    crate::ipc::send_typed(serde_json::json!({ "cmd": "shutdown" })),
-                    |res| Message::ServiceStopDone(res.map_err(|e| e.to_string())),
+                    async {
+                        let alive = tokio::task::spawn_blocking(crate::ipc::daemon_alive)
+                            .await
+                            .unwrap_or(false);
+                        if alive {
+                            super::stop_service().await.map_err(|e| e.to_string())
+                        } else {
+                            Err("daemon not running".to_string())
+                        }
+                    },
+                    Message::ServiceStopDone,
                 )
             }
             "quit" => {
@@ -237,13 +247,13 @@ impl PanelApp {
                 rt.spawn(async move {
                     // Only when a daemon is actually listening: no IPC wait
                     // otherwise. The probe blocks briefly, so keep it off the
-                    // async worker threads.
+                    // async worker threads. stop_service() waits for the
+                    // daemon to be fully gone before returning.
                     let alive = tokio::task::spawn_blocking(crate::ipc::daemon_alive)
                         .await
                         .unwrap_or(false);
                     if alive {
-                        let _ =
-                            crate::ipc::send_typed(serde_json::json!({ "cmd": "shutdown" })).await;
+                        let _ = super::stop_service().await;
                     }
                     std::process::exit(0);
                 });
