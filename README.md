@@ -29,6 +29,36 @@ Archives are written in the V1-compatible on-disk format (`meta.json`,
 `messages.jsonl`, `manifest.jsonl`, `attachments/`, `status.json`), so old
 V1 archives remain fully readable.
 
+## Supported platforms
+
+**Support policy: latest LTS of each platform only.** Anything older is
+best-effort and untested; CI builds and tests against the versions below.
+
+| Platform | Supported | Distribution artifacts | Autostart | Notes |
+|---|---|---|---|---|
+| Linux x86_64 / aarch64 | Latest Ubuntu LTS (24.04) and equivalent-era distros (Debian stable, current Fedora, …) | AppImage (GUI, libs bundled), static musl tar.gz (headless CLI) | systemd `--user` unit | AppImage needs FUSE (or `--appimage-extract-and-run`); GUI also needs GTK3 + libayatana-appindicator, both bundled in the AppImage |
+| macOS Apple Silicon / Intel | Latest macOS (15 Sequoia) | zip of the bare binary — no .dmg, no signing | launchd LaunchAgent | Binary is unsigned: if downloaded via a browser, run `xattr -d com.apple.quarantine guillotine` once |
+| Windows 10/11 x64 | Latest Windows 10/11 | zip of `guillotine.exe` (static CRT — no redistributable needed) | registry Run key | GUI-first: the exe is a windowed-subsystem binary, so CLI subcommands (`config init`, `scan`, …) produce no console output — use the tray app or run via `gui` |
+
+Feature coverage is identical on all platforms:
+
+| Feature | Linux | macOS | Windows |
+|---|---|---|---|
+| Tray GUI | yes | yes | yes |
+| Headless CLI (`service run`, `scan`, `archive`, `viewer`, …) | yes | yes | yes (no console output, see above) |
+| Archive viewer (local web UI) | yes | yes | yes |
+| Native service autostart | systemd | launchd | registry |
+| V1-compatible archive format | yes | yes | yes |
+
+Known limitations:
+
+- No 32-bit, armv7, or Windows-on-ARM builds; Linux musl builds are
+  headless-only (the GUI needs glibc + GTK).
+- Config/secret files are `0600` and the data dir `0700` on unix; on Windows
+  privacy relies on the user profile ACLs.
+- The archive viewer has no authentication by design — it binds to loopback
+  only unless `--expose` is passed.
+
 ## Quickstart
 
 Everything lives in the crate at the repo root:

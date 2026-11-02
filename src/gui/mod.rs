@@ -99,7 +99,9 @@ fn install_desktop_entry() {
     let Some(home) = dirs::home_dir() else { return };
     let apps = home.join(".local/share/applications");
     let icons = home.join(".local/share/icons/hicolor/256x256/apps");
-    let exe = std::env::current_exe().ok();
+    // Resolved through service::exe_path so an AppImage registers itself,
+    // not the ephemeral /tmp/.mount_* path.
+    let exe = crate::service::exe_path().ok();
     if let (Ok(_), Some(exe)) = (std::fs::create_dir_all(&apps), exe) {
         let desktop = format!(
             "[Desktop Entry]\nType=Application\nName=Message Guillotine\nComment=Scheduled bulk delete and archive of your own chat messages\nExec={} gui\nIcon=guillotine\nTerminal=false\nCategories=Utility;\n",

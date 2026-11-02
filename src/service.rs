@@ -9,8 +9,30 @@ use std::process::Command;
 use crate::config::{self, Config};
 use crate::scheduler;
 
-fn exe_path() -> anyhow::Result<PathBuf> {
-    Ok(std::env::current_exe()?.canonicalize()?)
+/// The executable path to write into autostart entries and the .desktop file.
+/// Under an AppImage, `current_exe` points into the ephemeral `/tmp/.mount_*`
+/// squashfs mount that vanishes when the AppImage exits; the AppImage runtime
+/// exports `$APPIMAGE` with the real file path, which is the path that must be
+/// registered. Compiled on every OS so the choice is unit-testable everywhere.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn pick_service_exe(appimage_env: Option<&Path>, current_exe: &Path) -> PathBuf {
+    if let Some(p) = appimage_env {
+        if p.is_file() {
+            return p.to_path_buf();
+        }
+    }
+    current_exe.to_path_buf()
+}
+
+pub(crate) fn exe_path() -> anyhow::Result<PathBuf> {
+    #[cfg(target_os = "linux")]
+    let picked = pick_service_exe(
+        std::env::var_os("APPIMAGE").as_deref().map(Path::new),
+        &std::env::current_exe()?,
+    );
+    #[cfg(not(target_os = "linux"))]
+    let picked = std::env::current_exe()?;
+    Ok(picked.canonicalize()?)
 }
 
 fn config_path(config_arg: Option<&Path>) -> PathBuf {
@@ -350,6 +372,25 @@ mod tests {
         assert_eq!(
             systemd_quote(Path::new("/tmp/my dir/x")),
             "\"/tmp/my dir/x\""
+        );
+    }
+
+    #[test]
+    fn pick_service_exe_prefers_a_real_appimage_path() {
+        // A real file stands in for the AppImage: it must win over current_exe.
+        let real = std::env::current_exe().unwrap();
+        assert_eq!(
+            pick_service_exe(Some(&real), Path::new("/nonexistent/mount/guillotine")),
+            real
+        );
+        // A stale/missing $APPIMAGE (e.g. moved after install) falls back.
+        assert_eq!(
+            pick_service_exe(Some(Path::new("/nonexistent/guillotine.AppImage")), &real),
+            real
+        );
+        assert_eq!(
+            pick_service_exe(None, Path::new("/usr/bin/guillotine")),
+            PathBuf::from("/usr/bin/guillotine")
         );
     }
 

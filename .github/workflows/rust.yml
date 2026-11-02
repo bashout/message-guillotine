@@ -72,6 +72,35 @@ jobs:
           path: lcov.info
           if-no-files-found: error
 
+  test-platforms:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+          - os: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      # No system deps needed: the tray/GUI crates (winit, tray-icon, muda,
+      # iced) are pure Rust on Windows and macOS, unlike the Linux GTK stack.
+      # Runs with default features so the per-OS cfg blocks in service.rs
+      # (registry Run key, launchd plist) compile and their tests run natively.
+      - name: cargo test --release
+        run: cargo test --release
+
+      - name: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
+
   build:
     name: Build ${{ matrix.artifact }}
     runs-on: ${{ matrix.os }}
