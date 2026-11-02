@@ -36,10 +36,13 @@ pub fn daemon_alive() -> bool {
 
 /// Say hello to whatever listens on `port`: true only when a daemon answers
 /// the handshake (`ok: true`). Bounded by short timeouts so a wedged peer
-/// cannot stall the caller.
+/// cannot stall the caller. Reads exactly one response line — the daemon
+/// keeps the connection open for further exchanges (the handshake and the
+/// secret-authenticated command share one connection), so waiting for EOF
+/// would hang until the timeout.
 #[cfg_attr(not(feature = "gui"), allow(dead_code))]
 fn hello_ok(port: u16) -> bool {
-    use std::io::{Read, Write};
+    use std::io::{BufRead, Write};
     let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) else {
         return false;
     };
@@ -48,11 +51,14 @@ fn hello_ok(port: u16) -> bool {
     if stream.write_all(b"{\"cmd\":\"hello\"}\n").is_err() {
         return false;
     }
-    let mut buf = String::new();
-    if stream.read_to_string(&mut buf).is_err() {
+    let mut line = String::new();
+    if std::io::BufReader::new(&mut stream)
+        .read_line(&mut line)
+        .is_err()
+    {
         return false;
     }
-    serde_json::from_str(buf.trim())
+    serde_json::from_str(line.trim())
         .map(|v: Value| v.get("ok").and_then(Value::as_bool) == Some(true))
         .unwrap_or(false)
 }
@@ -229,118 +235,132 @@ async fn handle(
     secret: String,
 ) -> anyhow::Result<()> {
     let (reader, mut writer) = stream.into_split();
-    // Cap the line length and bound the whole exchange so a local peer can
-    // neither exhaust memory nor hold a task/fd forever.
-    let line = read_request_line(BufReader::new(reader)).await?;
-    let req: Value = serde_json::from_str(line.trim())?;
-    // Handshake: proves to the client that this listener is the daemon before
-    // the client sends its secret, so a port squatter never receives it.
-    // Requires no secret itself.
-    if req.get("cmd").and_then(|c| c.as_str()) == Some("hello") {
-        let resp = json!({ "ok": true, "proto": 1 });
-        writer
-            .write_all((serde_json::to_string(&resp)? + "\n").as_bytes())
-            .await?;
-        return Ok(());
-    }
-    if !secret_eq(
-        req.get("secret").and_then(|s| s.as_str()).unwrap_or(""),
-        &secret,
-    ) {
-        let resp = json!({ "ok": false, "error": "unauthorized" });
-        writer
-            .write_all((serde_json::to_string(&resp)? + "\n").as_bytes())
-            .await?;
-        return Ok(());
-    }
-    let resp = match req.get("cmd").and_then(|c| c.as_str()) {
-        Some("status") => status_response(),
-        Some("jobs") => jobs_response(&registry),
-        Some("reauth") => {
-            // Acks immediately: the daemon's auth loop wakes on its own and
-            // the tray follows the outcome via the 1 s `jobs` poll (the
-            // "auth" field flips to ok/retrying/failed).
-            scheduler::request_reauth();
-            json!({ "ok": true, "accepted": true })
+    let mut reader = BufReader::new(reader);
+    // One JSON request per line, several exchanges per connection: the
+    // client opens with the secretless hello handshake (proving this
+    // listener is the daemon BEFORE any secret is sent) and then sends its
+    // secret-authenticated command(s) on the same connection — the proof
+    // and the secret must share the connection, otherwise a port squatter
+    // between two connections would receive the secret. The loop ends when
+    // either side closes, a line is unparseable (no response, so an
+    // over-cap or garbage line is never answered), or an error aborts the
+    // exchange; serve() bounds the whole connection in time.
+    loop {
+        let line = read_request_line(&mut reader).await?;
+        if line.trim().is_empty() {
+            return Ok(()); // client closed the connection
         }
-        Some("shutdown") => {
-            // Clean daemon shutdown: same path as SIGINT/SIGTERM (flush
-            // logs, remove the port file). Acks immediately; the daemon
-            // exits right after. Used by the tray's Stop service item and
-            // Quit, so closing the app cleans up the service instance.
-            crate::service::request_shutdown();
-            json!({ "ok": true, "accepted": true })
+        let req: Value = match serde_json::from_str(line.trim()) {
+            Ok(v) => v,
+            Err(_) => return Ok(()), // over-cap or garbage: end without a response
+        };
+        // Handshake: requires no secret itself, and the connection stays
+        // open for the command that follows.
+        if req.get("cmd").and_then(|c| c.as_str()) == Some("hello") {
+            let resp = json!({ "ok": true, "proto": 1 });
+            writer
+                .write_all((serde_json::to_string(&resp)? + "\n").as_bytes())
+                .await?;
+            continue;
         }
-        Some("archive") => {
-            let channel = req
-                .get("channel")
-                .and_then(|c| c.as_str())
-                .unwrap_or("")
-                .to_string();
-            if !crate::config::valid_id(&channel) {
-                json!({ "ok": false, "error": "channel id must be numeric" })
-            } else {
-                let cfg = cfg.clone();
-                let channel_job = channel.clone();
-                tokio::spawn(async move {
-                    let channel = channel_job;
-                    let _guard = crate::deletion::deletion_lock().lock().await;
-                    // Auth failure must stop the archive, not run it unauthenticated.
-                    let client = match crate::api::authed_client(&cfg).await {
-                        Ok(c) => c,
-                        Err(e) => {
-                            tracing::warn!(error = %e, "archive: authentication failed");
-                            return;
-                        }
-                    };
-                    let dir = cfg.resolve_archive_dir(None);
-                    if let Err(e) =
-                        crate::archiver::archive_chat(&client, &channel, &channel, &dir).await
-                    {
-                        tracing::warn!(channel = %channel, error = %e, "archive failed");
-                    }
-                });
-                json!({ "ok": true, "accepted": true, "channel": channel })
+        if !secret_eq(
+            req.get("secret").and_then(|s| s.as_str()).unwrap_or(""),
+            &secret,
+        ) {
+            let resp = json!({ "ok": false, "error": "unauthorized" });
+            writer
+                .write_all((serde_json::to_string(&resp)? + "\n").as_bytes())
+                .await?;
+            return Ok(());
+        }
+        let resp = match req.get("cmd").and_then(|c| c.as_str()) {
+            Some("status") => status_response(),
+            Some("jobs") => jobs_response(&registry),
+            Some("reauth") => {
+                // Acks immediately: the daemon's auth loop wakes on its own and
+                // the tray follows the outcome via the 1 s `jobs` poll (the
+                // "auth" field flips to ok/retrying/failed).
+                scheduler::request_reauth();
+                json!({ "ok": true, "accepted": true })
             }
-        }
-        Some("run_now") => {
-            let chat = req
-                .get("chat")
-                .and_then(|c| c.as_str())
-                .unwrap_or("")
-                .to_string();
-            let all = req.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
-            // Ack immediately and run in the background: a deletion can take
-            // many minutes at the 24/min pace, and the client must not time
-            // out (or worse, fall back to an unlocked second run). The job
-            // still serializes through the daemon's deletion lock.
-            match prepare_run_now(&cfg, &chat, all) {
-                Ok(job) => {
+            Some("shutdown") => {
+                // Clean daemon shutdown: same path as SIGINT/SIGTERM (flush
+                // logs, remove the port file). Acks immediately; the daemon
+                // exits right after. Used by the tray's Stop service item and
+                // Quit, so closing the app cleans up the service instance.
+                crate::service::request_shutdown();
+                json!({ "ok": true, "accepted": true })
+            }
+            Some("archive") => {
+                let channel = req
+                    .get("channel")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if !crate::config::valid_id(&channel) {
+                    json!({ "ok": false, "error": "channel id must be numeric" })
+                } else {
                     let cfg = cfg.clone();
-                    let registry = registry.clone();
-                    let chat_log = chat.clone();
+                    let channel_job = channel.clone();
                     tokio::spawn(async move {
-                        match run_now_via_daemon(&cfg, job, &registry).await {
-                            Ok(summary) => {
-                                tracing::info!(chat = %chat_log, deleted = summary.deleted, "run-now finished");
-                                record_last_run(&chat_log, &summary).await;
-                            }
+                        let channel = channel_job;
+                        let _guard = crate::deletion::deletion_lock().lock().await;
+                        // Auth failure must stop the archive, not run it unauthenticated.
+                        let client = match crate::api::authed_client(&cfg).await {
+                            Ok(c) => c,
                             Err(e) => {
-                                tracing::warn!(chat = %chat_log, error = %e, "run-now failed")
+                                tracing::warn!(error = %e, "archive: authentication failed");
+                                return;
                             }
+                        };
+                        let dir = cfg.resolve_archive_dir(None);
+                        if let Err(e) =
+                            crate::archiver::archive_chat(&client, &channel, &channel, &dir).await
+                        {
+                            tracing::warn!(channel = %channel, error = %e, "archive failed");
                         }
                     });
-                    json!({ "ok": true, "accepted": true, "chat": chat })
+                    json!({ "ok": true, "accepted": true, "channel": channel })
                 }
-                Err(e) => json!({ "ok": false, "error": format!("{e:#}") }),
             }
-        }
-        other => json!({ "ok": false, "error": format!("unknown cmd {other:?}") }),
-    };
-    writer
-        .write_all((serde_json::to_string(&resp)? + "\n").as_bytes())
-        .await?;
-    Ok(())
+            Some("run_now") => {
+                let chat = req
+                    .get("chat")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let all = req.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
+                // Ack immediately and run in the background: a deletion can take
+                // many minutes at the 24/min pace, and the client must not time
+                // out (or worse, fall back to an unlocked second run). The job
+                // still serializes through the daemon's deletion lock.
+                match prepare_run_now(&cfg, &chat, all) {
+                    Ok(job) => {
+                        let cfg = cfg.clone();
+                        let registry = registry.clone();
+                        let chat_log = chat.clone();
+                        tokio::spawn(async move {
+                            match run_now_via_daemon(&cfg, job, &registry).await {
+                                Ok(summary) => {
+                                    tracing::info!(chat = %chat_log, deleted = summary.deleted, "run-now finished");
+                                    record_last_run(&chat_log, &summary).await;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(chat = %chat_log, error = %e, "run-now failed")
+                                }
+                            }
+                        });
+                        json!({ "ok": true, "accepted": true, "chat": chat })
+                    }
+                    Err(e) => json!({ "ok": false, "error": format!("{e:#}") }),
+                }
+            }
+            other => json!({ "ok": false, "error": format!("unknown cmd {other:?}") }),
+        };
+        writer
+            .write_all((serde_json::to_string(&resp)? + "\n").as_bytes())
+            .await?;
+    }
 }
 
 pub fn read_last_runs_public() -> serde_json::Map<String, serde_json::Value> {
@@ -806,5 +826,46 @@ mod tests {
         let dead_port = listener.local_addr().unwrap().port();
         drop(listener);
         assert!(!hello_ok(dead_port));
+    }
+
+    /// The client protocol the tray depends on: the secretless hello
+    /// handshake and the secret-authenticated command share ONE
+    /// connection — the proof that the listener is the daemon must happen
+    /// on the same connection the secret is sent on, otherwise a squatter
+    /// between two connections would receive the secret. Regression test
+    /// for the server closing the connection after answering hello: the
+    /// panel's polls then all failed (EOF / os error 10053) while every
+    /// single-command test kept passing.
+    #[tokio::test]
+    async fn hello_then_command_on_the_same_connection_round_trips() {
+        use tokio::io::AsyncBufReadExt as _;
+        let port = spawn_ipc("test-secret", ipc_cfg()).await;
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        stream.write_all(b"{\"cmd\":\"hello\"}\n").await.unwrap();
+        let (r, mut w) = stream.into_split();
+        let mut reader = BufReader::new(r);
+        let mut hello = String::new();
+        reader.read_line(&mut hello).await.unwrap();
+        assert_eq!(hello.trim(), r#"{"ok":true,"proto":1}"#);
+        // the daemon must keep serving this connection after the handshake
+        w.write_all(b"{\"cmd\":\"jobs\",\"secret\":\"test-secret\"}\n")
+            .await
+            .unwrap();
+        let mut resp = String::new();
+        reader.read_line(&mut resp).await.unwrap();
+        let resp: Value = serde_json::from_str(resp.trim()).unwrap();
+        assert_eq!(resp["ok"], true);
+        assert!(resp["running"].is_array());
+        assert!(resp["last"].is_object());
+        assert!(resp["auth"].is_string());
+        // a second command on the same connection works too
+        w.write_all(b"{\"cmd\":\"status\",\"secret\":\"test-secret\"}\n")
+            .await
+            .unwrap();
+        let mut resp2 = String::new();
+        reader.read_line(&mut resp2).await.unwrap();
+        let resp2: Value = serde_json::from_str(resp2.trim()).unwrap();
+        assert_eq!(resp2["ok"], true);
+        assert!(resp2["runs"].is_object());
     }
 }
