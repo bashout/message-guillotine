@@ -27,7 +27,7 @@ mod service;
 mod testutil;
 mod viewer;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
@@ -46,8 +46,10 @@ struct Cli {
     #[arg(long, global = true)]
     config: Option<PathBuf>,
 
+    /// No subcommand on a gui build: start the service daemon (if none is
+    /// running) and open the tray app
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -57,7 +59,8 @@ enum Commands {
         #[command(subcommand)]
         action: ServiceCommands,
     },
-    /// Tray icon app: status, run-now, and configuration
+    /// Tray icon app: status, run-now, and configuration. Starts the service
+    /// daemon when none is running, so the tray always has a daemon behind it
     Gui,
     /// Browse archived chats in a local web UI (V2 viewer)
     Viewer {
@@ -127,11 +130,17 @@ enum ConfigCommands {
     Validate,
 }
 
-fn load_config(config_arg: Option<&PathBuf>) -> anyhow::Result<(Config, PathBuf)> {
-    let path = config_arg
-        .cloned()
+/// The config path in use: `--config`, else `GUILLOTINE_CONFIG`, else the
+/// per-OS default. Does not require the file to exist.
+fn resolved_config_path(config_arg: Option<&Path>) -> PathBuf {
+    config_arg
+        .map(Path::to_path_buf)
         .or_else(|| std::env::var_os(config::ENV_CONFIG).map(PathBuf::from))
-        .unwrap_or_else(config::default_config_path);
+        .unwrap_or_else(config::default_config_path)
+}
+
+fn load_config(config_arg: Option<&PathBuf>) -> anyhow::Result<(Config, PathBuf)> {
+    let path = resolved_config_path(config_arg.map(|p| p.as_path()));
     let cfg = Config::load(&path)?;
     Ok((cfg, path))
 }
@@ -198,17 +207,76 @@ fn main() -> anyhow::Result<()> {
         config: config_arg,
         command,
     } = Cli::parse();
-    // The Iced GUI runs its own event loop (and tokio runtime) on the main
-    // thread, so it must NOT be started from inside a #[tokio::main] runtime.
-    if matches!(command, Commands::Gui) {
-        #[cfg(feature = "gui")]
-        return gui::run_sync(config_arg);
-        #[cfg(not(feature = "gui"))]
-        anyhow::bail!(
-            "built without the gui feature; use `guillotine service run` and the CLI subcommands"
-        );
+    match command {
+        // No subcommand: the desktop default — start the daemon (unless one
+        // is already running) and open the tray app.
+        None => launch_default(config_arg),
+        // The tray app, with a daemon ensured behind its IPC.
+        Some(Commands::Gui) => launch_gui(config_arg),
+        // Everything else runs on a foreground tokio runtime.
+        Some(command) => tokio::runtime::Runtime::new()?.block_on(run_async(config_arg, command)),
     }
-    tokio::runtime::Runtime::new()?.block_on(run_async(config_arg, command))
+}
+
+/// The no-subcommand desktop default: on gui builds this is the tray launch
+/// (with a daemon ensured); headless builds have no default action.
+#[cfg(feature = "gui")]
+fn launch_default(config_arg: Option<PathBuf>) -> anyhow::Result<()> {
+    launch_gui(config_arg)
+}
+
+#[cfg(not(feature = "gui"))]
+fn launch_default(_config_arg: Option<PathBuf>) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "no subcommand given and this is a headless build; \
+         run `guillotine --help` for the subcommands"
+    )
+}
+
+/// Instantiate the config if none exists yet: a first launch on a fresh
+/// machine writes the example config (the same file `config init` writes)
+/// so the app opens with something editable instead of exiting with
+/// "cannot read config file". An existing file is never touched. Failure to
+/// create it is reported to stderr and left for the config load to surface.
+#[cfg(feature = "gui")]
+fn ensure_example_config(config_arg: Option<&Path>) {
+    let path = resolved_config_path(config_arg);
+    if path.exists() {
+        return;
+    }
+    let created = (|| -> anyhow::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        // Atomic private write: temp file created 0600 + rename, so the
+        // example token is never world-readable, even briefly.
+        config::write_file_private_atomic(&path, config::EXAMPLE_CONFIG)?;
+        Ok(())
+    })();
+    match created {
+        Ok(()) => eprintln!("No config found; wrote an example to {}", path.display()),
+        Err(e) => eprintln!("cannot create example config at {}: {e:#}", path.display()),
+    }
+}
+
+/// The tray path (`gui`, and the default launch): create the example config
+/// when none exists, ensure a daemon is running so the tray's run-now stays
+/// inside the single-deletion lock, then run the Iced GUI on the main
+/// thread. Iced runs its own event loop (and tokio runtime) on the main
+/// thread, so the GUI must NOT be started from inside a #[tokio::main]
+/// runtime.
+#[cfg(feature = "gui")]
+fn launch_gui(config_arg: Option<PathBuf>) -> anyhow::Result<()> {
+    ensure_example_config(config_arg.as_deref());
+    service::ensure_daemon(config_arg.as_deref())?;
+    gui::run_sync(config_arg)
+}
+
+#[cfg(not(feature = "gui"))]
+fn launch_gui(_config_arg: Option<PathBuf>) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "built without the gui feature; use `guillotine service run` and the CLI subcommands"
+    )
 }
 
 async fn run_async(config_arg: Option<PathBuf>, command: Commands) -> anyhow::Result<()> {
@@ -231,10 +299,7 @@ async fn run_async(config_arg: Option<PathBuf>, command: Commands) -> anyhow::Re
                 println!("{}", path.display());
             }
             ConfigCommands::Init => {
-                let path = config_arg
-                    .clone()
-                    .or_else(|| std::env::var_os(config::ENV_CONFIG).map(PathBuf::from))
-                    .unwrap_or_else(config::default_config_path);
+                let path = resolved_config_path(config_arg.as_deref());
                 if path.exists() {
                     anyhow::bail!("{} already exists; refusing to overwrite", path.display());
                 }

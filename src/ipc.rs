@@ -17,6 +17,46 @@ pub fn port_file() -> PathBuf {
     config::data_dir().join("ipc.port")
 }
 
+/// Whether a daemon is currently listening: the port file's port answers the
+/// secretless hello handshake. Used by the default launch (and `gui`) to
+/// decide whether the service daemon needs starting. No secret is involved,
+/// so an unrelated process squatting a reused port is never mistaken for the
+/// daemon — and never learns anything from the probe.
+/// (Only the gui feature calls this; headless builds start no tray.)
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub fn daemon_alive() -> bool {
+    let Ok(raw) = std::fs::read_to_string(port_file()) else {
+        return false;
+    };
+    let Ok(port) = raw.trim().parse::<u16>() else {
+        return false;
+    };
+    hello_ok(port)
+}
+
+/// Say hello to whatever listens on `port`: true only when a daemon answers
+/// the handshake (`ok: true`). Bounded by short timeouts so a wedged peer
+/// cannot stall the caller.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+fn hello_ok(port: u16) -> bool {
+    use std::io::{Read, Write};
+    let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(2)));
+    if stream.write_all(b"{\"cmd\":\"hello\"}\n").is_err() {
+        return false;
+    }
+    let mut buf = String::new();
+    if stream.read_to_string(&mut buf).is_err() {
+        return false;
+    }
+    serde_json::from_str(buf.trim())
+        .map(|v: Value| v.get("ok").and_then(Value::as_bool) == Some(true))
+        .unwrap_or(false)
+}
+
 /// Shared secret required on every IPC request. Stored 0600 in the data dir.
 pub fn secret_file() -> PathBuf {
     config::data_dir().join("ipc.secret")
@@ -661,5 +701,63 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resp["ok"], false);
+    }
+
+    // ------------------------------------------------------------------
+    // daemon_alive / hello_ok: the blocking liveness probe.
+    // ------------------------------------------------------------------
+
+    /// A std::net listener thread that consumes the request line like the
+    /// real daemon, then answers every connection with one fixed line.
+    /// (Reading first matters: closing a socket with unread inbound data
+    /// sends RST instead of FIN, which would make the probe fail.)
+    fn echo_listener(line: &'static str) -> u16 {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf); // consume the request line
+                let _ = stream.write_all(line.as_bytes());
+                let _ = stream.write_all(b"\n");
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn hello_ok_recognizes_a_daemon_handshake() {
+        // the daemon's hello answer proves the peer
+        let port = echo_listener("{\"ok\": true, \"proto\": 1}");
+        assert!(hello_ok(port));
+        // a non-daemon peer on the port is rejected
+        let port = echo_listener("{\"ok\": false}");
+        assert!(!hello_ok(port));
+        // garbage on the wire is rejected
+        let port = echo_listener("not json");
+        assert!(!hello_ok(port));
+        // nothing listening: connection refused
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let dead_port = listener.local_addr().unwrap().port();
+        drop(listener);
+        assert!(!hello_ok(dead_port));
+    }
+
+    #[tokio::test]
+    async fn daemon_alive_over_the_real_daemon_handshake() {
+        // spawn_ipc answers the same hello handshake the real daemon does.
+        // The probe blocks its thread, so it must run on the blocking pool:
+        // on the current-thread test runtime it would starve the listener.
+        let port = spawn_ipc("test-secret", ipc_cfg()).await;
+        let alive = tokio::task::spawn_blocking(move || hello_ok(port))
+            .await
+            .unwrap();
+        assert!(alive);
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let dead_port = listener.local_addr().unwrap().port();
+        drop(listener);
+        assert!(!hello_ok(dead_port));
     }
 }

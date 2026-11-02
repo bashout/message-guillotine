@@ -42,6 +42,56 @@ fn config_path(config_arg: Option<&Path>) -> PathBuf {
         .unwrap_or_else(config::default_config_path)
 }
 
+/// Start the daemon when none is running, so the default launch (no
+/// subcommand) and `guillotine gui` bring up the service together with the
+/// tray. The child is spawned fully detached — its own process group on
+/// unix, `DETACHED_PROCESS` on Windows — so the daemon outlives the tray
+/// process, exactly like an autostarted daemon would. Already-running
+/// daemons (e.g. started at login) are detected via the IPC hello handshake
+/// and left alone, so a second daemon never starts.
+#[cfg(feature = "gui")]
+pub fn ensure_daemon(config_arg: Option<&Path>) -> anyhow::Result<()> {
+    use std::process::Stdio;
+    if crate::ipc::daemon_alive() {
+        return Ok(());
+    }
+    let exe =
+        std::env::current_exe().map_err(|e| anyhow::anyhow!("cannot resolve exe path: {e}"))?;
+    let mut cmd = Command::new(&exe);
+    cmd.arg("service")
+        .arg("run")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(config) = config_arg {
+        cmd.arg("--config").arg(config);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+    }
+    cmd.spawn()
+        .map_err(|e| anyhow::anyhow!("cannot start the service daemon: {e}"))?;
+    // Bounded wait for the IPC hello handshake, so the tray's first status
+    // poll finds a live daemon. A timeout is not fatal: the daemon may still
+    // be coming up, and the tray keeps polling IPC either way.
+    for _ in 0..50 {
+        if crate::ipc::daemon_alive() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Ok(())
+}
+
 /// Resolves when the process should shut down: SIGINT (Ctrl-C) on every
 /// platform, plus SIGTERM on unix so `systemctl stop` flushes cleanly.
 async fn shutdown_signal() {
@@ -207,8 +257,19 @@ pub fn status(_config_arg: Option<&Path>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The registry Run key command line: the default launch (no subcommand), so
+/// login starts the service daemon and the tray together. Compiled on every
+/// OS so the quoting is unit-testable everywhere.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn run_key_value(exe: &Path, config: &Path) -> String {
+    format!("\"{}\" --config \"{}\"", exe.display(), config.display())
+}
+
 /// launchd LaunchAgent (macOS). Compiled on every OS so the escaping rules
-/// are unit-testable everywhere.
+/// are unit-testable everywhere. Runs the default launch (no subcommand) so
+/// login starts the service daemon and the tray together; KeepAlive uses
+/// SuccessfulExit=false so a clean tray Quit stays quit while a crash is
+/// restarted.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -216,7 +277,7 @@ fn xml_escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
-#[cfg(target_os = "macos")]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn launchd_plist(exe: &Path, config: &Path) -> String {
     let exe = xml_escape(&exe.display().to_string());
     let config = xml_escape(&config.display().to_string());
@@ -236,9 +297,9 @@ fn launchd_plist(exe: &Path, config: &Path) -> String {
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
          <plist version=\"1.0\"><dict>\n\
          <key>Label</key><string>com.guillotine.service</string>\n\
-         <key>ProgramArguments</key><array><string>{exe}</string><arg>--config</arg><string>{config}</string><arg>service</arg><arg>run</arg></array>\n\
+         <key>ProgramArguments</key><array><string>{exe}</string><arg>--config</arg><string>{config}</string></array>\n\
          <key>RunAtLoad</key><true/>\n\
-         <key>KeepAlive</key><true/>\n\
+         <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>\n\
          <key>StandardOutPath</key><string>{out}</string>\n\
          <key>StandardErrorPath</key><string>{err}</string>\n\
          </dict></plist>\n"
@@ -291,11 +352,7 @@ pub fn install(config_arg: Option<&Path>) -> anyhow::Result<()> {
     use std::os::windows::process::CommandExt;
     let exe = exe_path()?;
     let config = config_path(config_arg);
-    let value = format!(
-        "\"{}\" --config \"{}\" service run",
-        exe.display(),
-        config.display()
-    );
+    let value = run_key_value(&exe, &config);
     let status = Command::new("reg")
         .args([
             "add",
@@ -407,5 +464,44 @@ mod tests {
             "/tmp/&lt;weird&gt; &amp; \"path\""
         );
         assert_eq!(xml_escape(""), "");
+    }
+
+    #[test]
+    fn run_key_value_is_the_default_launch_with_quoted_paths() {
+        // no subcommand: the default launch (service + tray) with both
+        // paths quoted so spaces in the exe/config path cannot split args
+        let value = run_key_value(
+            Path::new("C:\\Program Files\\guillotine.exe"),
+            Path::new("C:\\Users\\me\\AppData\\Roaming\\guillotine\\config.toml"),
+        );
+        assert_eq!(
+            value,
+            "\"C:\\Program Files\\guillotine.exe\" --config \"C:\\Users\\me\\AppData\\Roaming\\guillotine\\config.toml\""
+        );
+        assert!(!value.contains("service"), "must be the default launch");
+    }
+
+    #[test]
+    fn launchd_plist_uses_default_launch_and_restarts_only_on_crash() {
+        let plist = launchd_plist(
+            Path::new("/Applications/Guillotine.app/Contents/MacOS/guillotine"),
+            Path::new("/Users/me/Library/Application Support/guillotine/config.toml"),
+        );
+        // default launch: exe + --config config, no "service run" arguments
+        assert!(plist
+            .contains("<string>/Applications/Guillotine.app/Contents/MacOS/guillotine</string>"));
+        assert!(plist.contains(
+            "<string>/Users/me/Library/Application Support/guillotine/config.toml</string>"
+        ));
+        assert!(!plist.contains("<arg>service</arg>"));
+        assert!(!plist.contains("<arg>run</arg>"));
+        // a & in the config path must be escaped, never injected raw
+        assert!(plist.contains("&amp;") || !plist.contains('&'));
+        // run at login, restart only after a non-clean exit (crash), so a
+        // tray Quit is respected
+        assert!(plist.contains("<key>RunAtLoad</key><true/>"));
+        assert!(
+            plist.contains("<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>")
+        );
     }
 }

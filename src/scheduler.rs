@@ -386,15 +386,46 @@ pub async fn run_now(config_arg: Option<&PathBuf>, chat: &str) -> anyhow::Result
 /// The service loop: resolve jobs, sleep until each chat's next fire time,
 /// run due jobs one at a time, and recompute. Runs forever.
 pub async fn run_loop(cfg: &Config, config_path: &std::path::Path) -> anyhow::Result<()> {
-    let client = crate::api::authed_client(cfg).await?;
     let registry = crate::progress::new_registry();
+    // IPC comes up before auth: the tray (and the default launch's liveness
+    // probe) must find a live daemon even when the token is not configured
+    // yet — a fresh install starts the service; it just runs no jobs until
+    // the config has a working token. run-now still works as soon as the
+    // token is fixed, because the IPC handler builds its own client per
+    // request from the reloaded config.
     tokio::spawn(crate::ipc::serve(
         std::sync::Arc::new(cfg.clone()),
         registry.clone(),
         config_path.to_path_buf(),
     ));
+    // Auth retries: a not-yet-configured token (fresh install) or a
+    // transient network failure must not kill the service. Each attempt
+    // reloads the config so a token fixed in the tray Settings takes effect
+    // without a daemon restart.
+    let client = loop {
+        let cfg_now = Config::load(config_path).unwrap_or_else(|_| cfg.clone());
+        match crate::api::authed_client(&cfg_now).await {
+            Ok(c) => break c,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "authentication failed; retrying in 60s (token not configured yet, or a network problem)"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            }
+        }
+    };
     // Re-resolve the DM scope periodically: DMs come and go.
-    let mut jobs = resolve_jobs(&client, cfg).await?;
+    let mut jobs = match resolve_jobs(&client, cfg).await {
+        Ok(jobs) => jobs,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "initial job resolution failed; starting idle and retrying in the loop"
+            );
+            Vec::new()
+        }
+    };
     // Warn about jobs whose last run is older than their schedule interval:
     // a fire missed while the service was down is not backfilled (retention is
     // relative to now, so this is safe) but it should be visible.

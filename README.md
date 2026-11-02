@@ -38,7 +38,7 @@ best-effort and untested; CI builds and tests against the versions below.
 |---|---|---|---|---|
 | Linux x86_64 / aarch64 | Latest Ubuntu LTS (24.04) and equivalent-era distros (Debian stable, current Fedora, …) | AppImage (GUI, libs bundled), static musl tar.gz (headless CLI) | systemd `--user` unit | AppImage needs FUSE (or `--appimage-extract-and-run`); GUI also needs GTK3 + libayatana-appindicator, both bundled in the AppImage |
 | macOS Apple Silicon / Intel | Latest macOS (15 Sequoia) | zip of the bare binary — no .dmg, no signing | launchd LaunchAgent | Binary is unsigned: if downloaded via a browser, run `xattr -d com.apple.quarantine guillotine` once |
-| Windows 10/11 x64 | Latest Windows 10/11 | zip of `guillotine.exe` (static CRT — no redistributable needed) | registry Run key | GUI-first: the exe is a windowed-subsystem binary, so CLI subcommands (`config init`, `scan`, …) produce no console output — use the tray app or run via `gui` |
+| Windows 10/11 x64 | Latest Windows 10/11 | zip of `guillotine.exe` (static CRT — no redistributable needed) | registry Run key (default launch: daemon + tray) | GUI-first: double-clicking the exe starts the service and the tray; the exe is a windowed-subsystem binary, so CLI subcommands (`config init`, `scan`, …) produce no console output — use the tray app |
 
 Feature coverage is identical on all platforms:
 
@@ -69,18 +69,27 @@ cd message-guillotine
 cargo build --release            # add --no-default-features on headless Linux
 
 # the binary is target/release/guillotine
+# No subcommand (desktop builds) starts the service daemon and the tray
+# app together; if a daemon is already running it is reused, not doubled.
+# A first launch with no config yet writes the example config automatically.
+./target/release/guillotine                # service + tray (desktop builds)
 ./target/release/guillotine config init      # writes an example config (0600) to the per-OS config dir
 ./target/release/guillotine config validate  # check it and print the resolved chats
 # edit the config: token (or GUILLOTINE_TOKEN env var), [dm] policy, [chat.*] entries
 
 ./target/release/guillotine service install  # register native autostart
 ./target/release/guillotine service status
-./target/release/guillotine gui              # tray app (desktop builds)
+./target/release/guillotine gui              # tray app (desktop builds; ensures the daemon)
 ./target/release/guillotine run-now dm:USER_ID          # manual run for one chat (serialized with scheduled runs)
 ./target/release/guillotine scan CHANNEL_ID --retention-days 7   # dry-run report
 ./target/release/guillotine archive CHANNEL_ID              # one-shot archive
 ./target/release/guillotine viewer [ARCHIVES_DIR] --host 127.0.0.1 --port 8765   # browse archives (--no-browser to skip opening)
 ```
+
+On Windows and macOS the autostart entries register the same default launch,
+so login starts the daemon and the tray together (the Linux systemd unit
+stays headless: `service run`). The daemon spawned by a default launch is
+detached and keeps running after the tray quits, like any service.
 
 ## Configuration
 
