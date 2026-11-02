@@ -109,7 +109,24 @@ archive_before_delete = false
 
 ## Development
 
-All development happens in the crate at the repo root:
+All development happens in the crate at the repo root.
+
+Toolchain prerequisites:
+
+- **Rust** (stable, via [rustup](https://rustup.rs)) — the default toolchain is
+  used on all platforms.
+- **Linux only:** the GUI/tray crates link against GTK3 and libayatana-appindicator
+  (`libxdo-dev libayatana-appindicator3-dev pkg-config libgtk-3-dev` on
+  Ubuntu; the same set CI installs). Skip these for a headless
+  (`--no-default-features`) build.
+- **Windows only:** the MSVC linker from [Visual Studio Build
+  Tools](https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio)
+  ("Desktop development with C++", which includes the Windows SDK) — rustup's
+  default `x86_64-pc-windows-msvc` target needs `link.exe` from it. No other
+  system libraries: the tray/GUI crates are pure Rust on Windows. The `winget`
+  equivalent is `Microsoft.VisualStudio.2022.BuildTools` (with the C++ and
+  Windows SDK components) plus `Rustlang.Rustup`.
+- **macOS:** Xcode Command Line Tools (`xcode-select --install`).
 
 ```bash
 cargo test --release             # unit tests — must pass
