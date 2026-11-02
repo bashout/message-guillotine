@@ -209,12 +209,17 @@ where
 
 /// Response payload for `cmd: "status"`.
 fn status_response() -> Value {
-    json!({ "ok": true, "runs": read_last_runs() })
+    json!({ "ok": true, "auth": scheduler::auth_state_str(), "runs": read_last_runs() })
 }
 
 /// Response payload for `cmd: "jobs"`: the live registry plus last runs.
 fn jobs_response(registry: &crate::progress::SharedRegistry) -> Value {
-    json!({ "ok": true, "running": registry.snapshot(), "last": read_last_runs() })
+    json!({
+        "ok": true,
+        "auth": scheduler::auth_state_str(),
+        "running": registry.snapshot(),
+        "last": read_last_runs()
+    })
 }
 
 async fn handle(
@@ -251,6 +256,13 @@ async fn handle(
     let resp = match req.get("cmd").and_then(|c| c.as_str()) {
         Some("status") => status_response(),
         Some("jobs") => jobs_response(&registry),
+        Some("reauth") => {
+            // Acks immediately: the daemon's auth loop wakes on its own and
+            // the tray follows the outcome via the 1 s `jobs` poll (the
+            // "auth" field flips to ok/retrying/failed).
+            scheduler::request_reauth();
+            json!({ "ok": true, "accepted": true })
+        }
         Some("archive") => {
             let channel = req
                 .get("channel")
@@ -535,6 +547,7 @@ mod tests {
         registry.update("dm:1", |p| p.deleted = 5);
         let resp = jobs_response(&registry);
         assert_eq!(resp["ok"], true);
+        assert!(resp["auth"].is_string(), "auth state must be reported");
         let running = resp["running"].as_array().unwrap();
         assert_eq!(running.len(), 1);
         assert_eq!(running[0]["chat"], "dm:1");
@@ -543,11 +556,24 @@ mod tests {
         assert_eq!(running[0]["deleted"], 5);
         assert!(running[0]["started"].as_str().is_some());
         assert!(resp["last"].is_object());
-        // status has no "running" key
+        // status has no "running" key but does report auth
         let resp = status_response();
         assert_eq!(resp["ok"], true);
+        assert!(resp["auth"].is_string());
         assert!(resp.get("running").is_none());
         assert!(resp["runs"].is_object());
+    }
+
+    #[tokio::test]
+    async fn ipc_reauth_acks_immediately() {
+        // Acks without doing the auth itself; the daemon's auth loop wakes
+        // on its own (request_reauth is fire-and-forget, no token involved).
+        let port = spawn_ipc("test-secret", ipc_cfg()).await;
+        let resp: Value = serde_json::from_str(
+            &ipc_send(port, r#"{"cmd":"reauth","secret":"test-secret"}"#).await,
+        )
+        .unwrap();
+        assert_eq!(resp, json!({"ok": true, "accepted": true}));
     }
 
     // ------------------------------------------------------------------

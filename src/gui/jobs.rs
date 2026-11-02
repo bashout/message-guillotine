@@ -12,6 +12,10 @@ pub(crate) struct JobsState {
     pub(crate) running: Vec<serde_json::Value>,
     pub(crate) last: serde_json::Value,
     pub(crate) note: String,
+    /// The daemon's auth state from the last `jobs` poll: "ok" |
+    /// "retrying" | "failed" (a full round of three attempts failed) |
+    /// "" (daemon not running / unknown).
+    pub(crate) daemon_auth: String,
     /// Chat key -> friendly label, fetched in the background from the API.
     pub(crate) labels: HashMap<String, String>,
     /// Two-click arm state for the "Clear jobs" button.
@@ -30,6 +34,19 @@ impl PanelApp {
         );
         if !j.note.is_empty() {
             col = col.push(text(j.note.clone()).color(err_color()));
+        }
+        // A failed auth round is the one thing the user must act on: point
+        // at the Settings tab where the token + Re-auth flow lives.
+        if j.daemon_auth == "failed" {
+            col = col.push(
+                text(
+                    "service authentication failed (3 attempts) — update the \
+                     token in Settings, save, then press Re-auth there",
+                )
+                .color(err_color()),
+            );
+        } else if j.daemon_auth == "retrying" {
+            col = col.push(text("service is authenticating…").color(muted()));
         }
 
         // Debug-style maintenance action: wipe the configured jobs ([chat]

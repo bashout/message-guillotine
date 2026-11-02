@@ -66,6 +66,9 @@ pub(crate) struct SettingsState {
     /// refused or unacknowledged request is visible (it is otherwise only
     /// logged).
     pub(crate) run_note: String,
+    /// Result of the last Re-auth request (the daemon's auth loop outcome
+    /// is followed via the jobs poll, this notes the request itself).
+    pub(crate) reauth_note: String,
 }
 
 /// Split a config schedule into its combobox kind ("daily"/"weekly"/
@@ -174,6 +177,7 @@ impl SettingsState {
             manual_chats,
             status: String::new(),
             run_note: String::new(),
+            reauth_note: String::new(),
         }
     }
 }
@@ -372,6 +376,20 @@ impl PanelApp {
         col = col.extend(manual_rows);
         col = col.push(button(text("add guild channel")).on_press(Message::AddManualChat));
 
+        // -- Auth (a failed daemon round prompts here; the flow is edit
+        // token -> Save -> Re-auth) --
+        if self.jobs.daemon_auth == "failed" {
+            col = col.push(
+                text(
+                    "service authentication failed after 3 attempts. Update the \
+                     token above, press Save, then press Re-auth.",
+                )
+                .color(err_color()),
+            );
+        } else if self.jobs.daemon_auth == "retrying" {
+            col = col.push(text("service is authenticating…").color(muted()));
+        }
+
         // -- Save --
         let status_color = if s.status.starts_with("Saved") {
             ok_color()
@@ -379,12 +397,28 @@ impl PanelApp {
             err_color()
         };
         let mut save_row = row![button(text("Save")).on_press(Message::Save)].spacing(10);
+        if self.jobs.daemon_auth == "failed" {
+            // Re-auth only makes sense once there is a saved token to try.
+            save_row = save_row.push(
+                button(text("Re-auth"))
+                    .on_press(Message::ReauthClicked)
+                    .style(button::danger),
+            );
+        }
         if !s.status.is_empty() {
             save_row = save_row.push(text(s.status.clone()).color(status_color));
         }
         if !s.run_note.is_empty() {
             let run_ok = s.run_note.starts_with("accepted");
             save_row = save_row.push(text(s.run_note.clone()).color(if run_ok {
+                ok_color()
+            } else {
+                err_color()
+            }));
+        }
+        if !s.reauth_note.is_empty() {
+            let reauth_ok = s.reauth_note.starts_with("re-auth started");
+            save_row = save_row.push(text(s.reauth_note.clone()).color(if reauth_ok {
                 ok_color()
             } else {
                 err_color()
@@ -822,6 +856,7 @@ mod tests {
             }],
             status: String::new(),
             run_note: String::new(),
+            reauth_note: String::new(),
         }
     }
 

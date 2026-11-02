@@ -398,6 +398,50 @@ fn token_marker(cfg: &Config) -> Option<String> {
     cfg.token().ok().map(str::to_string)
 }
 
+/// Daemon-wide auth state, surfaced over IPC (`jobs`/`status` responses) so
+/// the tray can prompt the user after a failed round. Never carries the
+/// token itself. Starts as `Retrying`: the daemon has not authenticated yet
+/// when its IPC listener comes up.
+static AUTH_STATE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(AuthState::Retrying as u8);
+
+/// Interrupts the auth loop's idle wait: set by the IPC `reauth` command (the
+/// tray's "Re-auth" button) so a new round starts immediately instead of
+/// waiting for the token-change poll. The flag covers the between-rounds
+/// race where `notify_waiters` would fire before the loop waits.
+static REAUTH_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static REAUTH_NOTIFY: std::sync::LazyLock<tokio::sync::Notify> =
+    std::sync::LazyLock::new(tokio::sync::Notify::new);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AuthState {
+    Ok = 0,
+    Retrying = 1,
+    Failed = 2,
+}
+
+pub fn set_auth_state(state: AuthState) {
+    AUTH_STATE.store(state as u8, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The daemon's auth state as reported over IPC: "ok" | "retrying" |
+/// "failed" (a full round of three attempts failed; the service is idle
+/// awaiting a token update or an explicit re-auth).
+pub fn auth_state_str() -> &'static str {
+    match AUTH_STATE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => "ok",
+        1 => "retrying",
+        _ => "failed",
+    }
+}
+
+/// Wake the auth loop for a new round now (IPC `reauth`, tray button).
+pub fn request_reauth() {
+    REAUTH_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
+    REAUTH_NOTIFY.notify_waiters();
+}
+
 /// The service loop: resolve jobs, sleep until each chat's next fire time,
 /// run due jobs one at a time, and recompute. Runs forever.
 pub async fn run_loop(cfg: &Config, config_path: &std::path::Path) -> anyhow::Result<()> {
@@ -420,6 +464,7 @@ pub async fn run_loop(cfg: &Config, config_path: &std::path::Path) -> anyhow::Re
     // network failure must not kill the service, and a bad token must not
     // turn into unbounded retries.
     let client = loop {
+        set_auth_state(AuthState::Retrying);
         let cfg_now = Config::load(config_path).unwrap_or_else(|_| cfg.clone());
         let failed_marker = token_marker(&cfg_now);
         let mut authed = None;
@@ -436,20 +481,36 @@ pub async fn run_loop(cfg: &Config, config_path: &std::path::Path) -> anyhow::Re
             }
         }
         if let Some(client) = authed {
+            set_auth_state(AuthState::Ok);
+            REAUTH_REQUESTED.store(false, std::sync::atomic::Ordering::Relaxed);
             break client;
         }
+        set_auth_state(AuthState::Failed);
         tracing::warn!(
             attempts = AUTH_ATTEMPTS,
-            "authentication failed; service idle until the token is updated"
+            "authentication failed; service idle until the token is updated or re-auth is requested"
         );
         loop {
-            tokio::time::sleep(TOKEN_POLL_INTERVAL).await;
-            let fresh = Config::load(config_path).unwrap_or_else(|_| cfg.clone());
-            if token_marker(&fresh) != failed_marker {
+            if REAUTH_REQUESTED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                tracing::info!("re-auth requested; retrying authentication");
                 break;
             }
+            tokio::select! {
+                _ = REAUTH_NOTIFY.notified() => {
+                    if REAUTH_REQUESTED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                        tracing::info!("re-auth requested; retrying authentication");
+                        break;
+                    }
+                }
+                _ = tokio::time::sleep(TOKEN_POLL_INTERVAL) => {
+                    let fresh = Config::load(config_path).unwrap_or_else(|_| cfg.clone());
+                    if token_marker(&fresh) != failed_marker {
+                        tracing::info!("token updated; retrying authentication");
+                        break;
+                    }
+                }
+            }
         }
-        tracing::info!("token updated; retrying authentication");
     };
     // Re-resolve the DM scope periodically: DMs come and go.
     let mut jobs = match resolve_jobs(&client, cfg).await {
@@ -733,6 +794,20 @@ mod tests {
             token_marker(&same_token),
             token_marker(&same_token_elsewhere)
         );
+    }
+
+    #[test]
+    fn auth_state_str_reports_the_ipc_surface_values() {
+        for (state, expected) in [
+            (AuthState::Ok, "ok"),
+            (AuthState::Retrying, "retrying"),
+            (AuthState::Failed, "failed"),
+        ] {
+            set_auth_state(state);
+            assert_eq!(auth_state_str(), expected);
+        }
+        // restore the initial daemon state for other tests sharing it
+        set_auth_state(AuthState::Retrying);
     }
 
     #[test]

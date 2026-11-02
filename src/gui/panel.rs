@@ -78,6 +78,14 @@ pub(crate) enum Message {
     /// Two-click armed: wipe the configured jobs ([chat] table) and save.
     ClearJobsClicked,
     Save,
+    // -- auth (daemon state -> UI) --
+    /// The daemon reports a failed auth round: prompt the user to update
+    /// the token, save, then re-auth.
+    ReauthClicked,
+    ReauthDone(Result<serde_json::Value, String>),
+    /// A GUI API client was (re)built after the daemon re-authenticated —
+    /// refresh the Settings lists that need one.
+    ClientBooted(Result<Arc<crate::api::Client>, String>),
     // -- jobs view --
     JobsFetched(Result<serde_json::Value, String>),
     LabelsFetched(HashMap<String, String>),
@@ -127,6 +135,7 @@ impl PanelApp {
                 running: Vec::new(),
                 last: serde_json::json!({}),
                 note: String::new(),
+                daemon_auth: String::new(),
                 labels: HashMap::new(),
                 armed_clear_jobs: false,
                 clear_note: String::new(),
@@ -135,31 +144,35 @@ impl PanelApp {
             client,
             config_path,
         };
-        let mut tasks = Vec::new();
-        if app.client.is_some() {
-            app.settings.dm_pending = true;
-            app.settings.guild_pending = true;
-            let c = app.client.clone();
-            tasks.push(Task::perform(fetch_dm_users(c), Message::DmUsersFetched));
-            let c = app.client.clone();
-            tasks.push(Task::perform(fetch_guilds(c), Message::GuildsFetched));
-            // Friendly chat labels for the jobs grids.
-            let c = app.client.clone();
-            let path = app.config_path.clone();
-            tasks.push(Task::perform(
-                async move {
-                    let chats = crate::load_config(Some(&path))
-                        .map(|(cfg, _)| cfg.chats().map(|(k, _)| k.to_string()).collect::<Vec<_>>())
-                        .unwrap_or_default();
-                    match &c {
-                        Some(c) => fetch_chat_labels(c, &chats).await,
-                        None => HashMap::new(),
-                    }
-                },
-                Message::LabelsFetched,
-            ));
-        }
+        let tasks = app.client_fetch_tasks();
         (app, Task::batch(tasks))
+    }
+
+    /// Background fetches that need an API client: DM users, guilds, and
+    /// friendly chat labels for the Settings/Jobs views. Used at boot and
+    /// after the client is rebuilt post-re-auth.
+    fn client_fetch_tasks(&mut self) -> Vec<Task<Message>> {
+        let Some(c) = self.client.clone() else {
+            return Vec::new();
+        };
+        self.settings.dm_pending = true;
+        self.settings.guild_pending = true;
+        let mut tasks = vec![
+            Task::perform(fetch_dm_users(Some(c.clone())), Message::DmUsersFetched),
+            Task::perform(fetch_guilds(Some(c.clone())), Message::GuildsFetched),
+        ];
+        // Friendly chat labels for the jobs grids.
+        let path = self.config_path.clone();
+        tasks.push(Task::perform(
+            async move {
+                let chats = crate::load_config(Some(&path))
+                    .map(|(cfg, _)| cfg.chats().map(|(k, _)| k.to_string()).collect::<Vec<_>>())
+                    .unwrap_or_default();
+                fetch_chat_labels(&c, &chats).await
+            },
+            Message::LabelsFetched,
+        ));
+        tasks
     }
 
     pub(crate) fn subscription(&self) -> Subscription<Message> {
@@ -545,19 +558,81 @@ impl PanelApp {
                     Ok(resp) if resp["ok"] == true => {
                         self.jobs.running = resp["running"].as_array().cloned().unwrap_or_default();
                         self.jobs.last = resp["last"].clone();
+                        self.jobs.daemon_auth = resp["auth"].as_str().unwrap_or("").to_string();
                         self.jobs.note.clear();
+                        // The daemon (re)authenticated while this GUI ran —
+                        // e.g. a fresh install whose token was just fixed in
+                        // Settings — and this GUI has no API client yet (its
+                        // boot auth failed). Rebuild it so the Settings
+                        // lists work without an app restart.
+                        if self.jobs.daemon_auth == "ok" && self.client.is_none() {
+                            let path = self.config_path.clone();
+                            return Task::perform(
+                                async move {
+                                    let (cfg, _) = crate::load_config(Some(&path))?;
+                                    let token = cfg.token()?.to_string();
+                                    let mut c = crate::api::Client::new(&token)?;
+                                    if c.get_current_user().await?.is_none() {
+                                        anyhow::bail!("invalid token or authentication failed");
+                                    }
+                                    Ok::<_, anyhow::Error>(Arc::new(c))
+                                },
+                                |res| Message::ClientBooted(res.map_err(|e| e.to_string())),
+                            );
+                        }
+                        Task::none()
                     }
                     Ok(resp) => {
+                        self.jobs.daemon_auth.clear();
                         self.jobs.note = resp["error"]
                             .as_str()
                             .map(String::from)
                             .unwrap_or_else(|| "daemon not running".to_string());
+                        Task::none()
                     }
                     Err(e) => {
+                        self.jobs.daemon_auth.clear();
                         self.jobs.note = format!("daemon not running ({e})");
+                        Task::none()
                     }
                 }
+            }
+            Message::ReauthClicked => {
+                // Acks immediately; the daemon's auth loop wakes on its own
+                // and this panel follows the outcome via the 1 s jobs poll
+                // (the "auth" field flips to ok/retrying/failed).
+                Task::perform(
+                    crate::ipc::send_typed(serde_json::json!({ "cmd": "reauth" })),
+                    |res| Message::ReauthDone(res.map_err(|e| e.to_string())),
+                )
+            }
+            Message::ReauthDone(res) => {
+                self.settings.reauth_note = match res {
+                    Ok(resp) if resp["ok"] == true => {
+                        "re-auth started: the service is retrying with the saved config".to_string()
+                    }
+                    Ok(resp) => format!(
+                        "re-auth refused: {}",
+                        resp["error"].as_str().unwrap_or("unknown error")
+                    ),
+                    Err(e) => format!("re-auth failed: daemon unreachable ({e})"),
+                };
                 Task::none()
+            }
+            Message::ClientBooted(res) => {
+                match res {
+                    Ok(c) => {
+                        self.client = Some(c);
+                        Task::batch(self.client_fetch_tasks())
+                    }
+                    // The token on disk still does not authenticate (e.g.
+                    // pressed before Save): the daemon-side state stays
+                    // visible; nothing to rebuild.
+                    Err(e) => {
+                        self.settings.reauth_note = format!("panel client not rebuilt: {e}");
+                        Task::none()
+                    }
+                }
             }
             Message::LabelsFetched(labels) => {
                 self.jobs.labels = labels;
