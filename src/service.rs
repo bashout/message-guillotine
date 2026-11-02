@@ -117,6 +117,19 @@ async fn shutdown_signal() {
     }
 }
 
+/// Wake the daemon for a graceful shutdown (IPC `shutdown` command — the
+/// tray's "Stop service" item and Quit). Same cleanup path as SIGINT/
+/// SIGTERM: flush logs, remove the IPC port file, exit. The notify future
+/// is registered when `run`'s select starts — before the IPC listener can
+/// accept a connection — so a shutdown request is never missed.
+static SHUTDOWN_NOTIFY: std::sync::LazyLock<tokio::sync::Notify> =
+    std::sync::LazyLock::new(tokio::sync::Notify::new);
+
+/// Request a clean daemon shutdown (IPC `shutdown`, tray Stop service/Quit).
+pub fn request_shutdown() {
+    SHUTDOWN_NOTIFY.notify_waiters();
+}
+
 /// Run the daemon in the foreground, logging to the per-OS data dir.
 pub async fn run(config_arg: Option<&Path>) -> anyhow::Result<()> {
     let path = config_path(config_arg);
@@ -175,6 +188,10 @@ pub async fn run(config_arg: Option<&Path>) -> anyhow::Result<()> {
     let result = tokio::select! {
         r = scheduler::run_loop(&cfg, &path) => r,
         _ = shutdown_rx => Ok(()),
+        _ = SHUTDOWN_NOTIFY.notified() => {
+            tracing::info!("shutdown requested over ipc");
+            Ok(())
+        }
     };
     // The IPC port file must not outlive the daemon: a stale port could be
     // reused by an unrelated local process (clients verify the peer with the

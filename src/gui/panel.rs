@@ -86,6 +86,8 @@ pub(crate) enum Message {
     /// A GUI API client was (re)built after the daemon re-authenticated —
     /// refresh the Settings lists that need one.
     ClientBooted(Result<Arc<crate::api::Client>, String>),
+    /// Outcome of the tray's "Stop service" (a clean daemon shutdown).
+    ServiceStopDone(Result<serde_json::Value, String>),
     // -- jobs view --
     JobsFetched(Result<serde_json::Value, String>),
     LabelsFetched(HashMap<String, String>),
@@ -216,12 +218,36 @@ impl PanelApp {
                 });
                 Task::none()
             }
+            "stop-service" => {
+                // Clean shutdown of the daemon over its IPC; the tray stays
+                // up and the outcome is visible in the Jobs tab.
+                Task::perform(
+                    crate::ipc::send_typed(serde_json::json!({ "cmd": "shutdown" })),
+                    |res| Message::ServiceStopDone(res.map_err(|e| e.to_string())),
+                )
+            }
             "quit" => {
                 // Quit is the only way to shut the app down; the Iced daemon
-                // intentionally keeps running with zero windows. Stop any
-                // detached archive viewers this GUI spawned.
+                // intentionally keeps running with zero windows. Clean up
+                // everything this app represents: the archive viewers, then
+                // the service instance (clean daemon shutdown over IPC), then
+                // exit. Closing the panel window (X) only hides it.
                 super::shutdown_viewers();
-                std::process::exit(0);
+                let rt = self.rt.clone();
+                rt.spawn(async move {
+                    // Only when a daemon is actually listening: no IPC wait
+                    // otherwise. The probe blocks briefly, so keep it off the
+                    // async worker threads.
+                    let alive = tokio::task::spawn_blocking(crate::ipc::daemon_alive)
+                        .await
+                        .unwrap_or(false);
+                    if alive {
+                        let _ =
+                            crate::ipc::send_typed(serde_json::json!({ "cmd": "shutdown" })).await;
+                    }
+                    std::process::exit(0);
+                });
+                Task::none()
             }
             other => {
                 if let Some(archive_path) = other.strip_prefix("view:") {
@@ -633,6 +659,21 @@ impl PanelApp {
                         Task::none()
                     }
                 }
+            }
+            Message::ServiceStopDone(res) => {
+                self.jobs.note = match res {
+                    Ok(resp) if resp["ok"] == true => {
+                        "service stopped (clean shutdown; start it again by \
+                         launching guillotine)"
+                            .to_string()
+                    }
+                    Ok(resp) => format!(
+                        "stop refused: {}",
+                        resp["error"].as_str().unwrap_or("unknown error")
+                    ),
+                    Err(e) => format!("stop failed: daemon unreachable ({e})"),
+                };
+                Task::none()
             }
             Message::LabelsFetched(labels) => {
                 self.jobs.labels = labels;

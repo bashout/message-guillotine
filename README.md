@@ -88,12 +88,15 @@ cargo build --release            # add --no-default-features on headless Linux
 
 On Windows and macOS the autostart entries register the same default launch,
 so login starts the daemon and the tray together (the Linux systemd unit
-stays headless: `service run`). The daemon spawned by a default launch is
-detached and keeps running after the tray quits, like any service. With no
-working token yet the service still comes up (run-now works as soon as a
-token is configured): it tries authentication three times per token value
-and then idles, checking the config for a token update every few seconds
-until a new value appears — then it tries three times again, and so on.
+stays headless: `service run`). The daemon runs detached in its own process,
+but exiting the tray app cleans up the service instance: Quit (and the
+tray's "Stop service" item) request a clean shutdown over IPC — logs
+flushed, IPC port file removed. Closing the panel window (X) only hides it.
+With no working token yet the service still comes up (run-now works as soon
+as a token is configured): it tries authentication three times per token
+value and then idles, checking the config for a token update every few
+seconds until a new value appears — then it tries three times again, and so
+on.
 
 ## Configuration
 

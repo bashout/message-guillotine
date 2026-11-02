@@ -432,6 +432,12 @@ fn build_menu(
         true,
         None::<Accelerator>,
     ))?;
+    menu.append(&MenuItem::with_id(
+        "stop-service",
+        "Stop service",
+        true,
+        None::<Accelerator>,
+    ))?;
     let archives = crate::archive_format::list_archives(archive_dir);
     if !archives.is_empty() {
         let view_sub = Submenu::with_id("view-archive", "View archive ▸", true);

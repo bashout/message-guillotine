@@ -263,6 +263,14 @@ async fn handle(
             scheduler::request_reauth();
             json!({ "ok": true, "accepted": true })
         }
+        Some("shutdown") => {
+            // Clean daemon shutdown: same path as SIGINT/SIGTERM (flush
+            // logs, remove the port file). Acks immediately; the daemon
+            // exits right after. Used by the tray's Stop service item and
+            // Quit, so closing the app cleans up the service instance.
+            crate::service::request_shutdown();
+            json!({ "ok": true, "accepted": true })
+        }
         Some("archive") => {
             let channel = req
                 .get("channel")
@@ -571,6 +579,19 @@ mod tests {
         let port = spawn_ipc("test-secret", ipc_cfg()).await;
         let resp: Value = serde_json::from_str(
             &ipc_send(port, r#"{"cmd":"reauth","secret":"test-secret"}"#).await,
+        )
+        .unwrap();
+        assert_eq!(resp, json!({"ok": true, "accepted": true}));
+    }
+
+    #[tokio::test]
+    async fn ipc_shutdown_acks_immediately() {
+        // Acks without exiting anything: the test's spawn_ipc listener is
+        // not the real daemon, and request_shutdown is fire-and-forget —
+        // only a daemon running service::run acts on it.
+        let port = spawn_ipc("test-secret", ipc_cfg()).await;
+        let resp: Value = serde_json::from_str(
+            &ipc_send(port, r#"{"cmd":"shutdown","secret":"test-secret"}"#).await,
         )
         .unwrap();
         assert_eq!(resp, json!({"ok": true, "accepted": true}));
