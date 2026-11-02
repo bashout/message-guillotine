@@ -334,25 +334,35 @@ pub async fn run_now(config_arg: Option<&PathBuf>, chat: &str) -> anyhow::Result
     // When the service daemon is running, go through it: the single-deletion
     // lock only holds within one process, and the daemon is the one that
     // owns scheduled runs.
-    if let Ok(resp) = crate::ipc::send(serde_json::json!({ "cmd": "run_now", "chat": chat })).await
-    {
-        if resp.get("ok").and_then(|v| v.as_bool()) == Some(true) {
-            // The daemon acks run-now immediately and runs it in the
-            // background, so there is no summary in the ack.
-            if resp.get("accepted").and_then(|v| v.as_bool()) == Some(true) {
-                println!(
-                    "run-now {chat}: accepted by the daemon; running in the background \
-                     (see the Jobs tab or the service log for the result)"
+    match crate::ipc::send_typed(serde_json::json!({ "cmd": "run_now", "chat": chat })).await {
+        Ok(resp) => {
+            if resp.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+                // The daemon acks run-now immediately and runs it in the
+                // background, so there is no summary in the ack.
+                if resp.get("accepted").and_then(|v| v.as_bool()) == Some(true) {
+                    println!(
+                        "run-now {chat}: accepted by the daemon; running in the background \
+                         (see the Jobs tab or the service log for the result)"
+                    );
+                }
+                return Ok(());
+            } else {
+                anyhow::bail!(
+                    "daemon refused run-now: {}",
+                    resp.get("error")
+                        .map_or("unknown", |e| e.as_str().unwrap_or("unknown"))
                 );
             }
-            return Ok(());
-        } else {
-            anyhow::bail!(
-                "daemon refused run-now: {}",
-                resp.get("error")
-                    .map_or("unknown", |e| e.as_str().unwrap_or("unknown"))
-            );
         }
+        // Only a genuinely absent daemon (no port/secret files, connection
+        // refused) justifies running in this process. A timeout or malformed
+        // reply means a daemon may be alive but wedged — running unlocked
+        // then would break the cross-process single-deletion guarantee.
+        Err(crate::ipc::SendError::Absent(_)) => {}
+        Err(e) => anyhow::bail!(
+            "the service daemon is running but did not answer run-now ({e:#}); \
+             refusing to run unlocked — the single-deletion lock only holds inside the daemon"
+        ),
     }
     let (cfg, _path) = crate::load_config(config_arg)?;
     let client = crate::api::authed_client(&cfg).await?;
@@ -465,7 +475,7 @@ pub async fn run_loop(cfg: &Config, config_path: &std::path::Path) -> anyhow::Re
         match run_chat_job(&client, cfg, &job, &registry).await {
             Ok(summary) => {
                 tracing::info!(chat = %job.key, deleted = summary.deleted, complete = summary.complete, "job done");
-                crate::ipc::record_last_run(&job.key.to_string(), &summary);
+                crate::ipc::record_last_run(&job.key.to_string(), &summary).await;
             }
             Err(e) => tracing::error!(chat = %job.key, error = %e, "job failed"),
         }
@@ -597,13 +607,18 @@ mod tests {
         assert_eq!((next.year(), next.month(), next.day()), (2025, 1, 1));
     }
 
+    // unix-only: switching the local timezone via the TZ env var is a unix
+    // mechanism — on Windows the OS timezone comes from the registry and TZ
+    // is ignored, so the nonexistent-time premise does not hold there.
+    #[cfg(unix)]
     #[test]
     fn next_fire_daily_dst_gap_falls_back() {
         // In America/New_York, 2024-03-10 02:30 does not exist (spring forward
         // 02:00 -> 03:00). The nonexistent candidate must not be returned;
         // the run fires the next day instead.
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::testutil::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("TZ", "America/New_York");
         let s = crate::config::Schedule {
             kind: ScheduleKind::Daily,

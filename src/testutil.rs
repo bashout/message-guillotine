@@ -7,6 +7,12 @@ use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
+/// One lock for every test that mutates process-global env vars (TZ,
+/// GUILLOTINE_TOKEN, DM_ARCHIVE_DIR, …): tests run as threads inside one
+/// binary, so an env flip in one test must never race another test's
+/// env-dependent assertions.
+pub static ENV_LOCK: Mutex<()> = Mutex::new(());
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 

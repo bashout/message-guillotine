@@ -64,20 +64,26 @@ pub fn load_session(channel_id: &str, root: Option<&Path>) -> Option<Session> {
 /// Persist run state atomically (temp file + rename). Resume is a
 /// convenience: if the write fails the deletes already stand, the run just
 /// rescans further next time.
-pub fn save_session(channel_id: &str, state: &Session, root: Option<&Path>) {
+pub async fn save_session(channel_id: &str, state: &Session, root: Option<&Path>) {
     let path = session_path(channel_id, root);
-    if let Some(parent) = path.parent() {
-        let _ = config::ensure_data_dir();
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let tmp = path.with_extension("json.part");
-    if config::write_file_private(&tmp, &(serde_json::to_string(state).unwrap() + "\n")).is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
-    }
+    let line = serde_json::to_string(state).unwrap() + "\n";
+    // std::fs (with the unix mode bits) runs on the blocking pool so the
+    // async deletion loop is never stalled by a session write.
+    let _ = tokio::task::spawn_blocking(move || {
+        if let Some(parent) = path.parent() {
+            let _ = config::ensure_data_dir();
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let tmp = path.with_extension("json.part");
+        if config::write_file_private(&tmp, &line).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    })
+    .await;
 }
 
-pub fn clear_session(channel_id: &str, root: Option<&Path>) {
-    let _ = std::fs::remove_file(session_path(channel_id, root));
+pub async fn clear_session(channel_id: &str, root: Option<&Path>) {
+    let _ = tokio::fs::remove_file(session_path(channel_id, root)).await;
 }
 
 #[derive(Debug, Clone)]
@@ -175,7 +181,7 @@ fn cutoff_check(epoch: &anyhow::Result<f64>, cutoff: Option<f64>) -> CutoffCheck
 /// Persist or drop the session file at the end of a run. A dry run never
 /// writes and never clears; an aborted run saves (resume); a complete run
 /// clears.
-fn persist_session(
+async fn persist_session(
     channel_id: &str,
     state: &Session,
     aborted: bool,
@@ -183,17 +189,17 @@ fn persist_session(
     root: Option<&Path>,
 ) {
     if aborted && !dry_run {
-        save_session(channel_id, state, root);
+        save_session(channel_id, state, root).await;
     } else if !aborted && !dry_run {
-        clear_session(channel_id, root);
+        clear_session(channel_id, root).await;
     }
 }
 
 /// Periodically persist the session mid-run (every 25 scanned messages) so
 /// a killed run can resume; never during a dry run.
-fn maybe_save_session(channel_id: &str, state: &Session, dry_run: bool, root: Option<&Path>) {
+async fn maybe_save_session(channel_id: &str, state: &Session, dry_run: bool, root: Option<&Path>) {
     if !dry_run && state.scanned.is_multiple_of(25) {
-        save_session(channel_id, state, root);
+        save_session(channel_id, state, root).await;
     }
 }
 
@@ -240,7 +246,11 @@ pub async fn run_deletion(client: &Client, channel_id: &str, opts: DeletionOptio
     let me_id = client.current_user.as_ref().map(|u| u.id.clone());
     let mut samples = Vec::new();
     let mut aborted: Option<String> = None;
-    let mut pending_pace = Duration::ZERO;
+    // Start paced: the sleep after each delete uses the *previous* wait, so a
+    // zero start would fire the first two deletes back-to-back. With the pace
+    // pre-loaded, every delete (including the first) is followed by at least
+    // RATE_LIMIT_DELAY before the next one fires.
+    let mut pending_pace = api::RATE_LIMIT_DELAY;
     let start_clock = std::time::Instant::now();
 
     let result = async {
@@ -278,12 +288,12 @@ pub async fn run_deletion(client: &Client, channel_id: &str, opts: DeletionOptio
                 update_registry(registry, label, &state);
 
                 if Some(&msg.author.id) != me_id.as_ref() {
-                    maybe_save_session(&channel_id, &state, dry_run, root);
+                    maybe_save_session(&channel_id, &state, dry_run, root).await;
                     continue;
                 }
                 if msg.is_system() {
                     state.skipped += 1;
-                    maybe_save_session(&channel_id, &state, dry_run, root);
+                    maybe_save_session(&channel_id, &state, dry_run, root).await;
                     continue;
                 }
                 if dry_run {
@@ -318,7 +328,7 @@ pub async fn run_deletion(client: &Client, channel_id: &str, opts: DeletionOptio
                         return Ok(());
                     }
                 }
-                maybe_save_session(&channel_id, &state, dry_run, root);
+                maybe_save_session(&channel_id, &state, dry_run, root).await;
             }
             cursor = page.last().map(|m| m.id.clone());
             if page.len() < 100 {
@@ -333,7 +343,7 @@ pub async fn run_deletion(client: &Client, channel_id: &str, opts: DeletionOptio
         aborted = Some(e);
     }
 
-    persist_session(&channel_id, &state, aborted.is_some(), dry_run, root);
+    persist_session(&channel_id, &state, aborted.is_some(), dry_run, root).await;
 
     let elapsed = start_clock.elapsed();
     tracing::info!(
@@ -439,11 +449,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn session_save_load_clear_roundtrip() {
+    #[tokio::test]
+    async fn session_save_load_clear_roundtrip() {
         let root = temp_root("roundtrip");
         let s = session("123", 10, 4, 1, 2, Some("999"), false);
-        save_session("123", &s, Some(&root));
+        save_session("123", &s, Some(&root)).await;
         let loaded = load_session("123", Some(&root)).expect("session loads");
         assert_eq!(loaded.channel_id, "123");
         assert_eq!(loaded.scanned, 10);
@@ -456,7 +466,7 @@ mod tests {
         assert!(!session_path("123", Some(&root))
             .with_extension("json.part")
             .exists());
-        clear_session("123", Some(&root));
+        clear_session("123", Some(&root)).await;
         assert!(load_session("123", Some(&root)).is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -472,11 +482,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    #[test]
-    fn complete_session_is_absent() {
+    #[tokio::test]
+    async fn complete_session_is_absent() {
         let root = temp_root("complete");
         let s = session("7", 5, 5, 0, 0, None, true);
-        save_session("7", &s, Some(&root));
+        save_session("7", &s, Some(&root)).await;
         assert!(load_session("7", Some(&root)).is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -532,26 +542,26 @@ mod tests {
         assert_eq!(cutoff_check(&undatable, None), CutoffCheck::InRange);
     }
 
-    #[test]
-    fn dry_run_never_writes_or_clears_session() {
+    #[tokio::test]
+    async fn dry_run_never_writes_or_clears_session() {
         let root = temp_root("dryrun");
         let s = session("5", 3, 2, 0, 1, Some("111"), false);
         // dry run, aborted: no save, no clear
-        persist_session("5", &s, true, true, Some(&root));
+        persist_session("5", &s, true, true, Some(&root)).await;
         assert!(!session_path("5", Some(&root)).exists());
         // dry run, complete: still no clear of a pre-existing file
-        save_session("5", &s, Some(&root));
-        persist_session("5", &s, false, true, Some(&root));
+        save_session("5", &s, Some(&root)).await;
+        persist_session("5", &s, false, true, Some(&root)).await;
         assert!(
             session_path("5", Some(&root)).exists(),
             "dry run must not clear"
         );
         // real run, complete: clears
-        persist_session("5", &s, false, false, Some(&root));
+        persist_session("5", &s, false, false, Some(&root)).await;
         assert!(!session_path("5", Some(&root)).exists());
         // real run, aborted: saves with counters intact
         let s2 = session("6", 8, 5, 1, 2, Some("222"), false);
-        persist_session("6", &s2, true, false, Some(&root));
+        persist_session("6", &s2, true, false, Some(&root)).await;
         let loaded = load_session("6", Some(&root)).unwrap();
         assert_eq!(
             (

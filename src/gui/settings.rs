@@ -7,7 +7,7 @@ use std::sync::Arc;
 use iced::widget::{
     button, checkbox, column, combo_box, container, row, scrollable, text, text_input, Space,
 };
-use iced::{Color, Element, Font, Length};
+use iced::{Element, Font, Length};
 
 use crate::config::{self, Config};
 
@@ -20,6 +20,8 @@ pub(crate) struct DmRow {
     pub(crate) enabled: bool,
     pub(crate) schedule: String,
     pub(crate) schedule_options: combo_box::State<String>,
+    /// Local fire time as "HH:MM" (24h); combined with `schedule` on save.
+    pub(crate) time: String,
     pub(crate) retention: String,
     pub(crate) archive: bool,
 }
@@ -28,6 +30,7 @@ pub(crate) struct ManualChat {
     pub(crate) key: String,
     pub(crate) schedule: String,
     pub(crate) schedule_options: combo_box::State<String>,
+    pub(crate) time: String,
     pub(crate) retention: String,
     pub(crate) archive: bool,
 }
@@ -41,6 +44,7 @@ pub(crate) struct SettingsState {
     pub(crate) dm_users: String,
     pub(crate) default_schedule: String,
     pub(crate) default_schedule_options: combo_box::State<String>,
+    pub(crate) default_time: String,
     pub(crate) default_retention: String,
     pub(crate) default_archive: bool,
     pub(crate) dm_rows: Vec<DmRow>,
@@ -57,8 +61,33 @@ pub(crate) struct SettingsState {
     pub(crate) selected_channel: String,
     pub(crate) archives: Vec<(String, PathBuf)>,
     pub(crate) manual_chats: Vec<ManualChat>,
-    pub(crate) armed_delete_all: Option<String>,
     pub(crate) status: String,
+    /// Result of the last run-now/delete-now request, shown in the UI so a
+    /// refused or unacknowledged request is visible (it is otherwise only
+    /// logged).
+    pub(crate) run_note: String,
+}
+
+/// Split a config schedule into its combobox kind ("daily"/"weekly"/
+/// "monthly") and the "HH:MM" time for the time input.
+fn split_schedule(s: &crate::config::Schedule) -> (String, String) {
+    use crate::config::ScheduleKind;
+    let kind = match s.kind {
+        ScheduleKind::Daily => "daily",
+        ScheduleKind::Weekly => "weekly",
+        ScheduleKind::Monthly => "monthly",
+    };
+    (kind.to_string(), s.at.format("%H:%M").to_string())
+}
+
+/// Compose the config schedule string ("daily at 04:00") from the combobox
+/// kind and the time input, validating the time as 24h HH:MM.
+fn schedule_string(kind: &str, time: &str) -> Result<String, String> {
+    let t = time.trim();
+    if chrono::NaiveTime::parse_from_str(t, "%H:%M").is_err() {
+        return Err(format!("invalid time {t:?} (use HH:MM, 24h)"));
+    }
+    Ok(format!("{kind} at {t}"))
 }
 
 impl SettingsState {
@@ -91,21 +120,24 @@ impl SettingsState {
         let mut dm_rows: Vec<DmRow> = Vec::new();
         let mut manual_chats: Vec<ManualChat> = Vec::new();
         for (k, c) in chat {
+            let (schedule, time) = split_schedule(&c.schedule);
             if let Some(user) = k.strip_prefix("dm:") {
                 dm_rows.push(DmRow {
                     user_id: user.to_string(),
                     name: user.to_string(),
                     enabled: true,
-                    schedule: c.schedule.to_string(),
+                    schedule,
                     schedule_options: schedule_state(),
+                    time,
                     retention: c.retention_days.to_string(),
                     archive: c.archive_before_delete,
                 });
             } else {
                 manual_chats.push(ManualChat {
                     key: k,
-                    schedule: c.schedule.to_string(),
+                    schedule,
                     schedule_options: schedule_state(),
+                    time,
                     retention: c.retention_days.to_string(),
                     archive: c.archive_before_delete,
                 });
@@ -122,8 +154,9 @@ impl SettingsState {
                 "exclude".to_string(),
             ]),
             dm_users: dm.users.join(", "),
-            default_schedule: dm.default_schedule.to_string(),
+            default_schedule: split_schedule(&dm.default_schedule).0,
             default_schedule_options: schedule_state(),
+            default_time: split_schedule(&dm.default_schedule).1,
             default_retention: dm.default_retention_days.to_string(),
             default_archive: dm.default_archive_before_delete,
             dm_rows,
@@ -139,8 +172,8 @@ impl SettingsState {
             selected_channel: String::new(),
             archives,
             manual_chats,
-            armed_delete_all: None,
             status: String::new(),
+            run_note: String::new(),
         }
     }
 }
@@ -240,6 +273,10 @@ impl PanelApp {
                     Some(&s.default_schedule),
                     Message::DefaultScheduleSelected,
                 ),
+                text("at"),
+                text_input("HH:MM", &s.default_time)
+                    .on_input(Message::DefaultTimeChanged)
+                    .width(Length::Fixed(55.0)),
                 text("retain days:").width(Length::Fixed(80.0)),
                 text_input("days", &s.default_retention)
                     .on_input(Message::DefaultRetentionChanged)
@@ -345,6 +382,14 @@ impl PanelApp {
         if !s.status.is_empty() {
             save_row = save_row.push(text(s.status.clone()).color(status_color));
         }
+        if !s.run_note.is_empty() {
+            let run_ok = s.run_note.starts_with("accepted");
+            save_row = save_row.push(text(s.run_note.clone()).color(if run_ok {
+                ok_color()
+            } else {
+                err_color()
+            }));
+        }
         col = col.push(save_row);
 
         col.into()
@@ -375,6 +420,10 @@ impl PanelApp {
                         Some(&r.schedule),
                         move |v| { Message::DmRowSchedule(i, v) }
                     ),
+                    text("at"),
+                    text_input("HH:MM", &r.time)
+                        .on_input(move |v| Message::DmRowTime(i, v))
+                        .width(Length::Fixed(55.0)),
                     text("retain days:"),
                     text_input("days", &r.retention)
                         .on_input(move |v| Message::DmRowRetention(i, v))
@@ -382,7 +431,7 @@ impl PanelApp {
                     checkbox(r.archive)
                         .label("archive before delete")
                         .on_toggle(move |v| Message::DmRowArchive(i, v)),
-                    self.delete_all_button(&chat),
+                    self.delete_now_button(&chat),
                 ]
                 .spacing(8)
                 .align_y(iced::Alignment::Center),
@@ -410,13 +459,17 @@ impl PanelApp {
                 Some(&r.schedule),
                 move |v| { Message::ManualSchedule(i, v) }
             ),
+            text("at"),
+            text_input("HH:MM", &r.time)
+                .on_input(move |v| Message::ManualTime(i, v))
+                .width(Length::Fixed(55.0)),
             text_input("days", &r.retention)
                 .on_input(move |v| Message::ManualRetention(i, v))
                 .width(Length::Fixed(60.0)),
             checkbox(r.archive)
                 .label("archive")
                 .on_toggle(move |v| Message::ManualArchive(i, v)),
-            self.delete_all_button(&r.key),
+            self.delete_now_button(&r.key),
             button(text("remove")).on_press(Message::RemoveManualChat(i)),
         ]
         .spacing(8)
@@ -424,58 +477,113 @@ impl PanelApp {
         .into()
     }
 
-    /// Two-click armed "Delete ALL now" button.
-    pub(crate) fn delete_all_button(&self, chat: &str) -> Element<'_, Message> {
-        let armed = self.settings.armed_delete_all.as_deref() == Some(chat);
-        let label = if armed {
-            "Confirm: delete ALL messages?"
-        } else {
-            "Delete all now"
-        };
-        let b = button(text(label).color(Color::WHITE))
-            .on_press(Message::DeleteAllClicked(chat.to_string()));
-        if armed {
-            b.style(button::danger).into()
-        } else {
-            b.into()
-        }
+    /// "Delete now" button: runs the chat's job immediately through the
+    /// daemon, honoring the configured retention (unlike a retention-0
+    /// delete-all, nothing inside the retention window is touched).
+    pub(crate) fn delete_now_button(&self, chat: &str) -> Element<'_, Message> {
+        button(text("Delete now"))
+            .on_press(Message::RunNowClicked(chat.to_string()))
+            .into()
     }
 }
 
 /// Returns the status line to show in the UI.
 pub(crate) fn save_config(path: &Path, s: &SettingsState) -> String {
-    // Validate schedules/retentions first so a bad row doesn't corrupt the file.
+    // Validate schedules/times/retentions first so a bad row doesn't corrupt
+    // the file.
+    if let Err(msg) = schedule_string(&s.default_schedule, &s.default_time) {
+        return msg;
+    }
+    if let Err(msg) = validate_retention(&s.default_retention) {
+        return msg;
+    }
+    // Chat keys and user ids go into the config verbatim and later into file
+    // names and API URLs, so they must satisfy the same rules Config::load
+    // enforces — a bad row would make the whole file unloadable.
     for row in s.dm_rows.iter().filter(|r| r.enabled) {
-        if let Err(msg) = validate_row(&row.schedule, &row.retention) {
+        if !config::valid_id(&row.user_id) {
+            return format!("invalid dm user id {:?} (must be numeric)", row.user_id);
+        }
+    }
+    for row in &s.manual_chats {
+        if let Err(e) = config::ChatKey::parse(&row.key) {
+            return format!("invalid chat key {:?}: {e}", row.key);
+        }
+    }
+    for row in s.dm_rows.iter().filter(|r| r.enabled) {
+        if let Err(msg) = validate_row(&row.schedule, &row.time, &row.retention) {
             return msg;
         }
     }
     for row in &s.manual_chats {
-        if let Err(msg) = validate_row(&row.schedule, &row.retention) {
+        if let Err(msg) = validate_row(&row.schedule, &row.time, &row.retention) {
             return msg;
         }
     }
+    // An enabled DM row whose user is out of scope under the dm policy would
+    // be refused by every run ("dm user not in scope"): reject the save.
+    let listed: Vec<&str> = s
+        .dm_users
+        .split(',')
+        .map(str::trim)
+        .filter(|x| !x.is_empty())
+        .collect();
+    for row in s.dm_rows.iter().filter(|r| r.enabled) {
+        let in_scope = match s.dm_policy.as_str() {
+            "nominate" => listed.iter().any(|u| *u == row.user_id),
+            _ => !listed.iter().any(|u| *u == row.user_id),
+        };
+        if !in_scope {
+            return format!(
+                "dm user {} ({}) is not in scope under the {:?} policy — fix the dm user ids above",
+                row.user_id, row.name, s.dm_policy
+            );
+        }
+    }
 
-    let mut doc = toml::Table::new();
+    // Round-trip the existing file through a TOML value so keys the GUI does
+    // not manage survive the save. An existing file that does not parse is
+    // refused, not clobbered.
+    let mut doc: toml::Table = match std::fs::read_to_string(path) {
+        Ok(raw) if raw.trim().is_empty() => toml::Table::new(),
+        Ok(raw) => match raw.parse::<toml::Value>() {
+            Ok(toml::Value::Table(t)) => t,
+            Ok(_) => return "Save failed: existing config is not a TOML table".to_string(),
+            Err(e) => {
+                return format!(
+                    "Save failed: existing config does not parse ({e}); fix it by hand first"
+                )
+            }
+        },
+        Err(_) => toml::Table::new(), // no config file yet
+    };
     if s.token.is_empty() {
         doc.remove("token"); // let GUILLOTINE_TOKEN supply it
     } else {
         doc.insert("token".into(), toml::Value::String(s.token.clone()));
     }
-    // round-trip the viewer path so saving from the GUI doesn't drop it
-    if let Some(v) = &s.archive_viewer {
-        doc.insert(
-            "archive_viewer".into(),
-            toml::Value::String(v.display().to_string()),
-        );
+    match &s.archive_viewer {
+        Some(v) => {
+            doc.insert(
+                "archive_viewer".into(),
+                toml::Value::String(v.display().to_string()),
+            );
+        }
+        None => {
+            doc.remove("archive_viewer");
+        }
     }
-    if !s.archive_dir.is_empty() {
+    if s.archive_dir.is_empty() {
+        doc.remove("archive_dir");
+    } else {
         doc.insert(
             "archive_dir".into(),
             toml::Value::String(s.archive_dir.clone()),
         );
     }
-    let mut dm = toml::Table::new();
+    let Some(dm) = ensure_table(&mut doc, "dm") else {
+        return "Save failed: [dm] is not a table in the existing config".to_string();
+    };
     dm.insert("policy".into(), toml::Value::String(s.dm_policy.clone()));
     let users: Vec<toml::Value> = s
         .dm_users
@@ -485,9 +593,14 @@ pub(crate) fn save_config(path: &Path, s: &SettingsState) -> String {
         .map(|x| toml::Value::String(x.to_string()))
         .collect();
     dm.insert("users".into(), toml::Value::Array(users));
+    // Schedule is stored as separate frequency + time fields (validated above).
     dm.insert(
-        "default_schedule".into(),
+        "default_frequency".into(),
         toml::Value::String(s.default_schedule.clone()),
+    );
+    dm.insert(
+        "default_time".into(),
+        toml::Value::String(s.default_time.trim().to_string()),
     );
     if let Ok(n) = s.default_retention.parse::<u32>() {
         dm.insert(
@@ -499,36 +612,52 @@ pub(crate) fn save_config(path: &Path, s: &SettingsState) -> String {
         "default_archive_before_delete".into(),
         toml::Value::Boolean(s.default_archive),
     );
-    doc.insert("dm".into(), toml::Value::Table(dm));
 
+    // The chat table is rebuilt from the rows (the GUI enumerates every chat
+    // entry), but each entry starts from its existing sub-table so keys the
+    // GUI does not manage inside a [chat.*] entry survive.
     let mut chats = toml::Table::new();
-    for row in s.dm_rows.iter().filter(|r| r.enabled) {
-        let mut t = toml::Table::new();
-        t.insert("schedule".into(), toml::Value::String(row.schedule.clone()));
-        if let Ok(n) = row.retention.parse::<u32>() {
+    let mut chat_row = |key: String, schedule: &str, time: &str, retention: &str, archive: bool| {
+        let mut t = existing_chat_table(&doc, &key);
+        t.insert(
+            "frequency".into(),
+            toml::Value::String(schedule.to_string()),
+        );
+        t.insert("time".into(), toml::Value::String(time.trim().to_string()));
+        if let Ok(n) = retention.trim().parse::<u32>() {
             t.insert("retention_days".into(), toml::Value::Integer(n as i64));
         }
         t.insert(
             "archive_before_delete".into(),
-            toml::Value::Boolean(row.archive),
+            toml::Value::Boolean(archive),
         );
-        chats.insert(format!("dm:{}", row.user_id), toml::Value::Table(t));
+        chats.insert(key, toml::Value::Table(t));
+    };
+    for row in s.dm_rows.iter().filter(|r| r.enabled) {
+        chat_row(
+            format!("dm:{}", row.user_id),
+            &row.schedule,
+            &row.time,
+            &row.retention,
+            row.archive,
+        );
     }
     for row in &s.manual_chats {
-        let mut t = toml::Table::new();
-        t.insert("schedule".into(), toml::Value::String(row.schedule.clone()));
-        if let Ok(n) = row.retention.parse::<u32>() {
-            t.insert("retention_days".into(), toml::Value::Integer(n as i64));
-        }
-        t.insert(
-            "archive_before_delete".into(),
-            toml::Value::Boolean(row.archive),
+        chat_row(
+            row.key.clone(),
+            &row.schedule,
+            &row.time,
+            &row.retention,
+            row.archive,
         );
-        chats.insert(row.key.clone(), toml::Value::Table(t));
     }
     doc.insert("chat".into(), toml::Value::Table(chats));
 
-    let rendered = toml::to_string_pretty(&doc).unwrap_or_default();
+    // Never write an empty file on a serialization failure.
+    let rendered = match toml::to_string_pretty(&doc) {
+        Ok(r) => r,
+        Err(e) => return format!("Save failed: could not serialize config: {e}"),
+    };
     // Atomic private write: temp file created 0600 + rename, so a crash
     // mid-save can't corrupt the only config file and the token is never
     // world-readable, even briefly.
@@ -610,15 +739,161 @@ pub(crate) async fn fetch_guild_channels_owned(
         None => Vec::new(),
     }
 }
-fn validate_row(schedule: &str, retention: &str) -> Result<(), String> {
+fn validate_row(schedule: &str, time: &str, retention: &str) -> Result<(), String> {
     use std::str::FromStr;
     if crate::config::Schedule::from_str(schedule).is_err() {
         Err(format!(
             "invalid schedule {schedule:?} (use daily/weekly/monthly)"
         ))
-    } else if retention.parse::<u32>().is_err() {
-        Err(format!("invalid retention {retention:?} (days)"))
+    } else if let Err(msg) = schedule_string(schedule, time) {
+        Err(msg)
     } else {
-        Ok(())
+        validate_retention(retention)
+    }
+}
+
+/// Retention must be a whole number of days within the same clamp the config
+/// loader enforces (max 36500 = 100 years), so a GUI save can never produce a
+/// file `Config::load` rejects.
+fn validate_retention(retention: &str) -> Result<(), String> {
+    match retention.trim().parse::<u32>() {
+        Ok(n) if n <= 36_500 => Ok(()),
+        Ok(n) => Err(format!(
+            "retention {n} days exceeds the max 36500 (100 years)"
+        )),
+        Err(_) => Err(format!("invalid retention {retention:?} (days)")),
+    }
+}
+
+/// The `[key]` sub-table of `doc`, created empty when missing or not a table.
+fn ensure_table<'a>(doc: &'a mut toml::Table, key: &str) -> Option<&'a mut toml::Table> {
+    doc.entry(key.to_string())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+        .as_table_mut()
+}
+
+/// The existing `[chat."<key>"]` sub-table, so a save keeps per-entry keys
+/// the GUI does not manage.
+fn existing_chat_table(doc: &toml::Table, key: &str) -> toml::Table {
+    doc.get("chat")
+        .and_then(|c| c.as_table())
+        .and_then(|c| c.get(key))
+        .and_then(|c| c.as_table())
+        .cloned()
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state(token: &str) -> SettingsState {
+        SettingsState {
+            token: token.to_string(),
+            archive_dir: String::new(),
+            archive_viewer: None,
+            dm_policy: "exclude".to_string(),
+            dm_policy_options: combo_box::State::new(vec!["nominate".into(), "exclude".into()]),
+            dm_users: String::new(),
+            default_schedule: "weekly".to_string(),
+            default_schedule_options: schedule_state(),
+            default_time: "04:00".to_string(),
+            default_retention: "30".to_string(),
+            default_archive: true,
+            dm_rows: Vec::new(),
+            dm_pending: false,
+            guilds: Vec::new(),
+            guild_options: combo_box::State::new(Vec::new()),
+            guild_pending: false,
+            selected_guild: String::new(),
+            channels: Vec::new(),
+            channel_options: combo_box::State::new(Vec::new()),
+            channels_for: String::new(),
+            channels_pending: false,
+            selected_channel: String::new(),
+            archives: Vec::new(),
+            manual_chats: vec![ManualChat {
+                key: "guild:1/channel:2".to_string(),
+                schedule: "daily".to_string(),
+                schedule_options: schedule_state(),
+                time: "03:00".to_string(),
+                retention: "7".to_string(),
+                archive: false,
+            }],
+            status: String::new(),
+            run_note: String::new(),
+        }
+    }
+
+    fn temp_config_path(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "guillotine-settings-test-{}-{tag}.toml",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    #[test]
+    fn save_config_preserves_unknown_keys_and_refuses_bad_saves() {
+        // One shared lock for env mutation, same as the config tests.
+        let _g = crate::testutil::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(config::ENV_TOKEN);
+        std::env::remove_var(config::ENV_ARCHIVE_DIR);
+
+        let path = temp_config_path("preserve");
+        std::fs::write(
+            &path,
+            "token = \"old\"\ncustom_key = \"keep me\"\n[dm]\npolicy = \"exclude\"\ncustom_dm_key = 1\n",
+        )
+        .unwrap();
+        let s = state("new-token");
+        let status = save_config(&path, &s);
+        assert!(status.starts_with("Saved"), "{status}");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.contains("custom_key"),
+            "unknown top-level key dropped: {raw}"
+        );
+        assert!(
+            raw.contains("custom_dm_key"),
+            "unknown [dm] key dropped: {raw}"
+        );
+        // The saved file must load as a valid Config.
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.token().unwrap(), "new-token");
+        assert!(cfg.chat.contains_key("guild:1/channel:2"));
+
+        // A bad manual key refuses the save and leaves the file untouched.
+        let before = std::fs::read_to_string(&path).unwrap();
+        let mut s2 = state("t");
+        s2.manual_chats[0].key = "../etc".to_string();
+        let status = save_config(&path, &s2);
+        assert!(!status.starts_with("Saved"), "{status}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        // Retention over the loader's clamp is refused too.
+        let mut s3 = state("t");
+        s3.manual_chats[0].retention = "99999".to_string();
+        let status = save_config(&path, &s3);
+        assert!(status.contains("36500"), "{status}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        // An existing but unparseable config is refused, not clobbered.
+        std::fs::write(&path, "not [valid toml").unwrap();
+        let status = save_config(&path, &state("t"));
+        assert!(status.starts_with("Save failed"), "{status}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not [valid toml");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn validate_retention_clamps_like_the_loader() {
+        assert!(validate_retention("0").is_ok());
+        assert!(validate_retention("36500").is_ok());
+        assert!(validate_retention("36501").is_err());
+        assert!(validate_retention("abc").is_err());
     }
 }

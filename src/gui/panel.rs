@@ -50,6 +50,7 @@ pub(crate) enum Message {
     DmPolicySelected(String),
     DmUsersChanged(String),
     DefaultScheduleSelected(String),
+    DefaultTimeChanged(String),
     DefaultRetentionChanged(String),
     DefaultArchiveToggled(bool),
     DmUsersFetched(Vec<(String, String)>),
@@ -60,16 +61,22 @@ pub(crate) enum Message {
     AddChannel,
     DmRowToggled(usize, bool),
     DmRowSchedule(usize, String),
+    DmRowTime(usize, String),
     DmRowRetention(usize, String),
     DmRowArchive(usize, bool),
     ManualKeyChanged(usize, String),
     ManualSchedule(usize, String),
+    ManualTime(usize, String),
     ManualRetention(usize, String),
     ManualArchive(usize, bool),
     RemoveManualChat(usize),
     AddManualChat,
-    DeleteAllClicked(String),
-    DeleteAllDone(String, Result<serde_json::Value, String>),
+    /// Run one chat's job now via the daemon, honoring its configured
+    /// retention (no retention-0 override).
+    RunNowClicked(String),
+    RunNowDone(String, Result<serde_json::Value, String>),
+    /// Two-click armed: wipe the configured jobs ([chat] table) and save.
+    ClearJobsClicked,
     Save,
     // -- jobs view --
     JobsFetched(Result<serde_json::Value, String>),
@@ -121,6 +128,8 @@ impl PanelApp {
                 last: serde_json::json!({}),
                 note: String::new(),
                 labels: HashMap::new(),
+                armed_clear_jobs: false,
+                clear_note: String::new(),
             },
             logs: LogsState::new(),
             client,
@@ -181,7 +190,7 @@ impl PanelApp {
             "status" => {
                 let rt = self.rt.clone();
                 rt.spawn(async {
-                    match crate::ipc::send(serde_json::json!({ "cmd": "status" })).await {
+                    match crate::ipc::send_typed(serde_json::json!({ "cmd": "status" })).await {
                         Ok(resp) => {
                             tracing::info!(status = %resp, "status");
                             println!(
@@ -204,19 +213,20 @@ impl PanelApp {
             other => {
                 if let Some(archive_path) = other.strip_prefix("view:") {
                     open_archive(Path::new(archive_path));
+                    Task::none()
                 } else if let Some(chat) = other.strip_prefix("run:") {
                     let chat = chat.to_string();
-                    self.rt.spawn(async move {
-                        match crate::ipc::send(serde_json::json!({ "cmd": "run_now", "chat": chat })).await {
-                            Ok(resp) if resp["ok"] == true => {
-                                tracing::info!(chat = %chat, "run-now accepted by daemon, running in background");
-                            }
-                            Ok(resp) => tracing::warn!(chat = %chat, "run-now failed: {}", &resp["error"]),
-                            Err(e) => tracing::warn!(chat = %chat, "daemon unreachable ({e}); start it with `guillotine service install`"),
-                        }
-                    });
+                    // Route the daemon's answer through the UI so a refused
+                    // run-now is visible instead of only logged.
+                    Task::perform(
+                        crate::ipc::send_typed(
+                            serde_json::json!({ "cmd": "run_now", "chat": chat.clone() }),
+                        ),
+                        move |res| Message::RunNowDone(chat, res.map_err(|e| e.to_string())),
+                    )
+                } else {
+                    Task::none()
                 }
-                Task::none()
             }
         }
     }
@@ -239,7 +249,7 @@ impl PanelApp {
             Message::SlowTick => {
                 self.logs.refresh();
                 Task::perform(
-                    crate::ipc::send(serde_json::json!({ "cmd": "jobs" })),
+                    crate::ipc::send_typed(serde_json::json!({ "cmd": "jobs" })),
                     |res| Message::JobsFetched(res.map_err(|e| e.to_string())),
                 )
             }
@@ -286,6 +296,10 @@ impl PanelApp {
                 self.settings.default_schedule = v;
                 Task::none()
             }
+            Message::DefaultTimeChanged(v) => {
+                self.settings.default_time = v;
+                Task::none()
+            }
             Message::DefaultRetentionChanged(v) => {
                 self.settings.default_retention = v;
                 Task::none()
@@ -304,8 +318,9 @@ impl PanelApp {
                             user_id: id,
                             name,
                             enabled: false,
-                            schedule: "daily".to_string(),
+                            schedule: self.settings.default_schedule.clone(),
                             schedule_options: schedule_state(),
+                            time: self.settings.default_time.clone(),
                             retention: self.settings.default_retention.clone(),
                             archive: self.settings.default_archive,
                         });
@@ -375,6 +390,7 @@ impl PanelApp {
                         key,
                         schedule: self.settings.default_schedule.clone(),
                         schedule_options: schedule_state(),
+                        time: self.settings.default_time.clone(),
                         retention: self.settings.default_retention.clone(),
                         archive: self.settings.default_archive,
                     });
@@ -384,12 +400,41 @@ impl PanelApp {
             Message::DmRowToggled(i, v) => {
                 if let Some(r) = self.settings.dm_rows.get_mut(i) {
                     r.enabled = v;
+                    if v {
+                        // Enabling a DM row must keep the user in scope under
+                        // the dm policy, otherwise run-now/scheduled runs
+                        // refuse the chat ("not in scope under the dm policy").
+                        let user_id = r.user_id.clone();
+                        let mut users: Vec<String> = self
+                            .settings
+                            .dm_users
+                            .split(',')
+                            .map(|x| x.trim().to_string())
+                            .filter(|x| !x.is_empty())
+                            .collect();
+                        match self.settings.dm_policy.as_str() {
+                            "nominate" => {
+                                if !users.contains(&user_id) {
+                                    users.push(user_id);
+                                }
+                            }
+                            "exclude" => users.retain(|u| *u != user_id),
+                            _ => {}
+                        }
+                        self.settings.dm_users = users.join(", ");
+                    }
                 }
                 Task::none()
             }
             Message::DmRowSchedule(i, v) => {
                 if let Some(r) = self.settings.dm_rows.get_mut(i) {
                     r.schedule = v;
+                }
+                Task::none()
+            }
+            Message::DmRowTime(i, v) => {
+                if let Some(r) = self.settings.dm_rows.get_mut(i) {
+                    r.time = v;
                 }
                 Task::none()
             }
@@ -417,6 +462,12 @@ impl PanelApp {
                 }
                 Task::none()
             }
+            Message::ManualTime(i, v) => {
+                if let Some(r) = self.settings.manual_chats.get_mut(i) {
+                    r.time = v;
+                }
+                Task::none()
+            }
             Message::ManualRetention(i, v) => {
                 if let Some(r) = self.settings.manual_chats.get_mut(i) {
                     r.retention = v;
@@ -438,40 +489,50 @@ impl PanelApp {
             Message::AddManualChat => {
                 self.settings.manual_chats.push(ManualChat {
                     key: "guild:".into(),
-                    schedule: "daily".into(),
+                    schedule: self.settings.default_schedule.clone(),
                     schedule_options: schedule_state(),
+                    time: self.settings.default_time.clone(),
                     retention: self.settings.default_retention.clone(),
                     archive: false,
                 });
                 Task::none()
             }
-            Message::DeleteAllClicked(chat) => {
-                // Two-click armed "Delete ALL now": first click arms, second
-                // sends run-now with all=true (retention 0) through the daemon.
-                if self.settings.armed_delete_all.as_deref() == Some(chat.as_str()) {
-                    self.settings.armed_delete_all = None;
-                    Task::perform(
-                        crate::ipc::send(
-                            serde_json::json!({ "cmd": "run_now", "chat": chat.clone(), "all": true }),
-                        ),
-                        move |res| Message::DeleteAllDone(chat, res.map_err(|e| e.to_string())),
-                    )
-                } else {
-                    self.settings.armed_delete_all = Some(chat);
-                    Task::none()
-                }
+            Message::RunNowClicked(chat) => {
+                // Plain run-now: the daemon resolves the chat's configured
+                // retention, so nothing inside the retention window is
+                // deleted. Acks immediately, runs in the background.
+                Task::perform(
+                    crate::ipc::send_typed(
+                        serde_json::json!({ "cmd": "run_now", "chat": chat.clone() }),
+                    ),
+                    move |res| Message::RunNowDone(chat, res.map_err(|e| e.to_string())),
+                )
             }
-            Message::DeleteAllDone(chat, res) => {
-                match res {
-                    Ok(resp) if resp["ok"] == true => {
-                        tracing::info!(chat = %chat, "delete-all accepted by daemon, running in background")
+            Message::RunNowDone(chat, res) => {
+                self.settings.run_note = run_now_note("run-now", &chat, res);
+                Task::none()
+            }
+            Message::ClearJobsClicked => {
+                // Two-click armed: first click arms, second wipes the
+                // configured jobs (the [chat] table) and saves the config.
+                if self.jobs.armed_clear_jobs {
+                    self.jobs.armed_clear_jobs = false;
+                    let removed = self.settings.manual_chats.len()
+                        + self.settings.dm_rows.iter().filter(|r| r.enabled).count();
+                    self.settings.manual_chats.clear();
+                    for row in &mut self.settings.dm_rows {
+                        row.enabled = false;
                     }
-                    Ok(resp) => {
-                        tracing::warn!(chat = %chat, "delete-all failed: {}", &resp["error"])
-                    }
-                    Err(e) => {
-                        tracing::warn!(chat = %chat, "daemon unreachable ({e}); delete-all needs the running service")
-                    }
+                    self.settings.status = save_config(&self.config_path, &self.settings);
+                    self.jobs.clear_note = if self.settings.status.starts_with("Saved") {
+                        format!("cleared {removed} job(s); config saved")
+                    } else {
+                        format!("clear failed: {}", self.settings.status)
+                    };
+                } else {
+                    self.jobs.armed_clear_jobs = true;
+                    self.jobs.clear_note =
+                        "click again to confirm: remove ALL configured jobs".to_string();
                 }
                 Task::none()
             }
@@ -552,5 +613,23 @@ impl PanelApp {
 
     pub(crate) fn heading<'a>(label: impl Into<String>) -> Element<'a, Message> {
         text(label.into()).size(19).into()
+    }
+}
+
+/// Human-readable result of a run-now/delete-now request for the settings
+/// view: accepted requests start with "accepted" (shown green), refusals
+/// and a missing daemon are red and say why.
+fn run_now_note(what: &str, chat: &str, res: Result<serde_json::Value, String>) -> String {
+    match res {
+        Ok(resp) if resp["ok"] == true => format!(
+            "accepted: {what} for {chat} is running in the background (see the Jobs tab)"
+        ),
+        Ok(resp) => format!(
+            "{what} for {chat} refused: {}",
+            resp["error"].as_str().unwrap_or("unknown error")
+        ),
+        Err(e) => format!(
+            "{what} for {chat} failed: daemon unreachable ({e}); start it with `guillotine service install`"
+        ),
     }
 }

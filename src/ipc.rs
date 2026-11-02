@@ -55,40 +55,50 @@ pub fn last_runs_file() -> PathBuf {
 
 static LAST_RUNS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-pub fn record_last_run(chat: &str, summary: &crate::deletion::Summary) {
+pub async fn record_last_run(chat: &str, summary: &crate::deletion::Summary) {
     // Serialized: concurrent run-now tasks must not lose each other's records.
-    let _g = LAST_RUNS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // The read+merge+write runs on the blocking pool; the std Mutex is never
+    // held across an .await.
     let file = last_runs_file();
-    let mut runs: Value = std::fs::read_to_string(&file)
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_else(|| json!({}));
-    if let Some(obj) = runs.as_object_mut() {
-        obj.insert(
-            chat.to_string(),
-            json!({
-                "last_run": chrono::Utc::now().to_rfc3339(),
-                "deleted": summary.deleted,
-                "failed": summary.failed,
-                "skipped": summary.skipped,
-                "scanned": summary.scanned,
-                "complete": summary.complete,
-                "aborted": summary.aborted,
-            }),
-        );
-    }
+    let chat = chat.to_string();
+    let entry = json!({
+        "last_run": chrono::Utc::now().to_rfc3339(),
+        "deleted": summary.deleted,
+        "failed": summary.failed,
+        "skipped": summary.skipped,
+        "scanned": summary.scanned,
+        "complete": summary.complete,
+        "aborted": summary.aborted,
+    });
+    let payload = {
+        let file = file.clone();
+        match tokio::task::spawn_blocking(move || {
+            let _g = LAST_RUNS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let mut runs: Value = std::fs::read_to_string(&file)
+                .ok()
+                .and_then(|raw| serde_json::from_str(&raw).ok())
+                .unwrap_or_else(|| json!({}));
+            if let Some(obj) = runs.as_object_mut() {
+                obj.insert(chat, entry);
+            }
+            serde_json::to_string_pretty(&runs).unwrap() + "\n"
+        })
+        .await
+        {
+            Ok(p) => p,
+            Err(_) => return, // blocking task panicked: nothing sensible to record
+        }
+    };
     if let Some(parent) = file.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        let _ = tokio::fs::create_dir_all(parent).await;
     }
     let tmp = file.with_extension("json.part");
-    if crate::config::write_file_private(
-        &tmp,
-        &(serde_json::to_string_pretty(&runs).unwrap() + "\n"),
-    )
-    .is_ok()
-    {
-        let _ = std::fs::rename(&tmp, &file);
-    }
+    let _ = tokio::task::spawn_blocking(move || {
+        if crate::config::write_file_private(&tmp, &payload).is_ok() {
+            let _ = std::fs::rename(&tmp, &file);
+        }
+    })
+    .await;
 }
 
 /// Serve IPC requests until the process exits. Spawned by the daemon.
@@ -178,6 +188,16 @@ async fn handle(
     // neither exhaust memory nor hold a task/fd forever.
     let line = read_request_line(BufReader::new(reader)).await?;
     let req: Value = serde_json::from_str(line.trim())?;
+    // Handshake: proves to the client that this listener is the daemon before
+    // the client sends its secret, so a port squatter never receives it.
+    // Requires no secret itself.
+    if req.get("cmd").and_then(|c| c.as_str()) == Some("hello") {
+        let resp = json!({ "ok": true, "proto": 1 });
+        writer
+            .write_all((serde_json::to_string(&resp)? + "\n").as_bytes())
+            .await?;
+        return Ok(());
+    }
     if !secret_eq(
         req.get("secret").and_then(|s| s.as_str()).unwrap_or(""),
         &secret,
@@ -243,7 +263,7 @@ async fn handle(
                         match run_now_via_daemon(&cfg, job, &registry).await {
                             Ok(summary) => {
                                 tracing::info!(chat = %chat_log, deleted = summary.deleted, "run-now finished");
-                                record_last_run(&chat_log, &summary);
+                                record_last_run(&chat_log, &summary).await;
                             }
                             Err(e) => {
                                 tracing::warn!(chat = %chat_log, error = %e, "run-now failed")
@@ -306,31 +326,82 @@ async fn run_now_via_daemon(
     scheduler::run_chat_job(&client, cfg, &job, registry).await
 }
 
-/// Client side: send one command to the running daemon.
-pub async fn send(mut cmd: Value) -> anyhow::Result<Value> {
+/// Why an IPC send failed. [`SendError::Absent`] means no daemon is listening
+/// (missing port/secret files, connection refused) and it is safe to fall
+/// back to in-process work; [`SendError::Failed`] means a daemon may be alive
+/// but wedged — running unlocked then would break the single-deletion
+/// guarantee, so callers must error out instead of falling back.
+#[derive(Debug, thiserror::Error)]
+pub enum SendError {
+    #[error("{0}")]
+    Absent(anyhow::Error),
+    #[error("{0}")]
+    Failed(anyhow::Error),
+}
+
+/// Client side: send one command to the running daemon. Distinguishes "no
+/// daemon running" ([`SendError::Absent`]) from "daemon alive but not
+/// answering" ([`SendError::Failed`]).
+pub async fn send_typed(mut cmd: Value) -> Result<Value, SendError> {
     let secret = std::fs::read_to_string(secret_file())
-        .context("no ipc secret — is the service running?")?;
+        .map_err(|e| SendError::Absent(anyhow::anyhow!("no ipc secret file: {e}")))?;
     cmd["secret"] = Value::String(secret.trim().to_string());
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        let port: u16 = std::fs::read_to_string(port_file())?
+        let port: u16 = std::fs::read_to_string(port_file())
+            .map_err(|e| SendError::Absent(anyhow::anyhow!("no ipc port file: {e}")))?
             .trim()
             .parse()
-            .context("invalid ipc port file — is the service running?")?;
-        let mut stream = TcpStream::connect(("127.0.0.1", port)).await?;
+            .map_err(|_| SendError::Absent(anyhow::anyhow!("invalid ipc port file")))?;
+        let mut stream = match TcpStream::connect(("127.0.0.1", port)).await {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                return Err(SendError::Absent(anyhow::anyhow!(
+                    "connection refused on port {port}: no daemon running"
+                )));
+            }
+            Err(e) => return Err(SendError::Failed(e.into())),
+        };
+        // Handshake first: the secret is only sent once the peer has proven it
+        // is the daemon, so a squatter on a reused ephemeral port never gets it.
         stream
-            .write_all((serde_json::to_string(&cmd)? + "\n").as_bytes())
-            .await?;
+            .write_all(b"{\"cmd\":\"hello\"}\n")
+            .await
+            .map_err(|e| SendError::Failed(e.into()))?;
+        {
+            use tokio::io::AsyncBufReadExt as _;
+            let mut hello = String::new();
+            BufReader::new(&mut stream)
+                .read_line(&mut hello)
+                .await
+                .map_err(|e| SendError::Failed(e.into()))?;
+            let hello: Value =
+                serde_json::from_str(hello.trim()).map_err(|e| SendError::Failed(e.into()))?;
+            if hello.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+                return Err(SendError::Failed(anyhow::anyhow!(
+                    "peer on port {port} is not the guillotine daemon"
+                )));
+            }
+        }
+        stream
+            .write_all(
+                (serde_json::to_string(&cmd).map_err(|e| SendError::Failed(e.into()))? + "\n")
+                    .as_bytes(),
+            )
+            .await
+            .map_err(|e| SendError::Failed(e.into()))?;
         let reader = BufReader::new(stream);
         let mut line = String::new();
         use tokio::io::{AsyncBufReadExt, AsyncReadExt};
-        reader.take(1024 * 1024).read_line(&mut line).await?;
-        Ok(serde_json::from_str(line.trim())?)
+        reader
+            .take(1024 * 1024)
+            .read_line(&mut line)
+            .await
+            .map_err(|e| SendError::Failed(e.into()))?;
+        serde_json::from_str(line.trim()).map_err(|e| SendError::Failed(e.into()))
     })
     .await
-    .context("ipc request timed out")?
+    .map_err(|_| SendError::Failed(anyhow::anyhow!("ipc request timed out")))?
 }
-
-use anyhow::Context;
 
 #[cfg(test)]
 mod tests {
@@ -489,6 +560,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hello_handshake_needs_no_secret() {
+        // The client sends hello before its secret, so a port squatter never
+        // receives the secret; the daemon must answer ok without one.
+        let port = spawn_ipc("test-secret", ipc_cfg()).await;
+        let resp: Value =
+            serde_json::from_str(&ipc_send(port, r#"{"cmd":"hello"}"#).await).unwrap();
+        assert_eq!(resp.get("ok").and_then(|v| v.as_bool()), Some(true));
+    }
+
+    #[tokio::test]
     async fn ipc_missing_or_wrong_secret_is_unauthorized() {
         let port = spawn_ipc("test-secret", ipc_cfg()).await;
         let resp: Value =
@@ -533,10 +614,22 @@ mod tests {
         big.push_str(&"a".repeat(100 * 1024));
         big.push_str("\"}");
         // truncated at the 64 KiB cap -> unparseable -> handler errors out and
-        // the connection closes without a response line
-        let resp = ipc_send(port, &big).await;
+        // the connection closes without a response line. When the server
+        // closes early, the client's write may fail with ECONNRESET (seen on
+        // macOS) instead of succeeding into the kernel buffer (Linux) — both
+        // mean the over-cap line was never answered.
+        use tokio::io::AsyncBufReadExt as _;
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let _ = stream.write_all(big.as_bytes()).await;
+        let _ = stream.write_all(b"\n").await;
+        let mut resp = String::new();
+        let n = match BufReader::new(stream).read_line(&mut resp).await {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => 0,
+            Err(e) => panic!("unexpected read error: {e}"),
+        };
         assert!(
-            resp.is_empty(),
+            n == 0 && resp.is_empty(),
             "over-cap line must not be answered: {resp:?}"
         );
     }

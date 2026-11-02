@@ -217,6 +217,16 @@ pub async fn archive_chat(
                     continue;
                 }
                 for att in &msg.attachments {
+                    // msg.id comes from the API and is interpolated into the
+                    // attachment file name below; validate it like every other
+                    // id so a crafted id can never traverse out of attachments/.
+                    if !crate::config::valid_id(&msg.id) {
+                        tracing::warn!(
+                            message_id = %msg.id,
+                            "skipping attachments of a message with a non-numeric id"
+                        );
+                        continue;
+                    }
                     let already = recorded.get(&att.id).is_some_and(|e| {
                         e.get("status").and_then(|s| s.as_str()) == Some("ok")
                             && e.get("local_path").and_then(|p| p.as_str()).is_some_and(|p| {

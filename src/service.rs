@@ -126,6 +126,10 @@ pub async fn run(config_arg: Option<&Path>) -> anyhow::Result<()> {
         r = scheduler::run_loop(&cfg, &path) => r,
         _ = shutdown_rx => Ok(()),
     };
+    // The IPC port file must not outlive the daemon: a stale port could be
+    // reused by an unrelated local process (clients verify the peer with the
+    // hello handshake, but the file should not advertise a dead listener).
+    let _ = std::fs::remove_file(crate::ipc::port_file());
     drop(_guard); // flush the non-blocking log writer
     result
 }

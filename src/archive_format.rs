@@ -131,9 +131,11 @@ pub fn load_message_records(path: &Path) -> Vec<serde_json::Value> {
     }
     if let Ok(meta) = std::fs::metadata(path) {
         if valid_end < meta.len() as usize {
-            let tmp = path.with_extension("jsonl.part");
-            if std::fs::write(&tmp, &bytes[..valid_end]).is_ok() {
-                let _ = std::fs::rename(&tmp, path);
+            // Repair through the private atomic writer: a plain fs::write of
+            // the temp file would rename a 0644 file over messages.jsonl and
+            // permanently loosen the archive's 0600 mode.
+            if let Ok(contents) = std::str::from_utf8(&bytes[..valid_end]) {
+                let _ = crate::config::write_file_private_atomic(path, contents);
             }
         }
     }
