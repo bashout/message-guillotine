@@ -76,7 +76,8 @@ jobs:
 
       - name: Smoke test static headless binary (Linux)
         if: runner.os == 'Linux'
-        run: "target/${{ matrix.musl_target }}/release/guillotine" --help > /dev/null
+        run: |
+          "target/${{ matrix.musl_target }}/release/guillotine" --help > /dev/null
 
       - name: Package static headless CLI as tar.gz (Linux)
         if: runner.os == 'Linux'
@@ -112,7 +113,8 @@ jobs:
       - name: Smoke test AppImage (Linux)
         if: runner.os == 'Linux'
         shell: bash
-        run: "dist/${{ matrix.artifact }}.AppImage" --appimage-extract-and-run --help > /dev/null
+        run: |
+          "dist/${{ matrix.artifact }}.AppImage" --appimage-extract-and-run --help > /dev/null
 
       # --- macOS ---
       - name: Build (macOS)
@@ -123,7 +125,8 @@ jobs:
 
       - name: Smoke test (macOS)
         if: runner.os == 'macOS'
-        run: "target/${{ matrix.target }}/release/guillotine" --help > /dev/null
+        run: |
+          "target/${{ matrix.target }}/release/guillotine" --help > /dev/null
 
       - name: Package zip (macOS)
         if: runner.os == 'macOS'
@@ -142,7 +145,8 @@ jobs:
       - name: Smoke test (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: "target\${{ matrix.target }}\release\guillotine.exe" --help | Out-Null
+        run: |
+          "target\${{ matrix.target }}\release\guillotine.exe" --help | Out-Null
 
       - name: Package zip (Windows)
         if: runner.os == 'Windows'
