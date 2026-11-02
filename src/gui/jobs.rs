@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use iced::widget::{column, container, progress_bar, row, text, Space};
+use iced::widget::{button, column, container, progress_bar, row, text, Space};
 use iced::{Element, Font, Length};
 
 use super::{err_color, muted, ok_color, phase_color, short_time, Message, PanelApp};
@@ -14,6 +14,10 @@ pub(crate) struct JobsState {
     pub(crate) note: String,
     /// Chat key -> friendly label, fetched in the background from the API.
     pub(crate) labels: HashMap<String, String>,
+    /// Two-click arm state for the "Clear jobs" button.
+    pub(crate) armed_clear_jobs: bool,
+    /// Result line of the last clear-jobs action.
+    pub(crate) clear_note: String,
 }
 
 impl PanelApp {
@@ -27,6 +31,29 @@ impl PanelApp {
         if !j.note.is_empty() {
             col = col.push(text(j.note.clone()).color(err_color()));
         }
+
+        // Debug-style maintenance action: wipe the configured jobs ([chat]
+        // table in config.toml) and save. Two-click armed.
+        let (clear_label, clear_danger) = if j.armed_clear_jobs {
+            ("Confirm: clear ALL configured jobs?", true)
+        } else {
+            ("Clear jobs", false)
+        };
+        let mut clear_row =
+            row![button(text(clear_label)).on_press(Message::ClearJobsClicked)].spacing(10);
+        if clear_danger {
+            clear_row = clear_row
+                .push(text("empties the [chat] config and saves immediately").color(muted()));
+        }
+        if !j.clear_note.is_empty() {
+            let ok = j.clear_note.starts_with("cleared");
+            clear_row = clear_row.push(text(j.clear_note.clone()).color(if ok {
+                ok_color()
+            } else {
+                err_color()
+            }));
+        }
+        col = col.push(clear_row);
 
         col = col.push(Self::heading(format!("Running now ({})", j.running.len())));
         if j.running.is_empty() {

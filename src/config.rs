@@ -216,14 +216,38 @@ impl fmt::Display for Schedule {
     }
 }
 
-impl<'de> Deserialize<'de> for Schedule {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let raw = String::deserialize(deserializer)?;
-        Schedule::from_str(&raw).map_err(serde::de::Error::custom)
+/// On-disk form of a schedule: the frequency and the time of day are stored
+/// as separate fields (`frequency = "daily"`, `time = "04:00"`). The legacy
+/// combined string (`schedule = "daily at 04:00"`) is still accepted so
+/// configs written by older versions keep loading.
+#[derive(Deserialize)]
+struct ScheduleRaw {
+    frequency: Option<String>,
+    time: Option<String>,
+    schedule: Option<String>,
+}
+
+/// Build a [`Schedule`] from the separate `frequency`/`time` fields, or from
+/// the legacy combined `schedule` string. Mixing the two forms is an error.
+fn schedule_from_parts(
+    frequency: Option<String>,
+    time: Option<String>,
+    legacy: Option<String>,
+) -> anyhow::Result<Schedule> {
+    if let Some(legacy) = legacy {
+        if frequency.is_some() || time.is_some() {
+            bail!("use either the legacy `schedule` string or `frequency` + `time`, not both");
+        }
+        return Schedule::from_str(&legacy);
     }
+    let frequency = frequency
+        .ok_or_else(|| anyhow::anyhow!("missing `frequency` (daily, weekly or monthly)"))?;
+    let mut schedule = Schedule::from_str(&frequency)?;
+    if let Some(t) = time {
+        schedule.at = NaiveTime::parse_from_str(t.trim(), "%H:%M")
+            .with_context(|| format!("invalid time {t:?}: expected HH:MM (24h)"))?;
+    }
+    Ok(schedule)
 }
 
 /// A chat target: a DM with a user, or a channel inside a guild.
@@ -276,27 +300,97 @@ impl fmt::Display for ChatKey {
 }
 
 /// One chat's settings: when to run, what to keep, whether to archive first.
-#[derive(Debug, Clone, Deserialize)]
+/// In the config file the schedule is stored as separate `frequency` and
+/// `time` fields (see [`ScheduleRaw`]); in memory it stays a [`Schedule`].
+#[derive(Debug, Clone)]
 pub struct ChatConfig {
     pub schedule: Schedule,
     pub retention_days: u32,
-    #[serde(default)]
     pub archive_before_delete: bool,
 }
 
+#[derive(Deserialize)]
+struct ChatConfigRaw {
+    #[serde(flatten)]
+    schedule: ScheduleRaw,
+    retention_days: u32,
+    #[serde(default)]
+    archive_before_delete: bool,
+}
+
+impl<'de> Deserialize<'de> for ChatConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = ChatConfigRaw::deserialize(deserializer)?;
+        let schedule = schedule_from_parts(
+            raw.schedule.frequency,
+            raw.schedule.time,
+            raw.schedule.schedule,
+        )
+        .map_err(serde::de::Error::custom)?;
+        Ok(ChatConfig {
+            schedule,
+            retention_days: raw.retention_days,
+            archive_before_delete: raw.archive_before_delete,
+        })
+    }
+}
+
 /// The [dm] section: scope policy plus defaults for DM chats that have no
-/// own [chat] entry (used under the "exclude" policy).
-#[derive(Debug, Clone, Deserialize)]
+/// own [chat] entry (used under the "exclude" policy). The default schedule
+/// is stored as `default_frequency` + `default_time` (legacy:
+/// `default_schedule = "weekly at 04:00"`).
+#[derive(Debug, Clone)]
 pub struct DmPolicy {
     pub policy: DmScope,
-    #[serde(default)]
     pub users: Vec<String>,
-    #[serde(default)]
     pub default_schedule: Schedule,
-    #[serde(default = "default_retention")]
     pub default_retention_days: u32,
-    #[serde(default)]
     pub default_archive_before_delete: bool,
+}
+
+#[derive(Deserialize)]
+struct DmPolicyRaw {
+    policy: DmScope,
+    #[serde(default)]
+    users: Vec<String>,
+    default_frequency: Option<String>,
+    default_time: Option<String>,
+    default_schedule: Option<String>,
+    #[serde(default = "default_retention")]
+    default_retention_days: u32,
+    #[serde(default)]
+    default_archive_before_delete: bool,
+}
+
+impl<'de> Deserialize<'de> for DmPolicy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = DmPolicyRaw::deserialize(deserializer)?;
+        // No schedule keys at all -> the default schedule (as before); a
+        // partial or legacy form is parsed and validated.
+        let default_schedule = match (
+            raw.default_frequency,
+            raw.default_time,
+            raw.default_schedule,
+        ) {
+            (None, None, None) => Schedule::default(),
+            (f, t, legacy) => {
+                schedule_from_parts(f, t, legacy).map_err(serde::de::Error::custom)?
+            }
+        };
+        Ok(DmPolicy {
+            policy: raw.policy,
+            users: raw.users,
+            default_schedule,
+            default_retention_days: raw.default_retention_days,
+            default_archive_before_delete: raw.default_archive_before_delete,
+        })
+    }
 }
 
 fn default_retention() -> u32 {
@@ -487,24 +581,29 @@ token = "YOUR_USER_TOKEN"
 [dm]
 policy = "exclude"
 users = ["USER_ID_TO_EXCLUDE"]
-default_schedule = "weekly"
+default_frequency = "weekly"
+default_time = "04:00"
 default_retention_days = 30
 default_archive_before_delete = true
 
-# Each chat has its own schedule, retention and archive flag.
-# schedule: daily | weekly | monthly, optional "at HH:MM" (default 04:00).
+# Each chat has its own frequency, time, retention and archive flag.
+# frequency: daily | weekly | monthly. time: HH:MM 24h local (default 04:00).
 # retention_days: the most recent N days of your messages are kept;
 # on each run everything older is deleted.
 # archive_before_delete: archive the chat first, appending to the existing
 # archive for this chat when one is present.
+# (Older configs may use the combined `schedule = "daily at 04:00"` form;
+# it is still accepted.)
 
 # [chat."dm:USER_ID"]
-# schedule = "monthly"
+# frequency = "monthly"
+# time = "04:00"
 # retention_days = 7
 # archive_before_delete = true
 
 # [chat."guild:GUILD_ID/channel:CHANNEL_ID"]
-# schedule = "daily"
+# frequency = "daily"
+# time = "04:00"
 # retention_days = 30
 # archive_before_delete = false
 "##;
@@ -596,6 +695,71 @@ archive_before_delete = true
         let toml = r#"archive_dir = "/tmp/x""#;
         let cfg: Config = toml::from_str(toml).unwrap();
         assert!(cfg.token.is_none());
+    }
+
+    #[test]
+    fn schedule_stored_as_separate_frequency_and_time() {
+        // New format: frequency and time are separate fields.
+        let cfg: Config = toml::from_str(
+            r#"token = "t"
+[dm]
+policy = "exclude"
+default_frequency = "weekly"
+default_time = "09:15"
+[chat."dm:1"]
+frequency = "monthly"
+time = "23:45"
+retention_days = 7
+"#,
+        )
+        .unwrap();
+        let s = cfg.dm_chat_settings("1").unwrap().schedule;
+        assert_eq!(s.kind, ScheduleKind::Monthly);
+        assert_eq!(s.at, NaiveTime::from_hms_opt(23, 45, 0).unwrap());
+        assert_eq!(cfg.dm.default_schedule.kind, ScheduleKind::Weekly);
+        assert_eq!(
+            cfg.dm.default_schedule.at,
+            NaiveTime::from_hms_opt(9, 15, 0).unwrap()
+        );
+        // time defaults to 04:00 when omitted
+        let cfg: Config = toml::from_str(
+            "token = \"t\"\n[chat.\"dm:1\"]\nfrequency = \"daily\"\nretention_days = 7\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.chat["dm:1"].schedule.at,
+            NaiveTime::from_hms_opt(4, 0, 0).unwrap()
+        );
+        // legacy combined string still parses
+        let cfg: Config = toml::from_str(
+            "token = \"t\"\n[chat.\"dm:1\"]\nschedule = \"daily at 23:30\"\nretention_days = 7\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.chat["dm:1"].schedule.kind, ScheduleKind::Daily);
+        assert_eq!(
+            cfg.chat["dm:1"].schedule.at,
+            NaiveTime::from_hms_opt(23, 30, 0).unwrap()
+        );
+        // mixing legacy and new forms is rejected
+        assert!(toml::from_str::<Config>(
+            "token = \"t\"\n[chat.\"dm:1\"]\nschedule = \"daily\"\nfrequency = \"weekly\"\nretention_days = 7\n"
+        )
+        .is_err());
+        // missing frequency is rejected
+        assert!(toml::from_str::<Config>(
+            "token = \"t\"\n[chat.\"dm:1\"]\ntime = \"04:00\"\nretention_days = 7\n"
+        )
+        .is_err());
+        // bad time is rejected
+        assert!(toml::from_str::<Config>(
+            "token = \"t\"\n[chat.\"dm:1\"]\nfrequency = \"daily\"\ntime = \"25:00\"\nretention_days = 7\n"
+        )
+        .is_err());
+        // unknown frequency is rejected
+        assert!(toml::from_str::<Config>(
+            "token = \"t\"\n[chat.\"dm:1\"]\nfrequency = \"hourly\"\nretention_days = 7\n"
+        )
+        .is_err());
     }
 
     #[test]
@@ -844,9 +1008,10 @@ retention_days = 7
 
     #[test]
     fn archive_dir_resolution_priority_and_token_env() {
-        // serialize env mutation within this test binary
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // serialize env mutation against every other env-mutating test
+        let _g = crate::testutil::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         let path = temp_config(
             "prio",
