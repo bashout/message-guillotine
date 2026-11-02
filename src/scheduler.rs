@@ -383,6 +383,21 @@ pub async fn run_now(config_arg: Option<&PathBuf>, chat: &str) -> anyhow::Result
     Ok(())
 }
 
+/// Auth attempts per token value before the service goes idle awaiting a
+/// token update.
+const AUTH_ATTEMPTS: u32 = 3;
+/// Spacing between the auth attempts of one round (transient failures).
+const AUTH_RETRY_SPACING: std::time::Duration = std::time::Duration::from_secs(30);
+/// How often the idle service polls the config for a token update.
+const TOKEN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The token value an auth round is keyed on: `None` when the config has no
+/// token. Awaiting a token update means waiting until this marker changes.
+/// The value is only ever compared, never logged.
+fn token_marker(cfg: &Config) -> Option<String> {
+    cfg.token().ok().map(str::to_string)
+}
+
 /// The service loop: resolve jobs, sleep until each chat's next fire time,
 /// run due jobs one at a time, and recompute. Runs forever.
 pub async fn run_loop(cfg: &Config, config_path: &std::path::Path) -> anyhow::Result<()> {
@@ -398,22 +413,43 @@ pub async fn run_loop(cfg: &Config, config_path: &std::path::Path) -> anyhow::Re
         registry.clone(),
         config_path.to_path_buf(),
     ));
-    // Auth retries: a not-yet-configured token (fresh install) or a
-    // transient network failure must not kill the service. Each attempt
-    // reloads the config so a token fixed in the tray Settings takes effect
-    // without a daemon restart.
+    // Auth rounds: up to three attempts for the current token value, then
+    // hold the service alive and wait for the token to be updated in the
+    // config (tray Settings, manual edit) before trying again — repeat
+    // forever. A not-yet-configured token (fresh install) or a transient
+    // network failure must not kill the service, and a bad token must not
+    // turn into unbounded retries.
     let client = loop {
         let cfg_now = Config::load(config_path).unwrap_or_else(|_| cfg.clone());
-        match crate::api::authed_client(&cfg_now).await {
-            Ok(c) => break c,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "authentication failed; retrying in 60s (token not configured yet, or a network problem)"
-                );
-                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        let failed_marker = token_marker(&cfg_now);
+        let mut authed = None;
+        for attempt in 1..=AUTH_ATTEMPTS {
+            match crate::api::authed_client(&cfg_now).await {
+                Ok(c) => {
+                    authed = Some(c);
+                    break;
+                }
+                Err(e) => tracing::warn!(attempt, error = %e, "authentication failed"),
+            }
+            if attempt < AUTH_ATTEMPTS {
+                tokio::time::sleep(AUTH_RETRY_SPACING).await;
             }
         }
+        if let Some(client) = authed {
+            break client;
+        }
+        tracing::warn!(
+            attempts = AUTH_ATTEMPTS,
+            "authentication failed; service idle until the token is updated"
+        );
+        loop {
+            tokio::time::sleep(TOKEN_POLL_INTERVAL).await;
+            let fresh = Config::load(config_path).unwrap_or_else(|_| cfg.clone());
+            if token_marker(&fresh) != failed_marker {
+                break;
+            }
+        }
+        tracing::info!("token updated; retrying authentication");
     };
     // Re-resolve the DM scope periodically: DMs come and go.
     let mut jobs = match resolve_jobs(&client, cfg).await {
@@ -670,6 +706,33 @@ mod tests {
         let mut v: Vec<String> = jobs.iter().map(|j| j.key.to_string()).collect();
         v.sort();
         v
+    }
+
+    #[test]
+    fn token_marker_keys_on_the_token_value_only() {
+        // unconfigured -> None: the idle service waits for Some
+        let unconfigured: Config = toml::from_str("[dm]\npolicy = \"exclude\"\n").unwrap();
+        assert_eq!(token_marker(&unconfigured), None);
+        // a configured token (even a placeholder) is a value to compare
+        let placeholder: Config = toml::from_str("token = \"YOUR_USER_TOKEN\"\n").unwrap();
+        assert_eq!(
+            token_marker(&placeholder).as_deref(),
+            Some("YOUR_USER_TOKEN")
+        );
+        // a change of value, not of anything else, breaks the idle wait
+        let updated: Config =
+            toml::from_str("token = \"real\"\n[dm]\npolicy = \"nominate\"\nusers = [\"1\"]\n")
+                .unwrap();
+        assert_ne!(token_marker(&updated), token_marker(&placeholder));
+        // the same token in a differently-edited config does not
+        let same_token: Config =
+            toml::from_str("token = \"real\"\n[dm]\npolicy = \"exclude\"\n").unwrap();
+        let same_token_elsewhere: Config =
+            toml::from_str("token = \"real\"\n[dm]\npolicy = \"nominate\"\n").unwrap();
+        assert_eq!(
+            token_marker(&same_token),
+            token_marker(&same_token_elsewhere)
+        );
     }
 
     #[test]
