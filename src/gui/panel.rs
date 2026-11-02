@@ -299,7 +299,22 @@ impl PanelApp {
                 self.logs.refresh();
                 Task::perform(
                     crate::ipc::send_typed(serde_json::json!({ "cmd": "jobs" })),
-                    |res| Message::JobsFetched(res.map_err(|e| e.to_string())),
+                    |res| {
+                        Message::JobsFetched(res.map_err(|e| match e {
+                            // Absent: nothing identifiable is listening —
+                            // no port/secret file, or connection refused.
+                            crate::ipc::SendError::Absent(inner) => {
+                                format!("no daemon running ({inner})")
+                            }
+                            // Failed: something was on the port but the
+                            // exchange broke (EOF, reset, timeout) — the
+                            // hello handshake already refuses impostors;
+                            // "not running" would be a misleading label.
+                            crate::ipc::SendError::Failed(inner) => {
+                                format!("daemon connection error ({inner})")
+                            }
+                        }))
+                    },
                 )
             }
             Message::WindowClosed(id) => {
