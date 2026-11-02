@@ -203,7 +203,7 @@ pub fn run_sync(config_arg: Option<PathBuf>) -> anyhow::Result<()> {
     let menu = build_menu(&chats, &archive_dir, viewer.as_deref(), &labels)?;
     let _tray = tray_icon::TrayIconBuilder::new()
         .with_menu(Box::new(menu))
-        .with_tooltip("guillotine")
+        .with_tooltip(format!("guillotine {}", crate::GIT_VERSION))
         .with_icon(tray_icon_rgba())
         .build()?;
 

@@ -194,6 +194,12 @@ impl PanelApp {
                 .size(12)
                 .color(muted()),
         );
+        col = col.push(
+            text(format!("build: {}", crate::GIT_VERSION))
+                .font(Font::MONOSPACE)
+                .size(12)
+                .color(muted()),
+        );
 
         // -- Connection --
         col = col.push(Self::heading("Connection"));

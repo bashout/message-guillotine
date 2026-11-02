@@ -158,3 +158,10 @@ the frozen archive format) and code conventions.
 
 The V2 line is cut from git tags `v2.x.y` on `main`; the crate version is set
 from that tag at release time.
+
+Every build embeds its git identity (`git describe --tags --always --dirty`)
+from `build.rs`: `guillotine --version` prints it, the tray tooltip shows it,
+and the Settings tab lists it — the release artifact filenames are identical
+across CI runs, so check the version instead of guessing which build an exe
+is. A source tree without git history builds with a `<version>-nogit`
+identity instead.

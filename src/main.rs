@@ -34,10 +34,16 @@ use clap::{Parser, Subcommand};
 
 use config::Config;
 
+/// This build's git identity: `git describe --tags --always --dirty` at
+/// compile time (e.g. "066ad42", "v2.1.0-3-g066ad42-dirty"), or
+/// "<crate version>-nogit" for a source tree without git history. Set by
+/// build.rs so artifacts are identifiable without guessing.
+pub(crate) const GIT_VERSION: &str = env!("GUILLOTINE_GIT_VERSION");
+
 #[derive(Parser)]
 #[command(
     name = "guillotine",
-    version,
+    version = GIT_VERSION,
     about = "Scheduled bulk delete and archive of your own chat messages \
              (self-bot — violates the platform ToS, use at your own risk)"
 )]
@@ -350,4 +356,19 @@ async fn run_async(config_arg: Option<PathBuf>, command: Commands) -> anyhow::Re
         } => viewer::run(archives_dir, &host, port, no_browser, expose).await?,
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GIT_VERSION;
+
+    #[test]
+    fn git_version_is_populated() {
+        // build.rs always sets the env var; this guards the wiring — an
+        // empty identity would make artifacts unidentifiable again.
+        assert!(
+            !GIT_VERSION.trim().is_empty(),
+            "GIT_VERSION must not be empty"
+        );
+    }
 }
