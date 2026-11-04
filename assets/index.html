@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>guillotine archive viewer</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div id="sticky-head">
+<header id="topbar">
+  <select id="archive-select" title="Archive"></select>
+  <input id="search" type="search" placeholder="Search messages&hellip;">
+  <button id="search-btn">Search</button>
+  <button id="search-clear" class="hidden">Clear</button>
+  <span class="spacer"></span>
+  <button id="view-messages" class="tab active">Messages</button>
+  <button id="view-gallery" class="tab">Media</button>
+  <button id="view-stats" class="tab">Stats</button>
+</header>
+<div id="filter-bar">
+  <label>From <input type="date" id="date-from"></label>
+  <label>To <input type="date" id="date-to"></label>
+  <label><input type="checkbox" id="f-att"> attachments</label>
+  <label><input type="checkbox" id="f-link"> links</label>
+  <label><input type="checkbox" id="f-pin"> pinned</label>
+  <span id="view-info"></span>
+</div>
+</div>
+<main>
+  <section id="pane-messages">
+    <div class="pager" id="pager-top"></div>
+    <div id="sentinel-top" class="sentinel"></div>
+    <div id="message-list"></div>
+    <div id="sentinel-bottom" class="sentinel"></div>
+    <div class="pager" id="pager-bottom"></div>
+  </section>
+  <section id="pane-gallery" class="hidden">
+    <div id="year-bar"></div>
+    <div id="gallery"></div>
+    <div class="pager"><button id="gallery-more">Load more</button></div>
+  </section>
+  <section id="pane-stats" class="hidden"><div id="stats"></div></section>
+</main>
+<script src="/app.js"></script>
+</body>
+</html>
