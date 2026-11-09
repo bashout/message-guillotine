@@ -1,7 +1,11 @@
-//! The background service: `run` is the daemon the native autostart entries
-//! launch; `install`/`uninstall`/`status` manage the per-OS registration
-//! (systemd --user on Linux, launchd LaunchAgent on macOS, registry Run key
-//! on Windows).
+//! The background service: `run` is the daemon; `install`/`uninstall`/
+//! `status` manage the per-OS autostart registration (systemd --user on
+//! Linux, launchd LaunchAgent on macOS, registry Run key on Windows).
+//! Desktop (gui) builds register the default launch — daemon + tray together
+//! — on every OS; headless builds register the daemon-only `service run`.
+//! On Linux, GUI builds also install a .desktop entry into the user's
+//! applications menu (`~/.local/share/applications`), so the tray is
+//! launchable from the app grid without a terminal.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -217,14 +221,25 @@ fn systemd_quote(path: &Path) -> String {
     format!("\"{escaped}\"")
 }
 
+/// systemd --user unit (Linux). GUI builds register the default launch (no
+/// subcommand) so login starts the daemon and the tray together, exactly like
+/// the Windows/macOS entries; headless builds keep the daemon-only
+/// `service run` for servers. A clean tray Quit exits 0, and
+/// Restart=on-failure leaves it stopped, matching launchd's SuccessfulExit=false.
 #[cfg(target_os = "linux")]
 fn systemd_unit(exe: &Path, config: &Path) -> String {
-    format!(
-        "[Unit]\nDescription=guillotine — scheduled message deletion/archival\n\n\
-         [Service]\nType=simple\nExecStart={} --config {} service run\nRestart=on-failure\nRestartSec=30\n\n\
-         [Install]\nWantedBy=default.target\n",
+    #[cfg(feature = "gui")]
+    let exec = format!("{} --config {}", systemd_quote(exe), systemd_quote(config));
+    #[cfg(not(feature = "gui"))]
+    let exec = format!(
+        "{} --config {} service run",
         systemd_quote(exe),
         systemd_quote(config)
+    );
+    format!(
+        "[Unit]\nDescription=guillotine — scheduled message deletion/archival\n\n\
+         [Service]\nType=simple\nExecStart={exec}\nRestart=on-failure\nRestartSec=30\n\n\
+         [Install]\nWantedBy=default.target\n"
     )
 }
 
@@ -245,6 +260,23 @@ pub fn install(config_arg: Option<&Path>) -> anyhow::Result<()> {
         .args(["--user", "enable", "--now", "guillotine.service"])
         .status();
     println!("Installed systemd user unit: {}", unit.display());
+    // GUI builds also add the app to the application menu, so the tray is
+    // launchable without a terminal. Headless builds skip this: there is no
+    // tray to launch.
+    #[cfg(feature = "gui")]
+    {
+        crate::gui::install_desktop_entry();
+        if let Some(home) = dirs::home_dir() {
+            println!(
+                "Installed desktop entry: {}",
+                home.join(".local/share/applications/guillotine.desktop")
+                    .display()
+            );
+            let _ = Command::new("update-desktop-database")
+                .arg(home.join(".local/share/applications"))
+                .status();
+        }
+    }
     Ok(())
 }
 
@@ -257,6 +289,14 @@ pub fn uninstall(config_arg: Option<&Path>) -> anyhow::Result<()> {
         .unwrap_or_else(|| PathBuf::from("."))
         .join("systemd/user/guillotine.service");
     let _ = std::fs::remove_file(&unit);
+    // Remove the application-menu entry and hicolor icon too (written by GUI
+    // builds on install/first launch); harmless no-op when absent.
+    if let Some(home) = dirs::home_dir() {
+        let _ = std::fs::remove_file(home.join(".local/share/applications/guillotine.desktop"));
+        let _ = std::fs::remove_file(
+            home.join(".local/share/icons/hicolor/256x256/apps/guillotine.png"),
+        );
+    }
     let _ = config_arg;
     println!("Removed systemd user unit: {}", unit.display());
     Ok(())
@@ -272,6 +312,34 @@ pub fn status(_config_arg: Option<&Path>) -> anyhow::Result<()> {
         if s.success() { "active" } else { "inactive" }
     );
     Ok(())
+}
+
+/// Quoting for a .desktop Exec argument: wrap in double quotes and escape the
+/// spec's reserved characters (\\, ", `, $). Compiled on every OS so the
+/// quoting is unit-testable everywhere.
+#[cfg_attr(not(all(target_os = "linux", feature = "gui")), allow(dead_code))]
+fn desktop_quote(path: &Path) -> String {
+    let raw = path.display().to_string();
+    assert!(!raw.contains('\n'), "path contains a newline");
+    let escaped = raw
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('$', "\\$")
+        .replace('`', "\\`");
+    format!("\"{escaped}\"")
+}
+
+/// The freedesktop .desktop entry (Linux GUI builds): launches the tray from
+/// the application menu, with the branding icon installed into hicolor.
+/// Compiled on every OS so the content is unit-testable everywhere.
+#[cfg_attr(not(all(target_os = "linux", feature = "gui")), allow(dead_code))]
+pub(crate) fn desktop_entry(exe: &Path) -> String {
+    format!(
+        "[Desktop Entry]\nType=Application\nName=Message Guillotine\n\
+         Comment=Scheduled bulk delete and archive of your own chat messages\n\
+         Exec={} gui\nIcon=guillotine\nTerminal=false\nCategories=Utility;\n",
+        desktop_quote(exe)
+    )
 }
 
 /// The registry Run key command line: the default launch (no subcommand), so
@@ -453,6 +521,35 @@ mod tests {
         );
     }
 
+    #[cfg(all(target_os = "linux", feature = "gui"))]
+    #[test]
+    fn systemd_unit_gui_build_registers_the_default_launch() {
+        // daemon + tray together: no subcommand on the ExecStart line
+        let unit = systemd_unit(
+            Path::new("/usr/bin/guillotine"),
+            Path::new("/home/me/.config/guillotine/config.toml"),
+        );
+        assert!(unit.contains(
+            "ExecStart=\"/usr/bin/guillotine\" --config \"/home/me/.config/guillotine/config.toml\"\n"
+        ));
+        assert!(!unit.contains("service run"));
+        assert!(unit.contains("Restart=on-failure"));
+        assert!(unit.contains("WantedBy=default.target"));
+    }
+
+    #[cfg(all(target_os = "linux", not(feature = "gui")))]
+    #[test]
+    fn systemd_unit_headless_build_runs_the_daemon_only() {
+        let unit = systemd_unit(
+            Path::new("/usr/bin/guillotine"),
+            Path::new("/home/me/.config/guillotine/config.toml"),
+        );
+        assert!(unit.contains(
+            "ExecStart=\"/usr/bin/guillotine\" --config \"/home/me/.config/guillotine/config.toml\" service run\n"
+        ));
+        assert!(unit.contains("WantedBy=default.target"));
+    }
+
     #[test]
     fn pick_service_exe_prefers_a_real_appimage_path() {
         // A real file stands in for the AppImage: it must win over current_exe.
@@ -481,6 +578,21 @@ mod tests {
             "/tmp/&lt;weird&gt; &amp; \"path\""
         );
         assert_eq!(xml_escape(""), "");
+    }
+
+    #[test]
+    fn desktop_entry_launches_the_tray_with_icon_and_quoted_exec() {
+        let entry = desktop_entry(Path::new("/home/me/Apps/guillotine AppImage"));
+        assert!(entry.starts_with("[Desktop Entry]\n"));
+        assert!(entry.contains("Type=Application"));
+        assert!(entry.contains("Name=Message Guillotine"));
+        // Exec launches the tray; the path is quoted so spaces cannot split it
+        assert!(entry.contains("Exec=\"/home/me/Apps/guillotine AppImage\" gui\n"));
+        assert!(entry.contains("Icon=guillotine"));
+        assert!(entry.contains("Terminal=false"));
+        // no shell-ish reserved characters survive unescaped in the path
+        let entry = desktop_entry(Path::new("/tmp/a\\b\"c$d`e"));
+        assert!(entry.contains("Exec=\"/tmp/a\\\\b\\\"c\\$d\\`e\" gui\n"));
     }
 
     #[test]
