@@ -156,7 +156,13 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          "target\${{ matrix.target }}\release\guillotine.exe" --help | Out-Null
+          # The GUI build is a windowed-subsystem exe (no console), so running
+          # `--help` has no stdout to write to and exits non-zero — validate the
+          # PE artifact instead of executing it.
+          $exe = "target\${{ matrix.target }}\release\guillotine.exe"
+          if (-not (Test-Path $exe)) { exit 1 }
+          $head = Get-Content $exe -AsByteStream -TotalCount 2
+          if ($head[0] -ne 77 -or $head[1] -ne 90) { exit 1 }  # 'MZ' PE magic
 
       - name: Package zip (Windows)
         if: runner.os == 'Windows'
