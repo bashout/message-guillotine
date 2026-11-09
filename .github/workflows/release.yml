@@ -72,7 +72,10 @@ jobs:
 
       - name: Verify static binary is not dynamically linked (Linux)
         if: runner.os == 'Linux'
-        run: file "target/${{ matrix.musl_target }}/release/guillotine" | grep -q 'statically linked'
+        # Recent stable toolchains link x86_64-unknown-linux-musl as
+        # static-PIE, which `file` reports as "static-pie linked" — accept both
+        # wordings; what must never appear is a dynamic interpreter.
+        run: file "target/${{ matrix.musl_target }}/release/guillotine" | grep -qE 'statically linked|static-pie linked'
 
       - name: Smoke test static headless binary (Linux)
         if: runner.os == 'Linux'
@@ -105,6 +108,13 @@ jobs:
           Type=Application
           Categories=Utility;
           EOF
+          # appimagetool does not synthesize an entrypoint: without AppRun the
+          # packaged AppImage fails with "Failed to run .../AppRun".
+          cat > AppDir/AppRun <<'EOF'
+          #!/bin/sh
+          exec "$(dirname "$0")/usr/bin/guillotine" "$@"
+          EOF
+          chmod +x AppDir/AppRun
           cp branding/icon-transparent.png AppDir/guillotine.png
           curl -sSL -o appimagetool "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-${{ matrix.arch }}.AppImage"
           chmod +x appimagetool
