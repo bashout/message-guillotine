@@ -19,7 +19,7 @@ risk.
 | Single-deletion lock | Only one deletion runs at a time, ever — a process-wide lock, enforced across processes via loopback IPC between the tray/CLI and the daemon |
 | Tray GUI | Desktop tray app with status, run-now, settings, and logs |
 | Viewer | `guillotine viewer` serves a local web UI to browse archives (search, filters, threading, media gallery, stats) |
-| Service autostart | Native autostart: systemd `--user` on Linux, launchd LaunchAgent on macOS, registry Run key on Windows |
+| Service autostart | Native autostart on every desktop platform — systemd `--user` on Linux, launchd LaunchAgent on macOS, registry Run key on Windows — launching the default (daemon + tray) |
 | Rate limiting | Paced at ~24 deletes/min; the platform's 429 `Retry-After` is honored |
 | Resume | Interrupted deletion runs resume from per-channel session files; archives resume via per-channel cursors |
 | Dry run | `guillotine scan CHANNEL_ID --retention-days 7` reports what a deletion run would delete, without deleting |
@@ -36,7 +36,7 @@ best-effort and untested; CI builds and tests against the versions below.
 
 | Platform | Supported | Distribution artifacts | Autostart | Notes |
 |---|---|---|---|---|
-| Linux x86_64 / aarch64 | Latest Ubuntu LTS (24.04) and equivalent-era distros (Debian stable, current Fedora, …) | AppImage (GUI, libs bundled), static musl tar.gz (headless CLI) | systemd `--user` unit | AppImage needs FUSE (or `--appimage-extract-and-run`); GUI also needs GTK3 + libayatana-appindicator, both bundled in the AppImage |
+| Linux x86_64 / aarch64 | Latest Ubuntu LTS (24.04) and equivalent-era distros (Debian stable, current Fedora, …) | AppImage (GUI, libs bundled), static musl tar.gz (headless CLI) | systemd `--user` unit (default launch: daemon + tray) | AppImage needs FUSE (or `--appimage-extract-and-run`); GUI also needs GTK3 + libayatana-appindicator, both bundled in the AppImage; headless (`--no-default-features`) builds register the daemon-only `service run` instead |
 | macOS Apple Silicon / Intel | Latest macOS (15 Sequoia) | zip of the bare binary — no .dmg, no signing | launchd LaunchAgent | Binary is unsigned: if downloaded via a browser, run `xattr -d com.apple.quarantine guillotine` once |
 | Windows 10/11 x64 | Latest Windows 10/11 | zip of `guillotine.exe` (static CRT — no redistributable needed) | registry Run key (default launch: daemon + tray) | GUI-first: double-clicking the exe starts the service and the tray; the exe is a windowed-subsystem binary, so CLI subcommands (`config init`, `scan`, …) produce no console output — use the tray app |
 
@@ -61,7 +61,13 @@ Known limitations:
 
 ## Quickstart
 
-Everything lives in the crate at the repo root:
+Zero-build install: download the AppImage from the latest `v2.*` release,
+`chmod +x` it, and run it — the first launch starts the service daemon and the
+tray together and writes an example config. `guillotine service install`
+(from the AppImage or an extracted binary) then registers autostart, so login
+brings the tray back. (`--appimage-extract-and-run` if you have no FUSE.)
+
+Or build from source — everything lives in the crate at the repo root:
 
 ```bash
 git clone https://github.com/bashout/message-guillotine.git
@@ -77,7 +83,7 @@ cargo build --release            # add --no-default-features on headless Linux
 ./target/release/guillotine config validate  # check it and print the resolved chats
 # edit the config: token (or GUILLOTINE_TOKEN env var), [dm] policy, [chat.*] entries
 
-./target/release/guillotine service install  # register native autostart
+./target/release/guillotine service install  # autostart at login (daemon + tray on GUI builds) + add "Message Guillotine" to the application menu (Linux GUI builds)
 ./target/release/guillotine service status
 ./target/release/guillotine gui              # tray app (desktop builds; ensures the daemon)
 ./target/release/guillotine run-now dm:USER_ID          # manual run for one chat (serialized with scheduled runs)
@@ -86,9 +92,15 @@ cargo build --release            # add --no-default-features on headless Linux
 ./target/release/guillotine viewer [ARCHIVES_DIR] --host 127.0.0.1 --port 8765   # browse archives (--no-browser to skip opening)
 ```
 
-On Windows and macOS the autostart entries register the same default launch,
-so login starts the daemon and the tray together (the Linux systemd unit
-stays headless: `service run`). The daemon runs detached in its own process,
+On every desktop platform the autostart entries register the default launch,
+so login starts the daemon and the tray together. On Linux, GUI builds do the
+same through the systemd `--user` unit; only headless (`--no-default-features`)
+builds register the daemon-only `service run`, for servers without a display.
+On Linux, GUI builds also install a `.desktop` entry into
+`~/.local/share/applications` (plus the hicolor icon) during `service install`
+and on the first GUI launch, so "Message Guillotine" shows up in the
+application menu; `service uninstall` removes it again. The daemon runs
+detached in its own process,
 but exiting the tray app cleans up the service instance: Quit (and the
 tray's "Stop service" item) request a clean shutdown over IPC — logs
 flushed, IPC port file removed. Closing the panel window (X) only hides it.

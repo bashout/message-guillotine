@@ -94,8 +94,10 @@ fn tray_icon_rgba() -> tray_icon::Icon {
 
 /// Install the .desktop entry and hicolor icon so docks/launches show
 /// "Message Guillotine" with the branding icon instead of a template icon.
+/// Also called by `service install` on Linux GUI builds, so the menu entry
+/// exists without a first GUI launch.
 #[cfg(target_os = "linux")]
-fn install_desktop_entry() {
+pub(crate) fn install_desktop_entry() {
     let Some(home) = dirs::home_dir() else { return };
     let apps = home.join(".local/share/applications");
     let icons = home.join(".local/share/icons/hicolor/256x256/apps");
@@ -103,11 +105,10 @@ fn install_desktop_entry() {
     // not the ephemeral /tmp/.mount_* path.
     let exe = crate::service::exe_path().ok();
     if let (Ok(_), Some(exe)) = (std::fs::create_dir_all(&apps), exe) {
-        let desktop = format!(
-            "[Desktop Entry]\nType=Application\nName=Message Guillotine\nComment=Scheduled bulk delete and archive of your own chat messages\nExec={} gui\nIcon=guillotine\nTerminal=false\nCategories=Utility;\n",
-            exe.display()
+        let _ = std::fs::write(
+            apps.join("guillotine.desktop"),
+            crate::service::desktop_entry(&exe),
         );
-        let _ = std::fs::write(apps.join("guillotine.desktop"), desktop);
     }
     if std::fs::create_dir_all(&icons).is_ok() {
         if let Some((rgba, w, h)) = brand_icon_pixels() {
